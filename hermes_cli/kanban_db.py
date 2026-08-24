@@ -5449,6 +5449,9 @@ def _production_completion_error(
         missing.append("deployed_at_matches_deployment")
     if isinstance(checks, dict) and checks.get("production_version") != deployed.get("production_version"):
         missing.append("post_deploy_checks.production_version")
+    receipt_error = _production_receipt_error(metadata, "live")
+    if receipt_error:
+        missing.append(receipt_error)
     if missing:
         return "production verification proof is incomplete: " + ", ".join(missing)
     return None
@@ -5536,6 +5539,29 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    source_row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    source_status = source_row["status"] if source_row else None
+    if (
+        source_row
+        and source_status == "running"
+        and source_row["current_run_id"] is not None
+    ):
+        source_status = _retry_status_for_run(
+            conn, task_id, int(source_row["current_run_id"])
+        )
+    if source_status == "prod_implemented":
+        if not actor or _canonical_assignee(actor) != "architect":
+            raise ProductionLifecycleError(
+                "only architect may complete live production verification"
+            )
+        receipt, verifier_error = _production_verifier(
+            conn, task_id, "live", metadata
+        )
+        if verifier_error:
+            raise ProductionLifecycleError(verifier_error)
+        metadata = _verified_production_metadata(metadata, receipt)
     lifecycle_error = _production_completion_error(conn, task_id, metadata, actor)
     if lifecycle_error:
         raise ProductionLifecycleError(lifecycle_error)
@@ -6807,6 +6833,163 @@ def _auto_production_risk_error(
     return None
 
 
+def _production_source_review_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+) -> tuple[Optional[sqlite3.Row], Optional[str], Optional[str]]:
+    """Validate the exact active source-review claim without mutating state."""
+    row = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None, "task not found"
+    if _canonical_assignee(row["assignee"]) != "architect":
+        return None, None, "source review is not owned by architect"
+    run_id = row["current_run_id"]
+    if row["status"] != "running" or run_id is None:
+        return None, None, "task is not in an active Architect review run"
+    if expected_run_id is not None and int(run_id) != int(expected_run_id):
+        return None, None, "run_id mismatch"
+    if _retry_status_for_run(conn, task_id, int(run_id)) != "review":
+        return None, None, "active run was not claimed from review"
+    handoff = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        payload = json.loads(handoff["payload"]) if handoff and handoff["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    implementer = payload.get("implementer") if isinstance(payload, dict) else None
+    if not isinstance(implementer, str) or not implementer.strip():
+        return None, None, "review handoff has no valid implementer provenance"
+    return row, _canonical_assignee(implementer), None
+
+
+def _production_verifier(
+    conn: sqlite3.Connection,
+    task_id: str,
+    phase: str,
+    evidence: Optional[dict],
+) -> tuple[Optional[dict], Optional[str]]:
+    """Ask the board-owned verifier to attest external production facts.
+
+    The caller's metadata is only input.  Advancement requires a fresh receipt
+    from an absolute, executable command configured by the board owner under
+    ``automation.auto_production.verifier_command``.  The command receives one
+    JSON object on stdin and must return one JSON object on stdout.  No shell is
+    involved, and missing/malformed/negative receipts fail closed.
+    """
+    task = conn.execute(
+        "SELECT title, body, workspace_path FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task is None:
+        return None, "task not found"
+    board = get_current_board()
+    board_meta = read_board_metadata(board)
+    automation = board_meta.get("automation")
+    auto_production = (
+        automation.get("auto_production")
+        if isinstance(automation, dict)
+        else None
+    )
+    command_value = (
+        auto_production.get("verifier_command")
+        if isinstance(auto_production, dict)
+        else None
+    )
+    command = Path(str(command_value or "")).expanduser()
+    if not command.is_absolute() or not command.is_file() or not os.access(command, os.X_OK):
+        return None, "trusted production verifier is not configured or executable"
+    timeout_value = auto_production.get("verifier_timeout_seconds", 30)
+    try:
+        timeout_seconds = max(1, min(int(timeout_value), 60))
+    except (TypeError, ValueError):
+        timeout_seconds = 30
+    clean_evidence = evidence if isinstance(evidence, dict) else {}
+    payload = {
+        "schema_version": 1,
+        "board": board,
+        "phase": phase,
+        "task": {
+            "id": task_id,
+            "title": task["title"],
+            "body": task["body"],
+            "workspace_path": task["workspace_path"],
+        },
+        "evidence": clean_evidence,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    try:
+        completed = subprocess.run(
+            [str(command)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"trusted production verifier failed: {type(exc).__name__}"
+    if completed.returncode != 0:
+        return None, "trusted production verifier rejected the request"
+    if len(completed.stdout or "") > 65536:
+        return None, "trusted production verifier receipt is too large"
+    try:
+        receipt = json.loads(completed.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        return None, "trusted production verifier returned malformed JSON"
+    if not isinstance(receipt, dict) or receipt.get("ok") is not True:
+        return None, "trusted production verifier returned a negative receipt"
+    if receipt.get("phase") != phase or receipt.get("task_id") != task_id:
+        return None, "trusted production verifier receipt scope mismatch"
+    if not str(receipt.get("receipt_id") or "").strip():
+        return None, "trusted production verifier receipt has no identifier"
+    checked_at = str(receipt.get("checked_at") or "").strip()
+    try:
+        datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None, "trusted production verifier receipt has no valid timestamp"
+    receipt = dict(receipt)
+    receipt["evidence_sha256"] = digest
+    return receipt, None
+
+
+def _verified_production_metadata(metadata: Optional[dict], receipt: dict) -> dict:
+    merged = dict(metadata) if isinstance(metadata, dict) else {}
+    # Always overwrite this internal field: callers cannot inject a receipt.
+    merged["_trusted_production_receipt"] = receipt
+    return merged
+
+
+def _production_receipt_error(metadata: Optional[dict], phase: str) -> Optional[str]:
+    proof = metadata if isinstance(metadata, dict) else {}
+    receipt = proof.get("_trusted_production_receipt")
+    if not isinstance(receipt, dict) or receipt.get("phase") != phase:
+        return "fresh trusted production verifier receipt is required"
+    facts = receipt.get("facts")
+    required = {
+        "deployment": (
+            "git_remote_matches", "deployed_revision_matches", "backup_exists",
+            "canary_passed", "rollback_tested",
+        ),
+        "live": (
+            "live_probes_passed", "deployed_revision_matches",
+            "rollback_available",
+        ),
+    }.get(phase, ())
+    if not isinstance(facts, dict) or any(facts.get(key) is not True for key in required):
+        return "trusted production verifier did not attest every required external fact"
+    return None
+
+
 def approve_production(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6821,57 +7004,80 @@ def approve_production(
     metadata = redact_review_value(metadata)
     if not actor or _canonical_assignee(actor) != "architect":
         return False, "only architect may approve production"
-    risk_error = _auto_production_risk_error(conn, task_id, metadata)
+    _row, _implementer, validation_error = _production_source_review_context(
+        conn, task_id, expected_run_id
+    )
+    if validation_error:
+        return False, validation_error
+    risk_receipt, verifier_error = _production_verifier(
+        conn, task_id, "risk", metadata
+    )
+    risk_error = verifier_error
+    if risk_receipt is not None and risk_receipt.get("decision") != "safe":
+        risk_error = (
+            "trusted production policy rejected automatic production; create "
+            "a distinct blocked human gate with no assignee"
+        )
+    risk_error = risk_error or _auto_production_risk_error(conn, task_id, metadata)
     if risk_error:
-        gate_id = create_task(
-            conn,
-            title=f"Human approval gate for {task_id}",
-            body=(
-                "Reserved human decision. Review the linked technical card and "
-                "record explicit approval before retrying Architect review."
-            ),
-            assignee=None,
-            created_by="architect",
-            initial_status="blocked",
-            idempotency_key=f"production-human-gate:{task_id}",
-        )
-        link_tasks(conn, gate_id, task_id)
-        block_task(
-            conn, task_id,
-            reason=f"human gate required: {gate_id}; {risk_error}",
-            kind="dependency",
-            expected_run_id=expected_run_id,
-        )
+        # Revalidate under the write lock, then materialize the human gate and
+        # park the technical task atomically.  Invalid/stale calls can never
+        # leave orphan gate cards behind.
+        with write_txn(conn):
+            row, _implementer, validation_error = _production_source_review_context(
+                conn, task_id, expected_run_id
+            )
+            if validation_error:
+                return False, validation_error
+            gate_id = create_task(
+                conn,
+                title=f"Human approval gate for {task_id}",
+                body=(
+                    "Reserved human decision. Review the linked technical card and "
+                    "record explicit approval before retrying Architect review."
+                ),
+                assignee=None,
+                created_by="architect",
+                initial_status="blocked",
+                idempotency_key=f"production-human-gate:{task_id}",
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (gate_id, task_id),
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'todo', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, block_kind = 'dependency' "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (task_id, int(row["current_run_id"])),
+            )
+            if cur.rowcount != 1:
+                return False, "task changed while creating the human gate"
+            ended_run_id = _end_run(
+                conn, task_id, outcome="blocked", status="blocked",
+                summary=f"human gate required: {gate_id}; {risk_error}",
+            )
+            _append_event(
+                conn, task_id, "linked", {"parent": gate_id, "child": task_id}
+            )
+            _append_event(
+                conn, task_id, "dependency_wait",
+                {
+                    "reason": f"human gate required: {gate_id}; {risk_error}",
+                    "kind": "dependency",
+                    "source_status": "review",
+                },
+                run_id=ended_run_id,
+            )
         return False, f"{risk_error}; human gate {gate_id} created"
+    metadata = _verified_production_metadata(metadata, risk_receipt)
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return False, "task not found"
-        if _canonical_assignee(row["assignee"]) != "architect":
-            return False, "source review is not owned by architect"
+        row, implementer, validation_error = _production_source_review_context(
+            conn, task_id, expected_run_id
+        )
+        if validation_error:
+            return False, validation_error
         run_id = row["current_run_id"]
-        if row["status"] != "running" or run_id is None:
-            return False, "task is not in an active Architect review run"
-        if expected_run_id is not None and int(run_id) != int(expected_run_id):
-            return False, "run_id mismatch"
-        if _retry_status_for_run(conn, task_id, int(run_id)) != "review":
-            return False, "active run was not claimed from review"
-        handoff = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? "
-            "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        try:
-            payload = json.loads(handoff["payload"]) if handoff and handoff["payload"] else {}
-        except (json.JSONDecodeError, TypeError):
-            payload = {}
-        implementer = payload.get("implementer") if isinstance(payload, dict) else None
-        if not isinstance(implementer, str) or not implementer.strip():
-            return False, "review handoff has no valid implementer provenance"
-        implementer = _canonical_assignee(implementer)
         cur = conn.execute(
             "UPDATE tasks SET status = 'production_ready', assignee = ?, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -6911,6 +7117,27 @@ def mark_prod_implemented(
     reviewer = _canonical_assignee(reviewer)
     if reviewer != "architect":
         return False, "live production reviewer must be architect"
+    preflight = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if preflight is None:
+        return False, "task not found"
+    if _canonical_assignee(preflight["assignee"]) != "ironrod-ops":
+        return False, "production run is not owned by ironrod-ops"
+    preflight_run_id = preflight["current_run_id"]
+    if preflight["status"] != "running" or preflight_run_id is None:
+        return False, "task is not in an active production run"
+    if expected_run_id is not None and int(preflight_run_id) != int(expected_run_id):
+        return False, "run_id mismatch"
+    if _retry_status_for_run(conn, task_id, int(preflight_run_id)) != "production_ready":
+        return False, "active run was not claimed from production_ready"
+    receipt, verifier_error = _production_verifier(
+        conn, task_id, "deployment", metadata
+    )
+    if verifier_error:
+        return False, verifier_error
+    metadata = _verified_production_metadata(metadata, receipt)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
@@ -6960,6 +7187,9 @@ def mark_prod_implemented(
             missing.append("rollback_prepared_tested")
         if missing:
             return False, "production metadata is incomplete: " + ", ".join(missing)
+        receipt_error = _production_receipt_error(metadata, "deployment")
+        if receipt_error:
+            return False, receipt_error
         cur = conn.execute(
             "UPDATE tasks SET status = 'prod_implemented', assignee = ?, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "

@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 
 
-def test_packaged_dashboard_bundle_contains_production_columns():
+def test_packaged_dashboard_bundle_locks_machine_production_columns(tmp_path):
     root = Path(__file__).resolve().parents[2]
     plugin = root / "plugins" / "kanban" / "dashboard"
     manifest = json.loads((plugin / "manifest.json").read_text())
@@ -35,6 +35,73 @@ def test_packaged_dashboard_bundle_contains_production_columns():
     assert "MACHINE_PRODUCTION_COLUMNS" in bundle
     assert "hermes-kanban-dot-production-ready" in css
     assert "hermes-kanban-dot-prod-implemented" in css
+    # Execute the exact packaged bundle (not the source copy) and exercise the
+    # actual component handlers. Expose only the two internal components to
+    # this isolated Node VM; the shipped file itself remains unchanged.
+    instrumented = bundle.replace(
+        "  // -------------------------------------------------------------------------\n"
+        "  // Register\n",
+        "  window.__KANBAN_BUNDLE_TEST__ = { Column, TaskCard };\n"
+        "  // -------------------------------------------------------------------------\n"
+        "  // Register\n",
+        1,
+    )
+    assert "window.__KANBAN_BUNDLE_TEST__" in instrumented
+    bundle_path = tmp_path / "packaged-kanban.js"
+    bundle_path.write_text(instrumented, encoding="utf-8")
+    harness = tmp_path / "bundle-behavior-test.js"
+    harness.write_text(
+        """const fs = require("fs");
+const assert = require("assert");
+const h = (type, props, ...children) => ({type, props: props || {}, children});
+const components = new Proxy({}, {get: (_target, key) => String(key)});
+global.window = {
+  __HERMES_PLUGIN_SDK__: {
+    React: {createElement: h, Component: class {}},
+    components,
+    hooks: {
+      useState: value => [value, () => {}],
+      useEffect: () => {},
+      useCallback: fn => fn,
+      useMemo: fn => fn(),
+      useRef: value => ({current: value || null}),
+    },
+    utils: {cn: (...parts) => parts.filter(Boolean).join(" "), timeAgo: () => ""},
+  },
+  __HERMES_PLUGINS__: {register: () => {}},
+};
+global.document = {querySelectorAll: () => [], createElement: () => ({}), body: {}};
+global.requestAnimationFrame = fn => fn();
+eval(fs.readFileSync(process.argv[2], "utf8"));
+const {Column, TaskCard} = window.__KANBAN_BUNDLE_TEST__;
+let moves = 0;
+const column = Column({
+  column: {name: "production_ready", tasks: []}, selectedIds: new Set(),
+  onMove: () => { moves += 1; }, onMoveSelected: () => { moves += 1; },
+  selectAllInColumn: () => {}, onCreate: () => {}, allTasks: [],
+});
+assert(column.props.className.includes("hermes-kanban-column--machine-locked"));
+let prevented = false;
+const event = {preventDefault: () => { prevented = true; },
+  dataTransfer: {dropEffect: "none", getData: () => "t_deadbeef"}};
+column.props.onDragOver(event);
+column.props.onDrop(event);
+assert.strictEqual(prevented, false);
+assert.strictEqual(moves, 0);
+for (const status of ["production_ready", "prod_implemented"]) {
+  const card = TaskCard({task: {id: "t_deadbeef", title: "x", status},
+    selected: false, failed: false, draggingSource: false,
+    toggleSelected: () => {}, onOpen: () => {}});
+  assert.strictEqual(card.props.draggable, false);
+}
+""",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["node", str(harness), str(bundle_path)], capture_output=True,
+        text=True, timeout=15, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +392,17 @@ def test_reopening_parent_demotes_ready_child(client):
     assert child_after_reopen["status"] == "todo"
 
 
-def test_reopening_parent_retracts_review_and_blocks_approval(client):
+def test_reopening_parent_retracts_review_and_blocks_approval(client, monkeypatch):
+    monkeypatch.setattr(
+        kb,
+        "_production_verifier",
+        lambda _conn, task_id, phase, _evidence: ({
+            "ok": True, "phase": phase, "task_id": task_id,
+            "receipt_id": "unit-risk",
+            "checked_at": "2026-08-24T12:00:00+00:00",
+            "decision": "safe", "facts": {},
+        }, None),
+    )
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
         assert kb.complete_task(conn, parent_id)

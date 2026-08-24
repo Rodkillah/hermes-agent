@@ -28,6 +28,32 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def trusted_production_verifier(monkeypatch: pytest.MonkeyPatch):
+    """These lifecycle units isolate routing from the verifier integration."""
+    def verify(_conn, task_id, phase, _evidence):
+        facts = {}
+        if phase == "deployment":
+            facts = {
+                "git_remote_matches": True, "deployed_revision_matches": True,
+                "backup_exists": True, "canary_passed": True,
+                "rollback_tested": True,
+            }
+        elif phase == "live":
+            facts = {
+                "live_probes_passed": True, "deployed_revision_matches": True,
+                "rollback_available": True,
+            }
+        return ({
+            "ok": True, "phase": phase, "task_id": task_id,
+            "receipt_id": f"unit-{phase}",
+            "checked_at": "2026-08-24T12:00:00+00:00",
+            "decision": "safe", "facts": facts,
+        }, None)
+
+    monkeypatch.setattr(kb, "_production_verifier", verify)
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with an empty kanban DB."""
