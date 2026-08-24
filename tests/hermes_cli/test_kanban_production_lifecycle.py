@@ -369,6 +369,87 @@ def test_external_verifier_is_mandatory_and_fail_closed(board, monkeypatch):
     assert gate is not None and (gate.status, gate.assignee) == ("blocked", None)
 
 
+def test_explicit_target_board_selects_its_own_verifier(board, tmp_path):
+    kb.create_board("policy-a")
+    kb.create_board("policy-b")
+    trace = tmp_path / "verifier-trace"
+
+    def install(slug: str):
+        verifier = tmp_path / f"verifier-{slug}"
+        verifier.write_text(
+            "#!/usr/bin/env python3\n"
+            "import datetime, json, pathlib, sys\n"
+            "payload = json.load(sys.stdin)\n"
+            f"pathlib.Path({str(trace)!r}).open('a').write({slug!r} + '\\n')\n"
+            "print(json.dumps({'ok': True, 'phase': payload['phase'], "
+            "'task_id': payload['task']['id'], 'receipt_id': 'scoped', "
+            "'checked_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), "
+            "'decision': 'safe', 'facts': {}}))\n",
+            encoding="utf-8",
+        )
+        verifier.chmod(0o700)
+        path = kb.board_metadata_path(slug)
+        meta = kb.read_board_metadata(slug)
+        meta.pop("db_path", None)
+        meta["automation"] = {
+            "auto_production": {"enabled": True, "verifier_command": str(verifier)}
+        }
+        path.write_text(json.dumps(meta), encoding="utf-8")
+
+    install("policy-a")
+    install("policy-b")
+    kb.set_current_board("policy-a")
+    with kb.connect(board="policy-b") as target:
+        task_id, review = _enter_review(target)
+        assert kb.approve_production(
+            target, task_id, metadata=_safe_risk(), actor="architect",
+            expected_run_id=review.current_run_id,
+        )[0]
+    assert trace.read_text(encoding="utf-8").splitlines() == ["policy-b"]
+
+
+def test_human_gate_stays_blocked_unassigned_across_dispatch_ticks(
+    board, monkeypatch
+):
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda _name: True)
+    task_id, review = _enter_review(board, "Rotate production credentials")
+    assert not kb.approve_production(
+        board, task_id, metadata=_safe_risk(), actor="architect",
+        expected_run_id=review.current_run_id,
+    )[0]
+    gate_id = kb.parent_ids(board, task_id)[0]
+    spawned = []
+    for _ in range(3):
+        kb.recompute_ready(board)
+        kb.dispatch_once(
+            board, board="default", default_assignee="amber",
+            max_in_progress=100,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        gate = kb.get_task(board, gate_id)
+        assert gate is not None
+        assert (gate.status, gate.assignee, gate.block_kind) == (
+            "blocked", None, "needs_input",
+        )
+    assert gate_id not in spawned
+
+    # Defense in depth: even a corrupted/manual ready status cannot make a
+    # durable human gate inherit the configured fallback owner.
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (gate_id,))
+    result = kb.dispatch_once(
+        board, board="default", default_assignee="amber",
+        max_in_progress=100,
+        spawn_fn=lambda task, _workspace: spawned.append(task.id),
+    )
+    gate = kb.get_task(board, gate_id)
+    assert gate is not None and gate.assignee is None
+    assert gate_id in result.skipped_unassigned
+    assert gate_id not in spawned
+
+
 def test_stale_claims_resume_both_production_phases(board):
     task_id, review = _enter_review(board)
     assert kb.approve_production(

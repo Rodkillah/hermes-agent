@@ -1001,6 +1001,31 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     return entries
 
 
+def _board_for_connection(conn: sqlite3.Connection) -> str:
+    """Resolve the canonical board whose main DB is open on ``conn``.
+
+    Explicit ``--board`` tool calls may target a board other than the process
+    current board. Production policy must follow the opened DB, never ambient
+    selection state. Unknown/in-memory DBs retain the historical current-board
+    fallback used by isolated unit tests.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main_file = next(
+            (str(row["file"] or "") for row in rows if row["name"] == "main"),
+            "",
+        )
+        if main_file:
+            opened = Path(main_file).expanduser().resolve(strict=False)
+            for meta in list_boards(include_archived=True):
+                candidate = str(meta.get("db_path") or "").strip()
+                if candidate and Path(candidate).expanduser().resolve(strict=False) == opened:
+                    return str(meta["slug"])
+    except (OSError, sqlite3.Error, KeyError, StopIteration, TypeError, ValueError):
+        pass
+    return get_current_board()
+
+
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Remove or archive a board.
 
@@ -4473,6 +4498,15 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
     """
+    task = conn.execute(
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if (
+        task
+        and task["status"] == "blocked"
+        and task["block_kind"] in {"needs_input", "capability"}
+    ):
+        return True
     row = conn.execute(
         "SELECT kind FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
@@ -4549,12 +4583,17 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, block_kind, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if (
+                cur_status == "blocked"
+                and row["block_kind"] in {"needs_input", "capability"}
+            ):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for explicit human intervention — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -6888,7 +6927,7 @@ def _production_verifier(
     ).fetchone()
     if task is None:
         return None, "task not found"
-    board = get_current_board()
+    board = _board_for_connection(conn)
     board_meta = read_board_metadata(board)
     automation = board_meta.get("automation")
     auto_production = (
@@ -7040,6 +7079,18 @@ def approve_production(
                 created_by="architect",
                 initial_status="blocked",
                 idempotency_key=f"production-human-gate:{task_id}",
+            )
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?",
+                (gate_id,),
+            )
+            _append_event(
+                conn, gate_id, "blocked",
+                {
+                    "kind": "needs_input",
+                    "reason": "reserved human production decision",
+                    "source_task": task_id,
+                },
             )
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -10614,7 +10665,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, block_kind FROM tasks "
         "WHERE status IN ('ready', 'production_ready') AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10696,6 +10747,9 @@ def _dispatch_once_locked(
             break
         row_assignee = row["assignee"]
         if not row_assignee:
+            if row["block_kind"] in {"needs_input", "capability"}:
+                result.skipped_unassigned.append(row["id"])
+                continue
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
             # exists, persist the assignment and proceed. This removes the
