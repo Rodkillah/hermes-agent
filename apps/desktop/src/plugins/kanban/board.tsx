@@ -168,7 +168,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
         // actually working; while queued, the named chip carries "attached".
         <Tip
           label={
-            task.status === 'review'
+            task.status === 'review' || task.status === 'prod_implemented'
               ? k.reviewChecking
               : task.assignee
                 ? k.attachedTip(attached)

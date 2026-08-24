@@ -48,7 +48,7 @@ export function useDefaultAssignee(): string {
 // claimed by the dispatcher; `scheduled` needs a wake-up time only an agent or
 // the CLI can attach (a bare status drag is refused with a 409). The reason
 // copy lives in the plugin i18n bundle (`locked.*`); see `lockedReason`.
-export const LOCKED_COLUMNS = ['review', 'running', 'scheduled'] as const
+export const LOCKED_COLUMNS = ['review', 'production_ready', 'prod_implemented', 'running', 'scheduled'] as const
 
 export const isLockedTarget = (name: string): boolean => (LOCKED_COLUMNS as readonly string[]).includes(name)
 
@@ -133,6 +133,8 @@ export function arcState(task: KanbanTask, fallbackAssignee: string): ArcState |
   const queued =
     task.status === 'triage' ||
     task.status === 'review' ||
+    task.status === 'production_ready' ||
+    task.status === 'prod_implemented' ||
     (task.status === 'ready' && Boolean(task.assignee || fallbackAssignee))
 
   return queued ? 'queued' : null

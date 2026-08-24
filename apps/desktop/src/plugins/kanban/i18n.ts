@@ -16,10 +16,20 @@ type KanbanMessages = {
   newTaskCommand: string
   countTip: (running: number, ready: number) => string
   col: Record<
-    'archived' | 'blocked' | 'done' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
+    | 'archived'
+    | 'blocked'
+    | 'done'
+    | 'prod_implemented'
+    | 'production_ready'
+    | 'ready'
+    | 'review'
+    | 'running'
+    | 'scheduled'
+    | 'todo'
+    | 'triage',
     { label: string; help: string }
   >
-  locked: { review: string; running: string; scheduled: string }
+  locked: { prod_implemented: string; production_ready: string; review: string; running: string; scheduled: string }
   arcRunning: string
   arcStale: string
   title: string
@@ -211,10 +221,20 @@ export const en: KanbanMessages = {
     running: { label: 'Running', help: 'Claimed by a worker — an agent is on it. Set by the dispatcher.' },
     blocked: { label: 'Blocked', help: 'The worker asked for human input.' },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
+    production_ready: {
+      label: 'Production ready',
+      help: 'Architect GO recorded; Ops will deploy this card automatically.'
+    },
+    prod_implemented: {
+      label: 'Prod implemented',
+      help: 'The exact version is deployed; Architect is verifying live probes and rollback.'
+    },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
     archived: { label: 'Archived', help: 'Hidden from the default board view.' }
   },
   locked: {
+    production_ready: 'Only Architect approval can enter Production ready.',
+    prod_implemented: 'Only the production worker can record Prod implemented.',
     review: 'Review is entered by the dispatcher when a review agent takes the card.',
     running: 'Running is set by the dispatcher when a worker claims the card.',
     scheduled: 'Scheduled needs a wake-up time — agents set it; it can’t be dragged into.'
@@ -413,10 +433,17 @@ const ja: KanbanMessages = {
     running: { label: '実行中', help: 'ワーカーが取得済み — エージェントが作業中。ディスパッチャが設定します。' },
     blocked: { label: 'ブロック', help: 'ワーカーが人間の入力を求めています。' },
     review: { label: 'レビュー', help: 'レビューエージェントが作業を確認中。ディスパッチャが設定します。' },
+    production_ready: { label: '本番準備完了', help: 'Architect の GO を記録済み。Ops が自動的にデプロイします。' },
+    prod_implemented: {
+      label: '本番反映済み',
+      help: '指定バージョンをデプロイ済み。Architect が本番プローブとロールバックを確認中です。'
+    },
     done: { label: '完了', help: '完了。依存する子タスクが Ready になります。' },
     archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' }
   },
   locked: {
+    production_ready: '本番準備完了へは Architect の承認によってのみ移動できます。',
+    prod_implemented: '本番反映済みは本番ワーカーのみ記録できます。',
     review: 'レビューは、レビューエージェントがカードを取得するとディスパッチャによって設定されます。',
     running: '実行中は、ワーカーがカードを取得するとディスパッチャによって設定されます。',
     scheduled: 'スケジュールには起動時刻が必要です — エージェントが設定します。ドラッグでは移動できません。'
@@ -614,10 +641,14 @@ const zh: KanbanMessages = {
     running: { label: '运行中', help: '已被工作单元领取 — 有代理在处理。由调度器设置。' },
     blocked: { label: '受阻', help: '工作单元需要人工输入。' },
     review: { label: '审查', help: '审查代理正在检查工作。由调度器设置。' },
+    production_ready: { label: '可投产', help: 'Architect 已批准；Ops 将自动部署此卡片。' },
+    prod_implemented: { label: '已投产', help: '精确版本已部署；Architect 正在验证在线探针和回滚。' },
     done: { label: '完成', help: '已完成；依赖它的子任务变为就绪。' },
     archived: { label: '已归档', help: '从默认面板视图中隐藏。' }
   },
   locked: {
+    production_ready: '只有 Architect 批准后才能进入可投产状态。',
+    prod_implemented: '只有生产工作代理才能记录已投产状态。',
     review: '审查状态由调度器在审查代理领取卡片时设置。',
     running: '运行中由调度器在工作单元领取卡片时设置。',
     scheduled: '排期需要唤醒时间 — 由代理设置；无法拖入。'
@@ -812,10 +843,14 @@ const zhHant: KanbanMessages = {
     running: { label: '執行中', help: '已被工作單元領取 — 有代理在處理。由排程器設定。' },
     blocked: { label: '受阻', help: '工作單元需要人工輸入。' },
     review: { label: '審查', help: '審查代理正在檢查工作。由排程器設定。' },
+    production_ready: { label: '可投產', help: 'Architect 已批准；Ops 將自動部署此卡片。' },
+    prod_implemented: { label: '已投產', help: '精確版本已部署；Architect 正在驗證線上探針與回滾。' },
     done: { label: '完成', help: '已完成；相依它的子任務變為就緒。' },
     archived: { label: '已封存', help: '從預設面板檢視中隱藏。' }
   },
   locked: {
+    production_ready: '只有 Architect 批准後才能進入可投產狀態。',
+    prod_implemented: '只有生產工作代理才能記錄已投產狀態。',
     review: '審查狀態由排程器在審查代理領取卡片時設定。',
     running: '執行中由排程器在工作單元領取卡片時設定。',
     scheduled: '排程需要喚醒時間 — 由代理設定；無法拖入。'

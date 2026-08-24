@@ -81,10 +81,13 @@ sessions still have zero `kanban_*` schema footprint unless configured.
 
 - **CLI verbs (common):** `init`, `create`, `list` (alias `ls`),
   `show`, `assign`, `link`, `unlink`, `comment`, `complete`, `block`,
+  `request-review`, `approve-production`, `mark-prod-implemented`,
   `unblock`, `archive`, `tail`. Less common: `watch`, `stats`, `runs`,
   `log`, `dispatch`, `daemon`, `gc`.
 - **Worker/orchestrator toolset:** `kanban_show`, `kanban_complete`,
-  `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`,
+  `kanban_block`, `kanban_request_review`, `kanban_request_changes`,
+  `kanban_approve_production`, `kanban_mark_prod_implemented`,
+  `kanban_heartbeat`, `kanban_comment`, `kanban_create`,
   `kanban_link`; profiles that explicitly enable the `kanban` toolset
   outside a dispatcher-spawned task also get `kanban_list` and
   `kanban_unblock` for board routing.
@@ -94,6 +97,11 @@ sessions still have zero `kanban_*` schema footprint unless configured.
   Auto-blocks a task after `failure_limit` consecutive spawn failures
   (default 2; configurable via `kanban.failure_limit` or per-task
   `max_retries`).
+- **Production lifecycle:** source review GO enters `production_ready`; Ops
+  deploys an exact version and enters `prod_implemented`; only independent
+  live verification with probes and rollback may enter `done`. Human-only
+  credentials or irreversible decisions remain distinct unassigned `blocked`
+  gates.
 - **Isolation:** board is the hard boundary (workers get
   `HERMES_KANBAN_BOARD` pinned in env); tenant is a soft namespace
   within a board for workspace-path + memory-key isolation.

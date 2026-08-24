@@ -299,10 +299,8 @@ def test_request_review_whitespace_only_summary_does_not_crash(
 # ---------------------------------------------------------------------------
 
 
-def test_complete_task_closes_review_to_done(kanban_home: Path) -> None:
-    """A task parked in ``review`` (with no active run — request_review
-    closed it, so ``current_run_id IS NULL``, the #54823 shape) must be
-    completable by a human approval via ``complete_task``."""
+def test_complete_task_refuses_review_to_done_shortcut(kanban_home: Path) -> None:
+    """A parked source review must enter production_ready, never done."""
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="approve me", assignee="worker")
         kb.claim_task(conn, tid)
@@ -311,14 +309,11 @@ def test_complete_task_closes_review_to_done(kanban_home: Path) -> None:
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "review"
-        # The review lane has no active run — the exact state that used to
-        # make `hermes kanban complete` a no-op (#54823).
         assert kb.get_task(conn, tid).current_run_id is None
-
-        ok = kb.complete_task(conn, tid, summary="LGTM — merged", result="approved")
-        assert ok is True
-        assert kb.get_task(conn, tid).status == "done"
-        assert _events(conn, tid, kind="completed")
+        with pytest.raises(kb.ProductionLifecycleError, match="approve_production"):
+            kb.complete_task(conn, tid, summary="LGTM — merged", result="approved")
+        assert kb.get_task(conn, tid).status == "review"
+        assert not _events(conn, tid, kind="completed")
 
 
 # ---------------------------------------------------------------------------
@@ -657,8 +652,40 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
         )
         assert kb.get_task(conn, tid).status == "review"
 
-        # Human approves.
-        assert kb.complete_task(conn, tid, summary="approved") is True
+        # Architect source GO -> Ops deploy -> Architect live GO.
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.approve_production(
+            conn, tid, summary="source approved",
+            metadata={"risk_classification": {
+                "category": "standard_code", "high_risk": False,
+                "human_gate_required": False,
+            }}, expected_run_id=review.current_run_id,
+        )[0]
+        production = kb.claim_task(conn, tid)
+        assert production is not None
+        assert kb.mark_prod_implemented(
+            conn, tid,
+            metadata={
+                "production_version": "abc123", "deployed_at": "now",
+                "canary": {"result": "passed"},
+                "main_promotion": {"mode": "fast-forward"},
+                "backup": {"created": True},
+                "rollback_prepared": {"tested": True},
+            },
+            expected_run_id=production.current_run_id,
+        )[0]
+        live = kb.claim_review_task(conn, tid)
+        assert live is not None
+        assert kb.complete_task(
+            conn, tid, summary="approved",
+            metadata={
+                "delivery_level": "verified_production",
+                "production_version": "abc123", "deployed_at": "now",
+                "post_deploy_checks": {"health": "ok"},
+                "rollback": {"verified": True},
+            }, expected_run_id=live.current_run_id,
+        )
         row = _row(conn, tid)
         assert row["status"] == "done"
         assert (row["block_recurrences"] or 0) == 0

@@ -136,11 +136,37 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     review_run = kb.latest_run(conn, task_id)
     assert review_run is not None
     assert review_run.profile == "reviewer"
+    assert kb.approve_production(
+        conn, task_id, summary="Approved after independent verification.",
+        metadata={"risk_classification": {
+            "category": "standard_code", "high_risk": False,
+            "human_gate_required": False,
+        }}, expected_run_id=review_2.current_run_id,
+    )[0]
+    production = kb.claim_task(conn, task_id, claimer="builder:prod")
+    assert production is not None
+    assert kb.mark_prod_implemented(
+        conn, task_id,
+        metadata={
+            "production_version": "abc123", "deployed_at": "now",
+            "canary": {"result": "passed"},
+            "main_promotion": {"mode": "fast-forward"},
+            "backup": {"created": True},
+            "rollback_prepared": {"tested": True},
+        },
+        expected_run_id=production.current_run_id,
+    )[0]
+    live = kb.claim_review_task(conn, task_id, claimer="reviewer:live")
+    assert live is not None
     assert kb.complete_task(
-        conn,
-        task_id,
-        summary="Approved after independent verification.",
-        expected_run_id=review_2.current_run_id,
+        conn, task_id,
+        summary="Live production verified.",
+        metadata={
+            "delivery_level": "verified_production",
+            "production_version": "abc123", "deployed_at": "now",
+            "post_deploy_checks": {"health": "ok"},
+            "rollback": {"verified": True},
+        }, expected_run_id=live.current_run_id,
     )
 
     completed = kb.get_task(conn, task_id)
@@ -540,22 +566,13 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
     assert current.current_run_id == successor.current_run_id
 
 
-def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
+def test_parked_review_approval_without_evidence_is_refused(conn) -> None:
     task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
     assert kb.request_review(conn, task_id, summary="implementation handoff")
-    assert kb.complete_task(conn, task_id)
-    completed_event = _event(kb.list_events(conn, task_id), "completed")
-    assert completed_event.run_id is not None
-    run = kb.latest_run(conn, task_id)
-    assert run is not None
-    assert run.id == completed_event.run_id
-    assert run.outcome == "completed"
-    assert run.profile == "reviewer"
-    assert run.summary == "Review approved without additional evidence."
-    assert run.metadata == {
-        "source_status": "review",
-        "approval": "manual",
-    }
+    with pytest.raises(kb.ProductionLifecycleError, match="approve_production"):
+        kb.complete_task(conn, task_id)
+    assert kb.get_task(conn, task_id).status == "review"
+    assert not [e for e in kb.list_events(conn, task_id) if e.kind == "completed"]
 
 
 def test_legacy_review_child_deadlock_is_reported_immediately(conn):

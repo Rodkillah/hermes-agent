@@ -38,6 +38,9 @@ _STATUS_ICONS = {
     "running":  "●",
     "scheduled":"⏱",
     "blocked":  "⊘",
+    "review":   "◉",
+    "production_ready": "🚀",
+    "prod_implemented": "🏭",
     "done":     "✓",
     "archived": "—",
 }
@@ -689,6 +692,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "reason", nargs="+", help="Concrete changes required before re-review",
     )
 
+    p_approve_production = sub.add_parser(
+        "approve-production",
+        help="Architect GO: move a safe reviewed task to production_ready",
+    )
+    p_approve_production.add_argument("task_id")
+    p_approve_production.add_argument("--summary", required=True)
+    p_approve_production.add_argument(
+        "--metadata", required=True,
+        help="JSON including risk_classification",
+    )
+
+    p_prod_implemented = sub.add_parser(
+        "mark-prod-implemented",
+        help="Record an exact deployment and request Architect live review",
+    )
+    p_prod_implemented.add_argument("task_id")
+    p_prod_implemented.add_argument("--summary", required=True)
+    p_prod_implemented.add_argument(
+        "--metadata", required=True,
+        help="JSON including production_version and deployed_at",
+    )
+    p_prod_implemented.add_argument("--reviewer", default="architect")
+
     p_reopen_review = sub.add_parser(
         "reopen-review",
         help="Send one or more review tasks back for changes (review -> ready/todo)",
@@ -1132,6 +1158,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
+            "approve-production": _cmd_approve_production,
+            "mark-prod-implemented": _cmd_mark_prod_implemented,
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -2492,6 +2520,54 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_metadata_arg(raw: str) -> Optional[dict]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"kanban: --metadata: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(value, dict):
+        print("kanban: --metadata must be a JSON object", file=sys.stderr)
+        return None
+    return value
+
+
+def _cmd_approve_production(args: argparse.Namespace) -> int:
+    metadata = _parse_metadata_arg(args.metadata)
+    if metadata is None:
+        return 2
+    with kb.connect_closing() as conn:
+        ok, detail = kb.approve_production(
+            conn, args.task_id, summary=args.summary, metadata=metadata,
+            expected_run_id=_worker_run_id_for(args.task_id),
+        )
+    if not ok:
+        print(f"cannot approve production for {args.task_id}: {detail}", file=sys.stderr)
+        return 1
+    print(f"Production ready {args.task_id}; routed to {detail}")
+    return 0
+
+
+def _cmd_mark_prod_implemented(args: argparse.Namespace) -> int:
+    metadata = _parse_metadata_arg(args.metadata)
+    if metadata is None:
+        return 2
+    with kb.connect_closing() as conn:
+        ok, detail = kb.mark_prod_implemented(
+            conn, args.task_id, summary=args.summary, metadata=metadata,
+            reviewer=args.reviewer,
+            expected_run_id=_worker_run_id_for(args.task_id),
+        )
+    if not ok:
+        print(
+            f"cannot mark production implemented for {args.task_id}: {detail}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Production implemented {args.task_id}; routed to {detail}")
+    return 0
+
+
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     if not ids:
@@ -2924,7 +3000,10 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in (
+        "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+        "production_ready", "prod_implemented", "done",
+    ):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")

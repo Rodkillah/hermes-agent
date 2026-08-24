@@ -76,6 +76,7 @@ _POLISHED_TOOLS = {
     "feishu_drive_reply_comment", "feishu_drive_add_comment",
     "kanban_create", "kanban_show", "kanban_comment", "kanban_complete",
     "kanban_block", "kanban_request_review", "kanban_request_changes",
+    "kanban_approve_production", "kanban_mark_prod_implemented",
     "kanban_link", "kanban_heartbeat",
     "yb_query_group_info", "yb_query_group_members", "yb_search_sticker",
     "yb_send_dm", "yb_send_sticker",

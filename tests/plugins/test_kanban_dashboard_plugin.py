@@ -368,15 +368,17 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         assert child.status == "review"
         review = kb.claim_review_task(conn, child_id)
         assert review is not None
-        assert kb.complete_task(
-            conn,
-            child_id,
-            summary="approved after parent stabilized",
-            expected_run_id=review.current_run_id,
-        )
+        assert kb.approve_production(
+            conn, child_id, summary="approved after parent stabilized",
+            metadata={"risk_classification": {
+                "category": "standard_code", "high_risk": False,
+                "human_gate_required": False,
+            }}, expected_run_id=review.current_run_id,
+        )[0]
+        assert kb.get_task(conn, child_id).status == "production_ready"
         grandchild = kb.get_task(conn, grandchild_id)
         assert grandchild is not None
-        assert grandchild.status == "ready"
+        assert grandchild.status == "todo"
 
 
 def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
@@ -1228,5 +1230,4 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

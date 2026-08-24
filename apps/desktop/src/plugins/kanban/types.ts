@@ -200,6 +200,8 @@ export const COLUMN_META: Record<string, { codicon: string; tone: string }> = {
   running: { codicon: 'sync', tone: '#34d399' },
   blocked: { codicon: 'error', tone: '#f87171' },
   review: { codicon: 'eye', tone: '#fbbf24' },
+  production_ready: { codicon: 'rocket', tone: '#60a5fa' },
+  prod_implemented: { codicon: 'server-process', tone: '#a78bfa' },
   done: { codicon: 'pass', tone: 'var(--ui-text-tertiary)' },
   archived: { codicon: 'archive', tone: 'var(--ui-text-quaternary)' }
 }

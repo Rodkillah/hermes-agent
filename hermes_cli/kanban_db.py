@@ -99,7 +99,10 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+    "production_ready", "prod_implemented", "done", "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -4501,9 +4504,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
+    resumable = {"review", "production_ready", "prod_implemented"}
     for key in ("resume_status", "retry_status", "source_status"):
-        if payload.get(key) == "review":
-            return "review"
+        if payload.get(key) in resumable:
+            return str(payload[key])
     return "ready"
 
 
@@ -4621,10 +4625,10 @@ def claim_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Atomically transition ``ready|production_ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in an executable status).
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -4638,6 +4642,13 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        source_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ? AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        source_status = source_row["status"] if source_row else None
+        if source_status not in ("ready", "production_ready"):
+            return None
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
@@ -4647,12 +4658,14 @@ def claim_task(
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
-                (task_id,),
+                "WHERE id = ? AND status = ?",
+                (task_id, source_status),
             )
             _append_event(
-                conn, task_id, "claim_rejected",
-                {"reason": "parents_not_done"},
+                conn,
+                task_id,
+                "dependency_wait" if source_status == "production_ready" else "claim_rejected",
+                {"reason": "parents_not_done", "source_status": source_status},
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -4660,8 +4673,8 @@ def claim_task(
         # it when the CAS resets the pointer below. No-op when the invariant
         # holds (the common case).
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
-            (task_id,),
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = ?",
+            (task_id, source_status),
         ).fetchone()
         if stale and stale["current_run_id"]:
             conn.execute(
@@ -4683,10 +4696,10 @@ def claim_task(
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
+               AND status = ?
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, source_status),
         )
         if cur.rowcount != 1:
             return None
@@ -4722,7 +4735,8 @@ def claim_task(
         )
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            {"lock": lock, "expires": expires, "run_id": run_id,
+             "source_status": source_status},
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
@@ -4743,10 +4757,10 @@ def claim_review_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``review -> running``.
+    """Atomically transition ``review|prod_implemented -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``review`` status).
+    already claimed (or is not in a review status).
 
     Parent dependencies are re-checked because a previously completed parent
     may have been reopened while this task waited in review.
@@ -4758,11 +4772,18 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        source_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ? AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        source_status = source_row["status"] if source_row else None
+        if source_status not in ("review", "prod_implemented"):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
-                (task_id,),
+                "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+                (task_id, source_status),
             )
             if demoted.rowcount == 1:
                 _append_event(
@@ -4771,7 +4792,7 @@ def claim_review_task(
                     "dependency_wait",
                     {
                         "reason": "parent_reopened",
-                        "source_status": "review",
+                        "source_status": source_status,
                     },
                 )
             return None
@@ -4783,10 +4804,10 @@ def claim_review_task(
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'review'
+               AND status = ?
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, source_status),
         )
         if cur.rowcount != 1:
             return None
@@ -4821,7 +4842,7 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": source_status},
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -4834,8 +4855,8 @@ def _retry_status_for_run(
 ) -> str:
     """Return the non-running phase an interrupted run must resume from.
 
-    Review claims record ``source_status=review`` on their claimed event. All
-    other and legacy runs retry from ``ready``. Keeping this decision in one
+    Special lifecycle claims record their durable phase on the claimed event.
+    Legacy runs retry from ``ready``. Keeping this decision in one
     place prevents crash/timeout/reclaim paths from silently converting a
     reviewer run into an implementation run.
     """
@@ -4859,7 +4880,10 @@ def _retry_status_for_run(
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
-    return "review" if payload.get("source_status") == "review" else "ready"
+    source_status = payload.get("source_status")
+    if source_status in ("review", "production_ready", "prod_implemented"):
+        return str(source_status)
+    return "ready"
 
 
 def goal_run_status(
@@ -4891,6 +4915,8 @@ def goal_run_status(
             {
                 "completed": "done",
                 "review_requested": "review",
+                "production_approved": "production_ready",
+                "prod_implemented": "prod_implemented",
                 "changes_requested": "changes_requested",
                 "blocked": "blocked",
                 "dependency_wait": "blocked",
@@ -5345,6 +5371,56 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class ProductionLifecycleError(ValueError):
+    """Raised when a card attempts to skip a production gate."""
+
+
+def _production_completion_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Return a diagnostic when completion would bypass production proof."""
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    status = row["status"]
+    source_status = (
+        _retry_status_for_run(conn, task_id, row["current_run_id"])
+        if status == "running" and row["current_run_id"] is not None
+        else status
+    )
+    if source_status == "review":
+        return (
+            "Architect approval must use approve_production; review cannot "
+            "complete directly to done"
+        )
+    if source_status == "production_ready":
+        return (
+            "production execution must use mark_prod_implemented before "
+            "Architect live verification"
+        )
+    if source_status != "prod_implemented":
+        return None
+    proof = metadata if isinstance(metadata, dict) else {}
+    missing: list[str] = []
+    if proof.get("delivery_level") != "verified_production":
+        missing.append("delivery_level=verified_production")
+    if not str(proof.get("production_version") or "").strip():
+        missing.append("production_version")
+    if not str(proof.get("deployed_at") or "").strip():
+        missing.append("deployed_at")
+    if not proof.get("post_deploy_checks"):
+        missing.append("post_deploy_checks")
+    if not proof.get("rollback"):
+        missing.append("rollback")
+    if missing:
+        return "production verification proof is incomplete: " + ", ".join(missing)
+    return None
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -5360,15 +5436,13 @@ def complete_task(
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+    """Transition eligible work to ``done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence. ``review`` is accepted so a human
-    (or reviewer) can approve a task parked in the review lane by
-    :func:`request_review` — even when it has no active run
-    (``current_run_id IS NULL``), the handoff fields are preserved via
-    :func:`_synthesize_ended_run`.
+    a claim/start/complete sequence. Architect-reviewed delivery work cannot
+    jump from ``review`` to ``done``: it must pass through
+    ``production_ready`` and ``prod_implemented`` with live proof.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -5428,6 +5502,9 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    lifecycle_error = _production_completion_error(conn, task_id, metadata)
+    if lifecycle_error:
+        raise ProductionLifecycleError(lifecycle_error)
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5439,6 +5516,9 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        lifecycle_error = _production_completion_error(conn, task_id, metadata)
+        if lifecycle_error:
+            raise ProductionLifecycleError(lifecycle_error)
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5452,7 +5532,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'prod_implemented')
                 """,
                 (result, now, task_id),
             )
@@ -5469,7 +5549,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'prod_implemented')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -6649,6 +6729,170 @@ def request_review(
     return _ret(True)
 
 
+_AUTO_PRODUCTION_SAFE_CATEGORIES = {
+    "standard_code", "configuration", "observability", "documentation",
+}
+_AUTO_PRODUCTION_DENY_TERMS = (
+    "credential", "credentials", "secret", "password", "token", "api key",
+    "clé api", "mot de passe", "drop table", "truncate", "delete data",
+    "destructive migration", "payment", "paiement", "legal", "juridique",
+    "contract", "contrat", "external action", "action externe",
+    "architecture decision", "architectural decision", "décision d'architecture",
+)
+
+
+def _auto_production_risk_error(
+    conn: sqlite3.Connection, task_id: str, metadata: Optional[dict]
+) -> Optional[str]:
+    """Enforce the hard boundary between automation and human-only gates."""
+    risk = metadata.get("risk_classification") if isinstance(metadata, dict) else None
+    if not isinstance(risk, dict):
+        return "metadata.risk_classification is required for production approval"
+    category = str(risk.get("category") or "").strip().lower()
+    if (
+        category not in _AUTO_PRODUCTION_SAFE_CATEGORIES
+        or risk.get("high_risk") is not False
+        or risk.get("human_gate_required") is not False
+    ):
+        return (
+            "high-risk work cannot be auto-produced; create a distinct blocked "
+            "human gate with no assignee"
+        )
+    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    text = " ".join(str(row[key] or "") for key in ("title", "body")) if row else ""
+    lowered = text.lower()
+    if any(term in lowered for term in _AUTO_PRODUCTION_DENY_TERMS):
+        return (
+            "credentials, secrets, destructive data, money, legal, or external "
+            "actions require a distinct blocked human gate with no assignee"
+        )
+    return None
+
+
+def approve_production(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Record Architect GO and route a safe card to production Ops."""
+    summary = redact_review_value(summary)
+    metadata = redact_review_value(metadata)
+    risk_error = _auto_production_risk_error(conn, task_id, metadata)
+    if risk_error:
+        return False, risk_error
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task not found"
+        run_id = row["current_run_id"]
+        if row["status"] != "running" or run_id is None:
+            return False, "task is not in an active Architect review run"
+        if expected_run_id is not None and int(run_id) != int(expected_run_id):
+            return False, "run_id mismatch"
+        if _retry_status_for_run(conn, task_id, int(run_id)) != "review":
+            return False, "active run was not claimed from review"
+        handoff = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        try:
+            payload = json.loads(handoff["payload"]) if handoff and handoff["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        implementer = payload.get("implementer") if isinstance(payload, dict) else None
+        if not isinstance(implementer, str) or not implementer.strip():
+            return False, "review handoff has no valid implementer provenance"
+        implementer = _canonical_assignee(implementer)
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'production_ready', assignee = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (implementer, task_id, int(run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during production approval"
+        ended_run_id = _end_run(
+            conn, task_id, outcome="production_approved",
+            status="production_ready", summary=summary, metadata=metadata,
+        )
+        _append_event(
+            conn, task_id, "production_approved",
+            {"implementer": implementer, "reviewer": row["assignee"],
+             "status": "production_ready"},
+            run_id=ended_run_id,
+        )
+    return True, implementer
+
+
+def mark_prod_implemented(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    reviewer: str = "architect",
+    expected_run_id: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Record exact deployment and route the card to independent live review."""
+    summary = redact_review_value(summary)
+    metadata = redact_review_value(metadata)
+    reviewer = _canonical_assignee(reviewer)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task not found"
+        run_id = row["current_run_id"]
+        if row["status"] != "running" or run_id is None:
+            return False, "task is not in an active production run"
+        if expected_run_id is not None and int(run_id) != int(expected_run_id):
+            return False, "run_id mismatch"
+        if _retry_status_for_run(conn, task_id, int(run_id)) != "production_ready":
+            return False, "active run was not claimed from production_ready"
+        proof = metadata if isinstance(metadata, dict) else {}
+        required = {
+            "production_version": proof.get("production_version"),
+            "deployed_at": proof.get("deployed_at"),
+            "canary": proof.get("canary"),
+            "main_promotion": proof.get("main_promotion"),
+            "backup": proof.get("backup"),
+            "rollback_prepared": proof.get("rollback_prepared"),
+        }
+        missing = [key for key, value in required.items() if not value]
+        if missing:
+            return False, "production metadata is incomplete: " + ", ".join(missing)
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'prod_implemented', assignee = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (reviewer, task_id, int(run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during production handoff"
+        ended_run_id = _end_run(
+            conn, task_id, outcome="prod_implemented",
+            status="prod_implemented", summary=summary, metadata=metadata,
+        )
+        _append_event(
+            conn, task_id, "prod_implemented",
+            {"implementer": row["assignee"], "reviewer": reviewer,
+             "status": "prod_implemented",
+             "production_version": proof.get("production_version"),
+             "deployed_at": proof.get("deployed_at")},
+            run_id=ended_run_id,
+        )
+    return True, reviewer
+
+
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6658,7 +6902,8 @@ def request_changes(
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
-    The transition is valid only for a run claimed from ``review``.  It closes
+    The transition is valid for a run claimed from ``review`` or
+    ``prod_implemented``. It closes
     that reviewer run, restores the implementer recorded by the latest
     ``review_requested`` event, reapplies parent gating, and emits an auditable
     ``changes_requested`` event.  The second tuple item is the implementer on
@@ -6697,8 +6942,9 @@ def request_changes(
             claimed_payload = {}
         if not isinstance(claimed_payload, dict):
             claimed_payload = {}
-        if claimed_payload.get("source_status") != "review":
-            return False, "active run was not claimed from review"
+        source_status = claimed_payload.get("source_status")
+        if source_status not in ("review", "prod_implemented"):
+            return False, "active run was not claimed from a review phase"
 
         requested_event = conn.execute(
             "SELECT payload FROM task_events "
@@ -6727,7 +6973,10 @@ def request_changes(
         else:
             reviewer = None
 
-        new_status = _landing_status_after_parents(conn, task_id)
+        if source_status == "prod_implemented" and _parents_satisfied(conn, task_id):
+            new_status = "production_ready"
+        else:
+            new_status = _landing_status_after_parents(conn, task_id)
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
@@ -6762,6 +7011,12 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "source_status": source_status,
+                "retry_status": (
+                    "production_ready"
+                    if source_status == "prod_implemented"
+                    else new_status
+                ),
             },
             run_id=run_id,
         )
@@ -7026,8 +7281,8 @@ def invalidate_descendants_for_parent_reopen(
 
     THE single domain implementation of done-reopen descendant invalidation.
     When a ``done`` (or ``archived``) ancestor is reopened, every descendant
-    whose state assumed the ancestor's result — ``ready``, ``review``,
-    ``running`` or ``done`` — is building on a retracted premise, so it is
+    whose state assumed the ancestor's result — including production phases —
+    is building on a retracted premise, so it is
     demoted to ``todo`` and re-gated on the graph. The CLI deliberately has
     NO done-reopen verb on this branch (``reopen-review`` only handles the
     review-phase transition via :func:`reopen_review_task`), so every surface
@@ -7100,12 +7355,15 @@ def invalidate_descendants_for_parent_reopen(
         ).fetchall()
         for row in rows:
             previous_status = row["status"]
-            if previous_status not in {"ready", "review", "running", "done"}:
+            if previous_status not in {
+                "ready", "review", "production_ready", "prod_implemented",
+                "running", "done",
+            }:
                 continue
             resume_status = "ready"
             run_id = None
-            if previous_status == "review":
-                resume_status = "review"
+            if previous_status in {"review", "production_ready", "prod_implemented"}:
+                resume_status = previous_status
             elif previous_status == "running":
                 resume_status = _retry_status_for_run(
                     conn, row["id"], row["current_run_id"]
@@ -9241,7 +9499,8 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+                    "WHERE id = ? AND status IN ("
+                    "'running', 'ready', 'review', 'production_ready', 'prod_implemented')",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -9251,7 +9510,8 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
+                    "WHERE id = ? AND status IN ("
+                    "'ready', 'review', 'production_ready', 'prod_implemented', 'running')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -9553,7 +9813,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL "
+        "WHERE status IN ('ready', 'production_ready') AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
@@ -9579,7 +9839,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
+        "WHERE status IN ('review', 'prod_implemented') AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
@@ -10035,7 +10295,7 @@ def _dispatch_once_locked(
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "WHERE status IN ('ready', 'production_ready') AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -10044,7 +10304,7 @@ def _dispatch_once_locked(
     if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
+            "WHERE status IN ('review', 'prod_implemented') AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs

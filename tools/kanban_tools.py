@@ -1021,6 +1021,77 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return tool_error(f"kanban_request_changes: {e}")
 
 
+def _production_metadata(args: dict) -> tuple[Optional[dict], Optional[str]]:
+    metadata = args.get("metadata")
+    if not isinstance(metadata, dict):
+        return None, "metadata must be an object/dict"
+    try:
+        return json.loads(
+            redact_sensitive_text(json.dumps(metadata), force=True)
+        ), None
+    except (TypeError, json.JSONDecodeError):
+        return None, "metadata could not be safely serialized"
+
+
+def _handle_approve_production(args: dict, **kw) -> str:
+    """Architect GO: safely route a reviewed card to production Ops."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    metadata, error = _production_metadata(args)
+    if error:
+        return tool_error(error)
+    summary = redact_sensitive_text(str(args.get("summary") or ""), force=True)
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok, detail = kb.approve_production(
+                conn, tid, summary=summary, metadata=metadata,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(f"could not approve production for {tid}: {detail}")
+            return _ok(task_id=tid, status="production_ready", implementer=detail)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_approve_production failed")
+        return tool_error(f"kanban_approve_production: {e}")
+
+
+def _handle_mark_prod_implemented(args: dict, **kw) -> str:
+    """Ops handoff after deploying an exact production version."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    metadata, error = _production_metadata(args)
+    if error:
+        return tool_error(error)
+    summary = redact_sensitive_text(str(args.get("summary") or ""), force=True)
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok, detail = kb.mark_prod_implemented(
+                conn, tid, summary=summary, metadata=metadata,
+                reviewer=str(args.get("reviewer") or "architect"),
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(f"could not mark production implemented for {tid}: {detail}")
+            return _ok(task_id=tid, status="prod_implemented", reviewer=detail)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_mark_prod_implemented failed")
+        return tool_error(f"kanban_mark_prod_implemented: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1977,6 +2048,61 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
     },
 }
 
+KANBAN_APPROVE_PRODUCTION_SCHEMA = {
+    "name": "kanban_approve_production",
+    "description": (
+        "Architect GO after source review. Moves a safe card to "
+        "production_ready and restores its implementer so Ops deploys it. "
+        "Credentials, secrets, destructive data operations, money, legal, "
+        "and external actions are refused: create a separate blocked human "
+        "gate with no assignee for those decisions."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "summary": {"type": "string"},
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Must include risk_classification with category, "
+                    "high_risk=false, and human_gate_required=false."
+                ),
+                "additionalProperties": True,
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary", "metadata"],
+    },
+}
+
+KANBAN_MARK_PROD_IMPLEMENTED_SCHEMA = {
+    "name": "kanban_mark_prod_implemented",
+    "description": (
+        "Ops production handoff after canary, promotion, and deployment of "
+        "an exact version. Moves the card to prod_implemented for an "
+        "independent Architect live review; it does not mark the card done."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "summary": {"type": "string"},
+            "reviewer": {"type": "string", "default": "architect"},
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Must include production_version, deployed_at, canary, "
+                    "main_promotion, backup, and rollback_prepared."
+                ),
+                "additionalProperties": True,
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary", "metadata"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2405,6 +2531,24 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
+)
+
+registry.register(
+    name="kanban_approve_production",
+    toolset="kanban",
+    schema=KANBAN_APPROVE_PRODUCTION_SCHEMA,
+    handler=_handle_approve_production,
+    check_fn=_check_kanban_mode,
+    emoji="🚀",
+)
+
+registry.register(
+    name="kanban_mark_prod_implemented",
+    toolset="kanban",
+    schema=KANBAN_MARK_PROD_IMPLEMENTED_SCHEMA,
+    handler=_handle_mark_prod_implemented,
+    check_fn=_check_kanban_mode,
+    emoji="🏭",
 )
 
 registry.register(

@@ -148,7 +148,8 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+    "production_ready", "prod_implemented", "done",
 ]
 
 
@@ -895,6 +896,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            if (
+                task.status in ("production_ready", "prod_implemented")
+                and s not in (task.status, "blocked")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cannot move a machine-owned {task.status} card to '{s}'; "
+                        "use the audited production transition or block it"
+                    ),
+                )
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -935,6 +947,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     ok = reopened if reopened is not None else _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
+            elif s in ("production_ready", "prod_implemented"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cannot set status to '{s}' directly; use the audited "
+                        "Architect/Ops production transition"
+                    ),
+                )
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
@@ -1340,6 +1360,20 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    if (
+                        task.status in ("production_ready", "prod_implemented")
+                        and s not in (task.status, "blocked")
+                    ):
+                        entry.update(
+                            ok=False,
+                            error=(
+                                f"Cannot move a machine-owned {task.status} card "
+                                f"to '{s}'; use the audited production transition "
+                                "or block it"
+                            ),
+                        )
+                        results.append(entry)
+                        continue
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
@@ -1371,6 +1405,16 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             error=(
                                 "Cannot set status to 'running' directly; "
                                 "use the dispatcher/claim path"
+                            ),
+                        )
+                        results.append(entry)
+                        continue
+                    elif s in {"production_ready", "prod_implemented"}:
+                        entry.update(
+                            ok=False,
+                            error=(
+                                f"Cannot set status to '{s}' directly; use the "
+                                "audited Architect/Ops production transition"
                             ),
                         )
                         results.append(entry)

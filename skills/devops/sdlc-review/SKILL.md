@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
 description: Review Kanban handoffs and route verified outcomes.
-version: 1.1.0
+version: 1.2.0
 author: Jakub Wolniewicz (@frizikk) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -22,16 +22,18 @@ Independently verify work handed from a Kanban implementation run to the review 
 
 Use this skill when all of the following are true:
 
-- the dispatcher spawned you for a task claimed from the `review` lane;
-- an implementer submitted a `review_requested` handoff;
-- the task needs an independent verdict before it can be completed.
+- the dispatcher spawned you for a task claimed from `review` or
+  `prod_implemented`;
+- the task needs an independent source or live-production verdict.
 
 Do not use it for a separate downstream review card. A downstream card is ordinary implementation work with a review-oriented specification and completes through its own lifecycle.
 
 ## Prerequisites
 
 - A Kanban worker context with the current task and run identifiers.
-- Native Kanban tools: `kanban_show`, `kanban_comment`, `kanban_complete`, `kanban_request_changes`, and `kanban_block`.
+- Native Kanban tools: `kanban_show`, `kanban_comment`,
+  `kanban_approve_production`, `kanban_complete`, `kanban_request_changes`,
+  and `kanban_block`.
 - Workspace access through `read_file`, `search_files`, and `terminal` when the deliverable is code.
 - The task's original specification, acceptance criteria, handoff summary, and prior run history must be available through `kanban_show`.
 
@@ -48,7 +50,8 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 | Verdict | When | Final action |
 |---|---|---|
-| Approve | Acceptance criteria and verification pass | `kanban_complete` |
+| Source GO | Source acceptance and verification pass | `kanban_approve_production` |
+| Live GO | Exact deployed version, probes, and rollback pass | `kanban_complete` with production proof |
 | Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
@@ -108,16 +111,48 @@ For non-code work:
 
 #### Approve
 
-Approve only when the acceptance criteria are satisfied and the evidence is sufficient. Call:
+For a source review claimed from `review`, approval is not completion. Classify
+the risk and call:
 
 ```text
-kanban_complete(
+kanban_approve_production(
     summary="Reviewed and approved. <what was verified>",
-    metadata={"review_outcome": "approved", "reviewer_checks": [...]}
+    metadata={
+        "review_outcome": "approved",
+        "reviewer_checks": [...],
+        "risk_classification": {
+            "category": "standard_code",
+            "high_risk": false,
+            "human_gate_required": false
+        }
+    }
 )
 ```
 
-Include the exact checks that passed and any bounded caveat that does not block acceptance.
+This routes the same card to `production_ready` and restores its implementer.
+Never classify credentials, secrets, destructive data operations, money/legal
+decisions, architecture decisions, or external actions as safe. Split those
+into a distinct `blocked` human gate with no assignee.
+
+For a live review claimed from `prod_implemented`, verify the exact deployed
+version, post-deploy probes, and rollback. Only then call:
+
+```text
+kanban_complete(
+    summary="Live production verification GO. <what was verified>",
+    metadata={
+        "delivery_level": "verified_production",
+        "production_version": "<exact SHA or immutable version>",
+        "deployed_at": "<timestamp>",
+        "post_deploy_checks": {...},
+        "rollback": {...}
+    }
+)
+```
+
+Include the exact checks that passed and any bounded caveat that does not block
+acceptance. A live NO-GO uses `kanban_request_changes`, which routes the same
+card back to `production_ready` for rollback, correction, and redeployment.
 
 #### Request changes
 
@@ -165,6 +200,10 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Skipping prior rounds:** Re-review must confirm both the requested corrections and preservation of previously passing behavior.
 - **Using blockers for ordinary rework:** Correctable defects belong in `kanban_request_changes`; reserve `kanban_block` for genuine external blockers or human decisions.
 - **Completing without evidence:** Every approval summary must name the checks or artifacts actually inspected.
+- **Source review → done:** Never call `kanban_complete` from `review`; use
+  `kanban_approve_production`.
+- **Unsafe automation:** Never auto-produce credentials, destructive data work,
+  money/legal decisions, architecture decisions, or external actions.
 
 ## Verification
 
@@ -176,6 +215,7 @@ Before submitting the verdict, confirm:
 - [ ] Relevant focused checks were run or an explicit reason was recorded when execution was impossible.
 - [ ] Prior requested changes were re-tested on re-review.
 - [ ] Unrelated regressions and scope changes were considered.
-- [ ] The verdict uses exactly one terminal action.
+- [ ] Source GO uses `kanban_approve_production`; live GO alone uses
+      `kanban_complete` with complete production proof.
 - [ ] The summary contains concrete, non-secret evidence.
 - [ ] No implementation files were edited by the reviewer.
