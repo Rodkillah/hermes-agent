@@ -69,14 +69,14 @@ def _claimed_review(
 
 
 def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
-    task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
+    task_id = kb.create_task(conn, title="Implement guarded export", assignee="ironrod-ops")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
 
     assert kb.request_review(
         conn,
         task_id,
-        reviewer="reviewer",
+        reviewer="architect",
         summary="Implementation and focused tests are ready.",
         metadata={"commit": "abc123"},
         expected_run_id=implementation.current_run_id,
@@ -85,13 +85,13 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     awaiting_review = kb.get_task(conn, task_id)
     assert awaiting_review is not None
     assert awaiting_review.status == "review"
-    assert awaiting_review.assignee == "reviewer"
+    assert awaiting_review.assignee == "architect"
     assert awaiting_review.current_run_id is None
 
     first_events = kb.list_events(conn, task_id)
     requested = _event(first_events, "review_requested")
-    assert requested.payload["implementer"] == "builder"
-    assert requested.payload["reviewer"] == "reviewer"
+    assert requested.payload["implementer"] == "ironrod-ops"
+    assert requested.payload["reviewer"] == "architect"
     assert requested.payload["summary"] == "Implementation and focused tests are ready."
     implementation_run = _run(kb.list_runs(conn, task_id), "review_requested")
     assert implementation_run.summary == "Implementation and focused tests are ready."
@@ -104,18 +104,18 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
         task_id,
         reason="Add a regression for the fallback branch.",
         expected_run_id=review.current_run_id,
-    ) == (True, "builder")
+    ) == (True, "ironrod-ops")
 
     rework = kb.get_task(conn, task_id)
     assert rework is not None
     assert rework.status == "ready"
-    assert rework.assignee == "builder"
+    assert rework.assignee == "ironrod-ops"
     assert rework.current_run_id is None
     changes = _event(kb.list_events(conn, task_id), "changes_requested")
     assert changes.payload is not None
     assert changes.payload["reason"] == "Add a regression for the fallback branch."
-    assert changes.payload["implementer"] == "builder"
-    assert changes.payload["reviewer"] == "reviewer"
+    assert changes.payload["implementer"] == "ironrod-ops"
+    assert changes.payload["reviewer"] == "architect"
     _run(kb.list_runs(conn, task_id), "changes_requested")
 
     implementation_2 = kb.claim_task(conn, task_id, claimer="builder:2")
@@ -129,31 +129,31 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     awaiting_rereview = kb.get_task(conn, task_id)
     assert awaiting_rereview is not None
     assert awaiting_rereview.status == "review"
-    assert awaiting_rereview.assignee == "reviewer"
+    assert awaiting_rereview.assignee == "architect"
     review_2 = kb.claim_review_task(conn, task_id, claimer="reviewer:2")
     assert review_2 is not None
-    assert review_2.assignee == "reviewer"
+    assert review_2.assignee == "architect"
     review_run = kb.latest_run(conn, task_id)
     assert review_run is not None
-    assert review_run.profile == "reviewer"
+    assert review_run.profile == "architect"
     assert kb.approve_production(
         conn, task_id, summary="Approved after independent verification.",
         metadata={"risk_classification": {
             "category": "standard_code", "high_risk": False,
             "human_gate_required": False,
-        }}, expected_run_id=review_2.current_run_id,
+        }}, expected_run_id=review_2.current_run_id, actor="architect",
     )[0]
     production = kb.claim_task(conn, task_id, claimer="builder:prod")
     assert production is not None
     assert kb.mark_prod_implemented(
         conn, task_id,
         metadata={
-            "production_version": "abc123", "deployed_at": "now",
-            "canary": {"result": "passed"},
-            "main_promotion": {"mode": "fast-forward"},
-            "backup": {"created": True},
+            "production_version": "a" * 40, "deployed_at": "2026-08-24T12:00:00+02:00",
+            "canary": {"result": "passed", "production_version": "a" * 40},
+            "main_promotion": {"mode": "fast-forward", "sha": "a" * 40, "remote": "origin/main"},
+            "backup": {"created": True, "id": "backup-1"},
             "rollback_prepared": {"tested": True},
-        },
+        }, actor="ironrod-ops",
         expected_run_id=production.current_run_id,
     )[0]
     live = kb.claim_review_task(conn, task_id, claimer="reviewer:live")
@@ -163,10 +163,11 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
         summary="Live production verified.",
         metadata={
             "delivery_level": "verified_production",
-            "production_version": "abc123", "deployed_at": "now",
-            "post_deploy_checks": {"health": "ok"},
-            "rollback": {"verified": True},
+            "production_version": "a" * 40, "deployed_at": "2026-08-24T12:00:00+02:00",
+            "post_deploy_checks": {"result": "passed", "production_version": "a" * 40},
+            "rollback": {"verified": True, "available": True},
         }, expected_run_id=live.current_run_id,
+        actor="architect",
     )
 
     completed = kb.get_task(conn, task_id)

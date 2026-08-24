@@ -87,7 +87,8 @@
   }
 
   // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "production_ready", "prod_implemented", "done"];
+  const MACHINE_PRODUCTION_COLUMNS = new Set(["production_ready", "prod_implemented"]);
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
@@ -98,6 +99,8 @@
     running: "In Progress",
     blocked: "Blocked",
     review: "Review",
+    production_ready: "Production ready",
+    prod_implemented: "Prod implemented",
     done: "Done",
     archived: "Archived",
   };
@@ -108,6 +111,8 @@
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
     review: "Implementation complete — awaiting review",
+    production_ready: "Architect GO recorded — Ops deployment is queued",
+    prod_implemented: "Exact version deployed — Architect live verification is queued",
     done: "Completed",
     archived: "Archived",
   };
@@ -176,6 +181,8 @@
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
     review: "hermes-kanban-dot-review",
+    production_ready: "hermes-kanban-dot-production-ready",
+    prod_implemented: "hermes-kanban-dot-prod-implemented",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
@@ -2827,12 +2834,14 @@
     const [dragOver, setDragOver] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
     const colRef = useRef(null);
+    const machineLocked = MACHINE_PRODUCTION_COLUMNS.has(props.column.name);
 
     // Listen for our synthetic touch-drop events from attachTouchDrag().
     useEffect(function () {
       if (!colRef.current) return undefined;
       const el = colRef.current;
       function onTouchDrop(e) {
+        if (machineLocked) return;
         if (e.detail && e.detail.status === props.column.name) {
           const taskId = e.detail.taskId;
           if (props.selectedIds && props.selectedIds.has(taskId) && props.selectedIds.size > 1 && props.onMoveSelected) {
@@ -2844,15 +2853,17 @@
       }
       el.addEventListener("hermes-kanban:drop", onTouchDrop);
       return function () { el.removeEventListener("hermes-kanban:drop", onTouchDrop); };
-    }, [props.column.name, props.onMove, props.selectedIds, props.onMoveSelected]);
+    }, [machineLocked, props.column.name, props.onMove, props.selectedIds, props.onMoveSelected]);
 
     const handleDragOver = function (e) {
+      if (machineLocked) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       if (!dragOver) setDragOver(true);
     };
     const handleDragLeave = function () { setDragOver(false); };
     const handleDrop = function (e) {
+      if (machineLocked) return;
       e.preventDefault();
       setDragOver(false);
       const taskId = e.dataTransfer.getData(MIME_TASK);
@@ -2885,6 +2896,7 @@
       className: cn(
         "hermes-kanban-column",
         dragOver ? "hermes-kanban-column--drop" : "",
+        machineLocked ? "hermes-kanban-column--machine-locked" : "",
       ),
       onDragOver: handleDragOver,
       onDragLeave: handleDragLeave,
@@ -3057,7 +3069,7 @@
         props.draggingSource ? "hermes-kanban-card--dragging-source" : "",
         stalenessClass(t),
       ),
-      draggable: true,
+      draggable: !MACHINE_PRODUCTION_COLUMNS.has(t.status),
       tabIndex: 0,
       role: "button",
       "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,

@@ -2326,6 +2326,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                actor=_profile_author(),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2540,6 +2541,7 @@ def _cmd_approve_production(args: argparse.Namespace) -> int:
         ok, detail = kb.approve_production(
             conn, args.task_id, summary=args.summary, metadata=metadata,
             expected_run_id=_worker_run_id_for(args.task_id),
+            actor=_profile_author(),
         )
     if not ok:
         print(f"cannot approve production for {args.task_id}: {detail}", file=sys.stderr)
@@ -2557,6 +2559,7 @@ def _cmd_mark_prod_implemented(args: argparse.Namespace) -> int:
             conn, args.task_id, summary=args.summary, metadata=metadata,
             reviewer=args.reviewer,
             expected_run_id=_worker_run_id_for(args.task_id),
+            actor=_profile_author(),
         )
     if not ok:
         print(

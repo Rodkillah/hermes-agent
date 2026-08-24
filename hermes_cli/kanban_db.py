@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+from datetime import datetime
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -5379,6 +5380,7 @@ def _production_completion_error(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: Optional[dict],
+    actor: Optional[str],
 ) -> Optional[str]:
     """Return a diagnostic when completion would bypass production proof."""
     row = conn.execute(
@@ -5404,6 +5406,14 @@ def _production_completion_error(
         )
     if source_status != "prod_implemented":
         return None
+    task_owner = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if (
+        not actor
+        or _canonical_assignee(actor) != "architect"
+        or not task_owner
+        or _canonical_assignee(task_owner["assignee"]) != "architect"
+    ):
+        return "only architect may complete live production verification"
     proof = metadata if isinstance(metadata, dict) else {}
     missing: list[str] = []
     if proof.get("delivery_level") != "verified_production":
@@ -5412,10 +5422,33 @@ def _production_completion_error(
         missing.append("production_version")
     if not str(proof.get("deployed_at") or "").strip():
         missing.append("deployed_at")
-    if not proof.get("post_deploy_checks"):
+    checks = proof.get("post_deploy_checks")
+    if not isinstance(checks, dict) or checks.get("result") != "passed":
         missing.append("post_deploy_checks")
-    if not proof.get("rollback"):
+    rollback = proof.get("rollback")
+    if (
+        not isinstance(rollback, dict)
+        or rollback.get("verified") is not True
+        or rollback.get("available") is not True
+    ):
         missing.append("rollback")
+    deployed_run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'prod_implemented' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        deployed = json.loads(deployed_run["metadata"]) if deployed_run and deployed_run["metadata"] else {}
+    except (json.JSONDecodeError, TypeError):
+        deployed = {}
+    if not isinstance(deployed, dict):
+        deployed = {}
+    if proof.get("production_version") != deployed.get("production_version"):
+        missing.append("production_version_matches_deployment")
+    if proof.get("deployed_at") != deployed.get("deployed_at"):
+        missing.append("deployed_at_matches_deployment")
+    if isinstance(checks, dict) and checks.get("production_version") != deployed.get("production_version"):
+        missing.append("post_deploy_checks.production_version")
     if missing:
         return "production verification proof is incomplete: " + ", ".join(missing)
     return None
@@ -5435,6 +5468,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    actor: Optional[str] = None,
 ) -> bool:
     """Transition eligible work to ``done`` and record ``result``.
 
@@ -5502,7 +5536,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    lifecycle_error = _production_completion_error(conn, task_id, metadata)
+    lifecycle_error = _production_completion_error(conn, task_id, metadata, actor)
     if lifecycle_error:
         raise ProductionLifecycleError(lifecycle_error)
     with write_txn(conn):
@@ -5516,7 +5550,7 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
-        lifecycle_error = _production_completion_error(conn, task_id, metadata)
+        lifecycle_error = _production_completion_error(conn, task_id, metadata, actor)
         if lifecycle_error:
             raise ProductionLifecycleError(lifecycle_error)
         if expected_run_id is None:
@@ -6738,6 +6772,10 @@ _AUTO_PRODUCTION_DENY_TERMS = (
     "destructive migration", "payment", "paiement", "legal", "juridique",
     "contract", "contrat", "external action", "action externe",
     "architecture decision", "architectural decision", "décision d'architecture",
+    "publish", "publication", "customer notification", "notification client",
+    "send customer", "purchase", "achat", "budget", "redesign", "topology",
+    "topologie", "alter schema", "schema migration", "migration de schéma",
+    "drop column", "force-push", "force push", "provider action",
 )
 
 
@@ -6775,14 +6813,36 @@ def approve_production(
     *,
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
+    actor: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Record Architect GO and route a safe card to production Ops."""
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    if not actor or _canonical_assignee(actor) != "architect":
+        return False, "only architect may approve production"
     risk_error = _auto_production_risk_error(conn, task_id, metadata)
     if risk_error:
-        return False, risk_error
+        gate_id = create_task(
+            conn,
+            title=f"Human approval gate for {task_id}",
+            body=(
+                "Reserved human decision. Review the linked technical card and "
+                "record explicit approval before retrying Architect review."
+            ),
+            assignee=None,
+            created_by="architect",
+            initial_status="blocked",
+            idempotency_key=f"production-human-gate:{task_id}",
+        )
+        link_tasks(conn, gate_id, task_id)
+        block_task(
+            conn, task_id,
+            reason=f"human gate required: {gate_id}; {risk_error}",
+            kind="dependency",
+            expected_run_id=expected_run_id,
+        )
+        return False, f"{risk_error}; human gate {gate_id} created"
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
@@ -6790,6 +6850,8 @@ def approve_production(
         ).fetchone()
         if row is None:
             return False, "task not found"
+        if _canonical_assignee(row["assignee"]) != "architect":
+            return False, "source review is not owned by architect"
         run_id = row["current_run_id"]
         if row["status"] != "running" or run_id is None:
             return False, "task is not in an active Architect review run"
@@ -6838,12 +6900,17 @@ def mark_prod_implemented(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     reviewer: str = "architect",
+    actor: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Record exact deployment and route the card to independent live review."""
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    if not actor or _canonical_assignee(actor) != "ironrod-ops":
+        return False, "only ironrod-ops may mark production implemented"
     reviewer = _canonical_assignee(reviewer)
+    if reviewer != "architect":
+        return False, "live production reviewer must be architect"
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
@@ -6851,6 +6918,8 @@ def mark_prod_implemented(
         ).fetchone()
         if row is None:
             return False, "task not found"
+        if _canonical_assignee(row["assignee"]) != "ironrod-ops":
+            return False, "production run is not owned by ironrod-ops"
         run_id = row["current_run_id"]
         if row["status"] != "running" or run_id is None:
             return False, "task is not in an active production run"
@@ -6859,15 +6928,36 @@ def mark_prod_implemented(
         if _retry_status_for_run(conn, task_id, int(run_id)) != "production_ready":
             return False, "active run was not claimed from production_ready"
         proof = metadata if isinstance(metadata, dict) else {}
-        required = {
-            "production_version": proof.get("production_version"),
-            "deployed_at": proof.get("deployed_at"),
-            "canary": proof.get("canary"),
-            "main_promotion": proof.get("main_promotion"),
-            "backup": proof.get("backup"),
-            "rollback_prepared": proof.get("rollback_prepared"),
-        }
-        missing = [key for key, value in required.items() if not value]
+        version = str(proof.get("production_version") or "").strip().lower()
+        deployed_at = str(proof.get("deployed_at") or "").strip()
+        canary = proof.get("canary")
+        promotion = proof.get("main_promotion")
+        backup = proof.get("backup")
+        rollback_prepared = proof.get("rollback_prepared")
+        missing: list[str] = []
+        if not re.fullmatch(r"[0-9a-f]{40}", version):
+            missing.append("production_version_exact_sha")
+        try:
+            datetime.fromisoformat(deployed_at.replace("Z", "+00:00"))
+        except ValueError:
+            missing.append("deployed_at_iso8601")
+        if not isinstance(canary, dict) or canary.get("result") != "passed" or canary.get("production_version") != version:
+            missing.append("canary_passed_exact_version")
+        if (
+            not isinstance(promotion, dict)
+            or promotion.get("mode") != "fast-forward"
+            or promotion.get("sha") != version
+            or promotion.get("remote") != "origin/main"
+        ):
+            missing.append("main_promotion_fast_forward_exact_remote")
+        if (
+            not isinstance(backup, dict)
+            or backup.get("created") is not True
+            or not str(backup.get("id") or backup.get("location") or "").strip()
+        ):
+            missing.append("backup_created_with_identifier")
+        if not isinstance(rollback_prepared, dict) or rollback_prepared.get("tested") is not True:
+            missing.append("rollback_prepared_tested")
         if missing:
             return False, "production metadata is incomplete: " + ", ".join(missing)
         cur = conn.execute(
@@ -10559,8 +10649,8 @@ def _dispatch_once_locked(
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
     # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the candidate and either approves
-    # (→ done) or requests changes (→ ready/todo for the implementer).
+    # sdlc-review skill) that verifies either source or live production.
+    # Source GO enters production_ready; live GO alone enters done.
     #
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of

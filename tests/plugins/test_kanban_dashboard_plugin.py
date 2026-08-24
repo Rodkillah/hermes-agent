@@ -22,6 +22,21 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 
 
+def test_packaged_dashboard_bundle_contains_production_columns():
+    root = Path(__file__).resolve().parents[2]
+    plugin = root / "plugins" / "kanban" / "dashboard"
+    manifest = json.loads((plugin / "manifest.json").read_text())
+    assert manifest["entry"] == "dist/index.js"
+    assert manifest["css"] == "dist/style.css"
+    bundle = (plugin / "dist" / "index.js").read_text()
+    css = (plugin / "dist" / "style.css").read_text()
+    assert '"production_ready"' in bundle
+    assert '"prod_implemented"' in bundle
+    assert "MACHINE_PRODUCTION_COLUMNS" in bundle
+    assert "hermes-kanban-dot-production-ready" in css
+    assert "hermes-kanban-dot-prod-implemented" in css
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -317,7 +332,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         child_id = kb.create_task(
             conn,
             title="child in review",
-            assignee="reviewer",
+            assignee="ironrod-ops",
             parents=[parent_id],
         )
         grandchild_id = kb.create_task(
@@ -331,7 +346,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         assert kb.request_review(
             conn,
             child_id,
-            summary="ready",
+                summary="ready", reviewer="architect",
             expected_run_id=implementation.current_run_id,
         )
         active_review = kb.claim_review_task(conn, child_id)
@@ -373,7 +388,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
             metadata={"risk_classification": {
                 "category": "standard_code", "high_risk": False,
                 "human_gate_required": False,
-            }}, expected_run_id=review.current_run_id,
+            }}, expected_run_id=review.current_run_id, actor="architect",
         )[0]
         assert kb.get_task(conn, child_id).status == "production_ready"
         grandchild = kb.get_task(conn, grandchild_id)
@@ -1230,4 +1245,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-

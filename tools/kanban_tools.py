@@ -771,6 +771,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    actor=os.environ.get("HERMES_PROFILE"),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1051,6 +1052,7 @@ def _handle_approve_production(args: dict, **kw) -> str:
             ok, detail = kb.approve_production(
                 conn, tid, summary=summary, metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
+                actor=os.environ.get("HERMES_PROFILE"),
             )
             if not ok:
                 return tool_error(f"could not approve production for {tid}: {detail}")
@@ -1081,6 +1083,7 @@ def _handle_mark_prod_implemented(args: dict, **kw) -> str:
                 conn, tid, summary=summary, metadata=metadata,
                 reviewer=str(args.get("reviewer") or "architect"),
                 expected_run_id=_worker_run_id(tid),
+                actor=os.environ.get("HERMES_PROFILE"),
             )
             if not ok:
                 return tool_error(f"could not mark production implemented for {tid}: {detail}")

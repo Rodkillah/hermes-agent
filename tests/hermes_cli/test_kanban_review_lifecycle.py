@@ -632,12 +632,12 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
     approve -> done. Never blocks, never triages, and stays wake-subscribed
     until done."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="cycle", assignee="worker")
+        tid = kb.create_task(conn, title="cycle", assignee="ironrod-ops")
 
         # Pass 1: implement -> review.
         kb.claim_task(conn, tid)
         kb.request_review(
-            conn, tid, summary="v1",
+            conn, tid, summary="v1", reviewer="architect",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "review"
@@ -647,7 +647,7 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
         assert kb.get_task(conn, tid).status == "ready"
         kb.claim_task(conn, tid)
         kb.request_review(
-            conn, tid, summary="v2",
+            conn, tid, summary="v2", reviewer="architect",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "review"
@@ -661,18 +661,19 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
                 "category": "standard_code", "high_risk": False,
                 "human_gate_required": False,
             }}, expected_run_id=review.current_run_id,
+            actor="architect",
         )[0]
         production = kb.claim_task(conn, tid)
         assert production is not None
         assert kb.mark_prod_implemented(
             conn, tid,
             metadata={
-                "production_version": "abc123", "deployed_at": "now",
-                "canary": {"result": "passed"},
-                "main_promotion": {"mode": "fast-forward"},
-                "backup": {"created": True},
+                "production_version": "a" * 40, "deployed_at": "2026-08-24T12:00:00+02:00",
+                "canary": {"result": "passed", "production_version": "a" * 40},
+                "main_promotion": {"mode": "fast-forward", "sha": "a" * 40, "remote": "origin/main"},
+                "backup": {"created": True, "id": "backup-1"},
                 "rollback_prepared": {"tested": True},
-            },
+            }, actor="ironrod-ops",
             expected_run_id=production.current_run_id,
         )[0]
         live = kb.claim_review_task(conn, tid)
@@ -681,10 +682,10 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
             conn, tid, summary="approved",
             metadata={
                 "delivery_level": "verified_production",
-                "production_version": "abc123", "deployed_at": "now",
-                "post_deploy_checks": {"health": "ok"},
-                "rollback": {"verified": True},
-            }, expected_run_id=live.current_run_id,
+                "production_version": "a" * 40, "deployed_at": "2026-08-24T12:00:00+02:00",
+                "post_deploy_checks": {"result": "passed", "production_version": "a" * 40},
+                "rollback": {"verified": True, "available": True},
+            }, expected_run_id=live.current_run_id, actor="architect",
         )
         row = _row(conn, tid)
         assert row["status"] == "done"
