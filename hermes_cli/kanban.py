@@ -655,6 +655,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_resolve_loop = sub.add_parser(
+        "resolve-block-loop",
+        help="Resolve a block-loop triage task with retry, complete, or archive",
+    )
+    p_resolve_loop.add_argument("task_id")
+    p_resolve_loop.add_argument(
+        "decision", choices=("retry", "complete", "archive"),
+    )
+    p_resolve_loop.add_argument("--reason", required=True, help="Durable reason for the human decision.")
+    p_resolve_loop.add_argument("--actor", default=None, help="Decision maker (defaults to the active profile).")
+    p_resolve_loop.add_argument("--summary", default=None, help="Required handoff for complete.")
+    p_resolve_loop.add_argument("--result", default=None, help="Optional result text for complete.")
+    p_resolve_loop.add_argument("--metadata", default=None, help="JSON object for the completion handoff.")
+
     p_request_review = sub.add_parser(
         "request-review",
         help="Move a task to 'review' (implementation done, awaiting review) — NOT a block",
@@ -1130,6 +1144,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "resolve-block-loop": _cmd_resolve_block_loop,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -2413,6 +2428,41 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_resolve_block_loop(args: argparse.Namespace) -> int:
+    raw_metadata = getattr(args, "metadata", None)
+    metadata = None
+    if raw_metadata:
+        try:
+            metadata = json.loads(raw_metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
+    actor = (getattr(args, "actor", None) or _profile_author()).strip()
+    with kb.connect_closing() as conn:
+        ok = kb.resolve_block_loop_task(
+            conn,
+            args.task_id,
+            decision=args.decision,
+            actor=actor,
+            reason=args.reason,
+            summary=getattr(args, "summary", None),
+            result=getattr(args, "result", None),
+            metadata=metadata,
+        )
+        if not ok:
+            print(
+                f"cannot resolve block loop for {args.task_id} "
+                "(requires triage with block_loop_detected provenance and no active run)",
+                file=sys.stderr,
+            )
+            return 1
+        task = kb.get_task(conn, args.task_id)
+        print(f"Resolved {args.task_id}: {args.decision} → {task.status if task else 'unknown'}")
+    return 0
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
