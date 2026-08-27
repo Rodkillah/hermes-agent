@@ -6535,8 +6535,6 @@ def resolve_block_loop_task(
         raise ValueError("reason is required")
     if handoff and not summary and not result:
         summary = handoff
-    summary = _repair_utf8_mojibake(summary)
-    result = _repair_utf8_mojibake(result)
     metadata = redact_review_value(metadata)
     if metadata is not None and not isinstance(metadata, dict):
         raise ValueError("metadata must be an object/dict")
