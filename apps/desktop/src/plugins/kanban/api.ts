@@ -243,6 +243,18 @@ export const reassignTask = (id: string, profile: string) =>
 
 export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
 
+export const resolveBlockLoopTask = (
+  id: string,
+  body: {
+    actor: string
+    decision: 'archive' | 'complete' | 'retry'
+    expected_event_id?: number
+    reason: string
+    result?: string
+    summary?: string
+  }
+) => nudged(call(withBoard(`/tasks/${id}/resolve-block-loop`), { method: 'POST', body }))
+
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 

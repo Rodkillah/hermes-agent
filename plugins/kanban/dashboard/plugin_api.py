@@ -896,6 +896,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            if (
+                task.status == "triage"
+                and s != "triage"
+                and kanban_db.is_block_loop_triage(conn, task_id)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "block-loop triage must be resolved with "
+                        "POST /tasks/{task_id}/resolve-block-loop"
+                    ),
+                )
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -1758,6 +1770,55 @@ def terminate_run_endpoint(
 
 class ReclaimBody(BaseModel):
     reason: Optional[str] = None
+
+
+class ResolveBlockLoopBody(BaseModel):
+    decision: str
+    actor: str
+    reason: str
+    summary: Optional[str] = None
+    result: Optional[str] = None
+    metadata: Optional[dict] = None
+    expected_event_id: Optional[int] = None
+
+
+@router.post("/tasks/{task_id}/resolve-block-loop")
+def resolve_block_loop_endpoint(
+    task_id: str,
+    payload: ResolveBlockLoopBody,
+    board: Optional[str] = Query(None),
+):
+    """Apply an explicit retry/complete/archive decision to block-loop triage."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        actor = payload.actor.strip()
+        try:
+            ok = kanban_db.resolve_block_loop_task(
+                conn, task_id, decision=payload.decision, actor=actor,
+                reason=payload.reason, summary=payload.summary,
+                result=payload.result, metadata=payload.metadata,
+                expected_event_id=payload.expected_event_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cannot resolve block loop for {task_id}: requires triage "
+                    "with block_loop_detected provenance and no active run"
+                ),
+            )
+        task = kanban_db.get_task(conn, task_id)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "decision": payload.decision,
+            "status": task.status if task else None,
+        }
+    finally:
+        conn.close()
 
 
 @router.post("/tasks/{task_id}/reclaim")

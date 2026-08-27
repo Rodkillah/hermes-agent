@@ -6482,6 +6482,194 @@ def block_task(
     return True
 
 
+def is_block_loop_triage(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether ``task_id`` is block-loop triage provenance.
+
+    Dashboard status editing uses this read-only predicate to avoid creating a
+    second ``triage -> ready`` escape hatch beside the domain transition.
+    Only the latest state event counts; comments and other non-state events do
+    not change the provenance.
+    """
+    state_kinds = (
+        "block_loop_detected", "status", "blocked", "unblocked",
+        "dependency_wait", "promoted", "review_requested",
+        "changes_requested", "review_reopened", "completed", "archived",
+    )
+    placeholders = ", ".join("?" for _ in state_kinds)
+    row = conn.execute(
+        f"SELECT kind FROM task_events WHERE task_id = ? "
+        f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (task_id, *state_kinds),
+    ).fetchone()
+    return row is not None and row["kind"] == "block_loop_detected"
+
+
+def resolve_block_loop_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    actor: str,
+    reason: str,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    handoff: Optional[str] = None,
+    expected_event_id: Optional[int] = None,
+) -> bool:
+    """Resolve a task escalated by ``block_loop_detected``.
+
+    Only a task still in ``triage`` with no active claim and a latest state
+    event of ``block_loop_detected`` can use this transition. ``retry``
+    preserves block-loop memory, ``complete`` resets it and releases
+    dependants, while ``archive`` leaves dependants gated.
+    """
+    decision = str(decision or "").strip().lower()
+    if decision not in {"retry", "complete", "archive"}:
+        raise ValueError("decision must be one of 'retry', 'complete', or 'archive'")
+    actor = str(redact_review_value(actor or "")).strip()
+    reason = str(redact_review_value(reason or "")).strip()
+    if not actor:
+        raise ValueError("actor is required")
+    if not reason:
+        raise ValueError("reason is required")
+    if handoff and not summary and not result:
+        summary = handoff
+    summary = _repair_utf8_mojibake(summary)
+    result = _repair_utf8_mojibake(result)
+    metadata = redact_review_value(metadata)
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object/dict")
+    if decision == "complete" and not (
+        str(summary or "").strip() or str(result or "").strip()
+    ):
+        raise ValueError("complete decision requires a non-empty handoff (summary or result)")
+
+    state_kinds = (
+        "block_loop_detected", "status", "blocked", "unblocked",
+        "dependency_wait", "promoted", "review_requested",
+        "changes_requested", "review_reopened", "completed", "archived",
+    )
+    placeholders = ", ".join("?" for _ in state_kinds)
+    run_id: Optional[int] = None
+    release_dependants = False
+    cleanup_workspace = False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "triage":
+            return False
+        if any(
+            row[key] is not None
+            for key in ("current_run_id", "claim_lock", "claim_expires", "worker_pid")
+        ):
+            return False
+        # The task pointer is the normal ownership guard, but keep the
+        # transition fail-closed if an earlier writer left an orphaned live
+        # run row behind. A triage decision must never race an active worker,
+        # even when the task/run invariant is already damaged.
+        active_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if active_run is not None:
+            return False
+        provenance = conn.execute(
+            f"SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+            f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+            (task_id, *state_kinds),
+        ).fetchone()
+        if provenance is None or provenance["kind"] != "block_loop_detected":
+            return False
+        if expected_event_id is not None and int(provenance["id"]) != int(expected_event_id):
+            return False
+        try:
+            source = json.loads(provenance["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(source, dict):
+            return False
+        source_status = source.get("source_status")
+        if source_status not in {"ready", "review"}:
+            return False
+        # A human may bypass the goal judge for this explicit resolution, but
+        # must not bypass dependency gating: completing a child while one of
+        # its parents is still open would release descendants on an invalid
+        # graph.
+        if decision == "complete" and not _parents_satisfied(conn, task_id):
+            return False
+        resolved_payload = {
+            "decision": decision,
+            "actor": actor,
+            "reason": reason,
+            "source_event_id": int(provenance["id"]),
+            "source_status": source_status,
+        }
+
+        if decision == "retry":
+            landing = _landing_status_after_parents(conn, task_id)
+            new_status = "review" if source_status == "review" and landing == "ready" else landing
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status = 'triage' AND current_run_id IS NULL",
+                (new_status, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            resolved_payload["status"] = new_status
+        elif decision == "complete":
+            now = int(time.time())
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'done', result = ?, completed_at = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = NULL, block_recurrences = 0, current_run_id = NULL "
+                "WHERE id = ? AND status = 'triage' AND current_run_id IS NULL",
+                (result, now, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="completed",
+                summary=summary if summary is not None else result,
+                metadata=metadata,
+            )
+            resolved_payload["status"] = "done"
+            resolved_payload["run_id"] = run_id
+            _append_event(conn, task_id, "block_loop_resolved", resolved_payload, run_id=run_id)
+            _append_event(
+                conn, task_id, "completed",
+                {"summary": (summary or result or "").strip().splitlines()[0][:400]},
+                run_id=run_id,
+            )
+            release_dependants = True
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'archived', current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'triage' AND current_run_id IS NULL",
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                return False
+            resolved_payload["status"] = "archived"
+            cleanup_workspace = True
+
+        if decision != "complete":
+            _append_event(conn, task_id, "block_loop_resolved", resolved_payload)
+        if decision == "archive":
+            _append_event(conn, task_id, "archived", None)
+
+    if release_dependants:
+        recompute_ready(conn)
+    if cleanup_workspace:
+        _cleanup_workspace(conn, task_id)
+    return True
+
 
 def redact_review_value(value: Any) -> Any:
     """Redact secrets at the domain boundary for durable review handoffs."""

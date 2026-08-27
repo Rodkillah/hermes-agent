@@ -1134,3 +1134,45 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_resolve_block_loop_handler_archives_for_orchestrator(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "block_loop_detected",
+                {"source_status": "ready", "reason": "repeat"},
+            )
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_resolve_block_loop({
+        "task_id": tid,
+        "decision": "archive",
+        "actor": "amber",
+        "reason": "superseded",
+    }))
+    assert out["ok"] is True
+    assert out["status"] == "archived"
+
+
+def test_resolve_block_loop_handler_rejects_task_worker(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_resolve_block_loop({
+        "task_id": worker_env,
+        "decision": "archive",
+        "actor": "amber",
+        "reason": "not worker-owned",
+    }))
+    assert out.get("error")
+    assert "orchestrator-only" in out["error"]
