@@ -1230,3 +1230,41 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_resolve_block_loop_endpoint_retries_with_audit(client):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="input", kind="capability")
+        assert kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="input", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+    finally:
+        conn.close()
+
+    direct = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "ready"},
+    )
+    assert direct.status_code == 409, direct.text
+    assert "resolve-block-loop" in direct.json()["detail"]
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{tid}/resolve-block-loop",
+        json={"decision": "retry", "actor": "dashboard-user", "reason": "input fixed"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ready"
+
+    conn = kb.connect()
+    try:
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_resolved"][-1]
+        assert event.payload["actor"] == "dashboard-user"
+        assert event.payload["decision"] == "retry"
+    finally:
+        conn.close()

@@ -66,6 +66,39 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
+def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
+    db_path = tmp_path / "block-loop-resolution.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "block_loop_detected",
+                {"source_status": "ready", "recurrences": 2, "reason": "repeat"},
+            )
+        # Subscribe after the detection event so this test isolates the
+        # resolution notification rather than replaying both events.
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.resolve_block_loop_task(
+            conn, tid, decision="archive", actor="amber", reason="superseded"
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "block loop resolved" in adapter.sent[0]["text"]
+
+
 def _unseen_terminal_events(tid):
     conn = kb.connect()
     try:

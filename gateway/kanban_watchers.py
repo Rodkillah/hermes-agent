@@ -228,7 +228,7 @@ class GatewayKanbanWatchersMixin:
         stored cursor with kind in the terminal set (``completed``,
         ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
         ``review_requested``, ``changes_requested``,
-        ``block_loop_detected``). Sends one
+        ``block_loop_detected``, ``block_loop_resolved``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
         task is ``archived``. A ``done`` task can be reopened for review or
@@ -263,7 +263,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "block_loop_resolved", "review_requested", "changes_requested")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -686,6 +686,15 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
+                            )
+                        elif kind == "block_loop_resolved":
+                            payload = ev.payload or {}
+                            decision = str(payload.get("decision") or "resolved")
+                            reason = str(payload.get("reason") or "")[:160]
+                            suffix = f": {reason}" if reason else ""
+                            msg = (
+                                f"✅ {board_tag}{tag}Kanban {sub['task_id']} block loop "
+                                f"resolved — {decision}{suffix}"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS

@@ -288,6 +288,22 @@ parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
+To resolve the resulting human gate, an orchestrator must use the dedicated
+transition rather than generic `unblock`, `promote`, or `specify`:
+
+```bash
+hermes kanban resolve-block-loop t_abc retry --reason "retry after fixing the input"
+hermes kanban resolve-block-loop t_abc complete --reason "accepted as-is" \
+    --summary "Reviewed the existing outcome; no further execution is required."
+hermes kanban resolve-block-loop t_abc archive --reason "superseded by the replacement task"
+```
+
+The transition is fail-closed: the task must still be `triage`, have no active
+run, and retain its latest `block_loop_detected` provenance. `retry` restores
+`review` or parent-gated `ready`/`todo` without erasing loop memory; `complete`
+resets that memory and promotes dependants; `archive` does not promote them.
+Every decision records the actor and reason in a `block_loop_resolved` event.
+
 ## How workers interact with the board
 
 **Workers do not shell out to `hermes kanban`.** When the dispatcher spawns a worker it sets `HERMES_KANBAN_TASK=t_abcd` in the child's env, and that env var flips on a dedicated **kanban toolset** in the model's schema. The same toolset is also available to orchestrator profiles that enable `kanban` in their toolsets config. These tools read and mutate the board directly via the Python `kanban_db` layer, same as the CLI does. A running worker calls these like any other tool; it never sees or needs the `hermes kanban` CLI.
@@ -299,6 +315,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
+| `kanban_resolve_block_loop` | Orchestrator-only human decision for a `block_loop_detected` triage task: `retry`, `complete`, or `archive`. Requires an actor and durable reason; `complete` also requires a handoff. | `decision`, `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |

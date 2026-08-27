@@ -42,6 +42,7 @@ import {
   PROFILES_KEY,
   reassignTask,
   reclaimTask,
+  resolveBlockLoopTask,
   taskKey,
   uploadAttachment
 } from './api'
@@ -642,6 +643,33 @@ export function TaskDrawer({
     }
   })
 
+  const resolveBlockLoop = (decision: 'archive' | 'complete' | 'retry') => {
+    if (!task || task.status !== 'triage' || !detail?.events.some(event => event.kind === 'block_loop_detected')) {
+      return
+    }
+
+    const reason = window.prompt('Reason for this block-loop decision:')?.trim()
+
+    if (!reason) {
+      return
+    }
+
+    const summary = decision === 'complete'
+      ? window.prompt('Completion handoff (required):')?.trim()
+      : undefined
+
+    if (decision === 'complete' && !summary) {
+      return
+    }
+
+    void mutate(() => resolveBlockLoopTask(task.id, {
+      actor: 'desktop',
+      decision,
+      reason,
+      ...(summary ? { summary } : {})
+    }))()
+  }
+
   const uploadMut = useMutation({
     mutationFn: async (file: File) =>
       uploadAttachment(id!, {
@@ -789,6 +817,19 @@ export function TaskDrawer({
             {task.status === 'ready' && !task.assignee && !defaultAssignee && (
               <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
                 <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">{k.readyUnassignedBody}</p>
+              </Callout>
+            )}
+
+            {task.status === 'triage' && detail.events.some(event => event.kind === 'block_loop_detected') && (
+              <Callout title={k.notify.blockLoopTitle} tone={SEVERITY_TONE.error}>
+                <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
+                  This triage card came from a repeated block loop. Choose an explicit human decision.
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  <Button onClick={() => resolveBlockLoop('retry')} size="xs" variant="secondary">Retry</Button>
+                  <Button onClick={() => resolveBlockLoop('complete')} size="xs" variant="outline">Complete</Button>
+                  <Button onClick={() => resolveBlockLoop('archive')} size="xs" variant="outline">{k.archiveTask}</Button>
+                </div>
               </Callout>
             )}
 

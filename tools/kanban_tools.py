@@ -1725,6 +1725,55 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_resolve_block_loop(args: dict, **kw) -> str:
+    """Apply an explicit orchestrator decision to a block-loop triage card."""
+    delegated_err = _reject_delegated_child_mutation("kanban_resolve_block_loop")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_resolve_block_loop")
+    if guard:
+        return guard
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return tool_error("reason is required — explain the human decision")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object/dict")
+    actor = str(args.get("actor") or "").strip()
+    if not actor:
+        return tool_error("actor is required — identify the human decision maker")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.resolve_block_loop_task(
+                conn, tid,
+                decision=args.get("decision"), actor=actor, reason=reason,
+                summary=args.get("summary"), result=args.get("result"),
+                metadata=metadata, handoff=args.get("handoff"),
+                expected_event_id=args.get("expected_event_id"),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not resolve block loop for {tid} (requires triage "
+                    "with block_loop_detected provenance and no active run)"
+                )
+            task = kb.get_task(conn, tid)
+            return _ok(task_id=tid, decision=args.get("decision"), status=task.status if task else None)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_resolve_block_loop: {e}")
+    except Exception as e:
+        logger.exception("kanban_resolve_block_loop failed")
+        return tool_error(f"kanban_resolve_block_loop: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -2389,6 +2438,32 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_RESOLVE_BLOCK_LOOP_SCHEMA = {
+    "name": "kanban_resolve_block_loop",
+    "description": (
+        "Orchestrator-only human decision for a task routed to triage by "
+        "block_loop_detected. Choose retry, complete, or archive. Requires "
+        "a durable actor and reason; complete also requires a summary or result."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Block-loop triage task id."},
+            "decision": {"type": "string", "enum": ["retry", "complete", "archive"]},
+            "actor": {"type": "string", "description": "Human/orchestrator decision maker."},
+            "reason": {"type": "string", "description": "Durable reason for the decision."},
+            "summary": {"type": "string", "description": "Completion handoff required for complete."},
+            "result": {"type": "string", "description": "Optional completion result."},
+            "handoff": {"type": "string", "description": "Alias for summary."},
+            "metadata": {"type": "object", "description": "Structured completion facts."},
+            "expected_event_id": {"type": "integer", "description": "Optional CAS id of the block_loop_detected event."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["decision", "actor", "reason"],
+    },
+}
+
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -2464,6 +2539,15 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
+)
+
+registry.register(
+    name="kanban_resolve_block_loop",
+    toolset="kanban",
+    schema=KANBAN_RESOLVE_BLOCK_LOOP_SCHEMA,
+    handler=_handle_resolve_block_loop,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="⚖",
 )
 
 registry.register(
