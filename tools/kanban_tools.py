@@ -35,7 +35,7 @@ from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
-from tools.registry import registry, tool_error
+from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
@@ -117,6 +117,37 @@ def _check_kanban_mode() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return True
     return _profile_has_kanban_toolset()
+
+
+@no_cache_check_fn
+def _check_kanban_creator_mode() -> bool:
+    """Surface de CREATION de taches (kanban_create, kanban_link).
+
+    Iron Rod, 2026-08-15, reporte sur 0.20.5 le 2026-08-23 : la creation
+    de taches est reservee aux profils dont la config porte
+    ``kanban.can_create: true`` (defaut True pour ne rien casser
+    ailleurs).  Les experts (colbert, julien, ruth) analysent et
+    PROPOSENT ; Amber seule cree.  Le lifecycle des cartes qui leur sont
+    assignees (show, comment, heartbeat, block, complete) reste ouvert :
+    il passe par ``_check_kanban_mode``, pas par ici.
+
+    FAIL-CLOSED : si la configuration ne peut pas etre lue, la creation
+    est REFUSEE.  Une erreur de chargement ne doit jamais ouvrir la
+    surface de creation ; c est le defaut du correctif d origine, corrige
+    ici sur demande de la revue Architect du 2026-08-22.
+    """
+    if not _check_kanban_mode():
+        return False
+    try:
+        cfg = load_config()
+    except Exception:
+        logger.warning(
+            "kanban.can_create: configuration illisible, creation refusee "
+            "(fail-closed)"
+        )
+        return False
+    kanban_cfg = cfg.get("kanban") or {}
+    return bool(kanban_cfg.get("can_create", True))
 
 
 def _check_kanban_orchestrator_mode() -> bool:
@@ -1340,6 +1371,28 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+def _reject_uncreatable_profile(tool_name: str) -> Optional[str]:
+    """Refuse la CREATION de taches aux profils sans ``kanban.can_create``.
+
+    Second verrou, indispensable : ``registry.dispatch()`` appelle le
+    handler SANS reevaluer le ``check_fn``, et le registre met les
+    resultats de ``check_fn`` en cache (30 s, plus une grace pouvant
+    aller a 60 s apres un False ou une exception).  Un ``check_fn`` seul
+    n est donc qu indicatif : il masque l outil dans le schema, il ne
+    l interdit pas.  Ajoute le 2026-08-23 sur constat de la revue
+    Architect, qui a montre que le fail-closed annonce ne tenait pas.
+    """
+    if _check_kanban_creator_mode():
+        return None
+    return tool_error(
+        f"{tool_name} refused: this profile is not allowed to create "
+        "Kanban tasks (kanban.can_create is false, or the configuration "
+        "could not be read and the guard fails closed). Experts analyse "
+        "and propose; task creation is reserved to the orchestrator "
+        "profile."
+    )
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1349,6 +1402,9 @@ def _handle_create(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
+    creator_err = _reject_uncreatable_profile("kanban_create")
+    if creator_err:
+        return creator_err
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1646,6 +1702,9 @@ def _handle_link(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_link")
     if delegated_err:
         return delegated_err
+    creator_err = _reject_uncreatable_profile("kanban_link")
+    if creator_err:
+        return creator_err
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -2457,7 +2516,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_creator_mode,
     emoji="➕",
 )
 
@@ -2475,6 +2534,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_creator_mode,
     emoji="🔗",
 )

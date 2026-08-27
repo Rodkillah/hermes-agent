@@ -76,6 +76,40 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_initially_blocked_parentless_task_is_sticky(kanban_home: Path) -> None:
+    """A task intentionally created blocked must not become dispatchable.
+
+    ``recompute_ready`` distinguishes deliberate blocks from recoverable
+    circuit-breaker blocks through lifecycle events.  Creation therefore has
+    to record an explicit ``blocked`` event, not only ``status='blocked'`` in
+    the task row / ``created`` payload.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="operator gate",
+            assignee="architect",
+            initial_status="blocked",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+
+        kinds = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (tid,),
+            ).fetchall()
+        ]
+        assert kinds == ["created", "blocked"]
+
+
 
 
 # ---------------------------------------------------------------------------
