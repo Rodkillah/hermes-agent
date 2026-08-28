@@ -16,7 +16,7 @@ type KanbanMessages = {
   newTaskCommand: string
   countTip: (running: number, ready: number) => string
   col: Record<
-    'archived' | 'blocked' | 'done' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
+    'archived' | 'blocked' | 'done' | 'prod' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
     { label: string; help: string }
   >
   locked: { review: string; running: string; scheduled: string }
@@ -212,6 +212,7 @@ export const en: KanbanMessages = {
     blocked: { label: 'Blocked', help: 'The worker asked for human input.' },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
+    prod: { label: 'Prod', help: 'Production deployment verified with an immutable receipt.' },
     archived: { label: 'Archived', help: 'Hidden from the default board view.' }
   },
   locked: {
@@ -414,6 +415,7 @@ const ja: KanbanMessages = {
     blocked: { label: 'ブロック', help: 'ワーカーが人間の入力を求めています。' },
     review: { label: 'レビュー', help: 'レビューエージェントが作業を確認中。ディスパッチャが設定します。' },
     done: { label: '完了', help: '完了。依存する子タスクが Ready になります。' },
+    prod: { label: 'Prod', help: '本番デプロイが不変の証跡で検証済みです。' },
     archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' }
   },
   locked: {
@@ -615,6 +617,7 @@ const zh: KanbanMessages = {
     blocked: { label: '受阻', help: '工作单元需要人工输入。' },
     review: { label: '审查', help: '审查代理正在检查工作。由调度器设置。' },
     done: { label: '完成', help: '已完成；依赖它的子任务变为就绪。' },
+    prod: { label: 'Prod', help: '生产部署已通过不可变收据验证。' },
     archived: { label: '已归档', help: '从默认面板视图中隐藏。' }
   },
   locked: {
@@ -813,6 +816,7 @@ const zhHant: KanbanMessages = {
     blocked: { label: '受阻', help: '工作單元需要人工輸入。' },
     review: { label: '審查', help: '審查代理正在檢查工作。由排程器設定。' },
     done: { label: '完成', help: '已完成；相依它的子任務變為就緒。' },
+    prod: { label: 'Prod', help: '正式部署已透過不可變收據驗證。' },
     archived: { label: '已封存', help: '從預設面板檢視中隱藏。' }
   },
   locked: {

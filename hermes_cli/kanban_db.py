@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -99,8 +100,15 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "prod", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# ``done`` is the completion of the work item.  ``prod`` is a later, explicit
+# proof that the exact candidate was deployed and verified.  Keep these
+# predicates in one place so dependency and terminal checks cannot drift.
+WORK_COMPLETED_STATUSES = frozenset({"done", "prod"})
+EXECUTION_TERMINAL_STATUSES = frozenset({"done", "prod", "archived"})
+HIDDEN_STATUSES = frozenset({"archived"})
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1068,6 +1076,7 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    work_completed_at: Optional[int] = None
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -1165,6 +1174,9 @@ class Task:
             created_at=row["created_at"],
             started_at=row["started_at"],
             completed_at=row["completed_at"],
+            work_completed_at=(
+                row["work_completed_at"] if "work_completed_at" in keys else None
+            ),
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
@@ -1341,6 +1353,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
     completed_at         INTEGER,
+    -- Work completion is retained when a delivered item is routed back to
+    -- todo solely because its production deployment is still outstanding.
+    work_completed_at    INTEGER,
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
@@ -1514,6 +1529,39 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Immutable production proof.  These tables are additive and deliberately
+-- have no backfill: legacy done cards remain exactly as they were.
+CREATE TABLE IF NOT EXISTS production_receipts (
+    id                       TEXT PRIMARY KEY,
+    task_id                  TEXT NOT NULL UNIQUE,
+    schema_version            INTEGER NOT NULL,
+    environment               TEXT NOT NULL,
+    target                    TEXT NOT NULL,
+    deployed_at_utc           TEXT NOT NULL,
+    candidate_sha             TEXT NOT NULL,
+    deployed_identity_kind    TEXT NOT NULL,
+    deployed_identity_value   TEXT NOT NULL,
+    derivation_ref             TEXT,
+    backup_ref                 TEXT NOT NULL,
+    rollback_ref               TEXT NOT NULL,
+    verification_mode          TEXT NOT NULL,
+    actor                      TEXT NOT NULL,
+    idempotency_key            TEXT NOT NULL UNIQUE,
+    evidence_sha256            TEXT NOT NULL,
+    created_at                 INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS production_probes (
+    receipt_id   TEXT NOT NULL,
+    ordinal      INTEGER NOT NULL,
+    name         TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    required     INTEGER NOT NULL,
+    result       TEXT NOT NULL,
+    evidence_ref TEXT NOT NULL,
+    PRIMARY KEY (receipt_id, ordinal)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1524,6 +1572,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_production_probes_receipt ON production_probes(receipt_id, ordinal);
 """
 
 
@@ -2549,6 +2598,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
+    if "work_completed_at" not in cols:
+        # Additive only: existing cards retain their status and receive no
+        # inferred completion/production evidence.
+        _add_column_if_missing(
+            conn, "tasks", "work_completed_at", "work_completed_at INTEGER"
+        )
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
@@ -3853,10 +3908,13 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             (parent_id, child_id),
         )
         # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
+        parent_row = conn.execute(
+            "SELECT status, work_completed_at FROM tasks WHERE id = ?", (parent_id,)
+        ).fetchone()
+        if not parent_row or (
+            parent_row["status"] not in WORK_COMPLETED_STATUSES
+            and parent_row["work_completed_at"] is None
+        ):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -3978,7 +4036,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
         SELECT t.id AS id, t.result AS result
         FROM tasks t
         JOIN task_links l ON l.parent_id = t.id
-        WHERE l.child_id = ? AND t.status = 'done'
+        WHERE l.child_id = ? AND t.status IN ('done', 'prod')
         ORDER BY t.completed_at ASC
         """,
         (task_id,),
@@ -4568,12 +4626,16 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, t.work_completed_at FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] == "done" for p in parents):
+            if all(
+                p["status"] in WORK_COMPLETED_STATUSES
+                or (p["status"] == "todo" and p["work_completed_at"] is not None)
+                for p in parents
+            ):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -4620,7 +4682,8 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done') LIMIT 1",
+        "AND p.status NOT IN ('done', 'prod') "
+        "AND NOT (p.status = 'todo' AND p.work_completed_at IS NOT NULL) LIMIT 1",
         (task_id,),
     ).fetchone() is None
 
@@ -4652,7 +4715,8 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done') LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'prod') "
+            "AND NOT (p.status = 'todo' AND p.work_completed_at IS NOT NULL) LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -5603,6 +5667,488 @@ def complete_task(
     return True
 
 
+@dataclass(frozen=True)
+class ProductionReceipt:
+    """The durable, redacted proof returned by :func:`mark_task_prod`."""
+
+    id: str
+    task_id: str
+    schema_version: int
+    environment: str
+    target: str
+    deployed_at_utc: str
+    candidate_sha: str
+    deployed_identity_kind: str
+    deployed_identity_value: str
+    derivation_ref: Optional[str]
+    backup_ref: str
+    rollback_ref: str
+    verification_mode: str
+    actor: str
+    idempotency_key: str
+    evidence_sha256: str
+    created_at: int
+    probes: tuple[dict, ...] = ()
+
+    def to_dict(self) -> dict:
+        value = {
+            key: getattr(self, key)
+            for key in (
+                "id", "task_id", "schema_version", "environment", "target",
+                "deployed_at_utc", "candidate_sha", "deployed_identity_kind",
+                "deployed_identity_value", "derivation_ref", "backup_ref",
+                "rollback_ref", "verification_mode", "actor", "idempotency_key",
+                "evidence_sha256", "created_at",
+            )
+        }
+        value["probes"] = [dict(probe) for probe in self.probes]
+        return value
+
+
+class ProductionLifecycleError(ValueError):
+    """Raised when a production proof is incomplete or a transition is invalid."""
+
+
+_PROD_REF_MAX = 512
+_PROD_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def _production_string(value: Any, name: str, *, required: bool = True) -> Optional[str]:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise ProductionLifecycleError(f"{name} must be a string")
+    value = value.strip()
+    if required and not value:
+        raise ProductionLifecycleError(f"{name} must be non-empty")
+    if len(value) > _PROD_REF_MAX or any(ord(ch) < 32 for ch in value):
+        raise ProductionLifecycleError(f"{name} is invalid or too long")
+    return value
+
+
+def _production_ref(value: Any, name: str) -> str:
+    value = _production_string(value, name)
+    # References are opaque identifiers, not executable commands, URLs or
+    # copied logs.  Keep this check deliberately conservative.
+    if "://" in value or "\n" in value or "\r" in value:
+        raise ProductionLifecycleError(f"{name} must be an opaque reference")
+    return value
+
+
+def _normalise_production_receipt(receipt: Mapping[str, Any]) -> tuple[dict, list[dict]]:
+    if not isinstance(receipt, Mapping):
+        raise ProductionLifecycleError("receipt must be an object")
+    try:
+        schema_version = int(receipt.get("schema_version"))
+    except (TypeError, ValueError):
+        raise ProductionLifecycleError("schema_version must be 1") from None
+    if schema_version != 1:
+        raise ProductionLifecycleError("schema_version must be 1")
+    candidate_sha = _production_string(receipt.get("candidate_sha"), "candidate_sha").lower()
+    if not _PROD_SHA_RE.fullmatch(candidate_sha):
+        raise ProductionLifecycleError("candidate_sha must be an exact 40-hex SHA")
+    deployed_at = _production_string(receipt.get("deployed_at_utc"), "deployed_at_utc")
+    try:
+        parsed = datetime.fromisoformat(deployed_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise ProductionLifecycleError("deployed_at_utc must be ISO-8601") from None
+    if parsed.tzinfo is None:
+        raise ProductionLifecycleError("deployed_at_utc must include a timezone")
+    deployed_at = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    identity_kind = _production_string(
+        receipt.get("deployed_identity_kind"), "deployed_identity_kind"
+    )
+    if identity_kind not in {"git_sha", "artifact_sha256", "release_id"}:
+        raise ProductionLifecycleError("deployed_identity_kind is not supported")
+    identity_value = _production_ref(
+        receipt.get("deployed_identity_value"), "deployed_identity_value"
+    )
+    verification_mode = _production_string(
+        receipt.get("verification_mode"), "verification_mode"
+    )
+    if verification_mode not in {"system_verified", "authorized_attestation"}:
+        raise ProductionLifecycleError("verification_mode is not supported")
+    probes_value = receipt.get("probes")
+    if not isinstance(probes_value, list) or not probes_value:
+        raise ProductionLifecycleError("at least one production probe is required")
+    probes: list[dict] = []
+    for ordinal, probe in enumerate(probes_value):
+        if not isinstance(probe, Mapping):
+            raise ProductionLifecycleError("each production probe must be an object")
+        name = _production_string(probe.get("name"), f"probes[{ordinal}].name")
+        scope = _production_string(probe.get("scope"), f"probes[{ordinal}].scope")
+        result = _production_string(probe.get("result"), f"probes[{ordinal}].result")
+        if scope != "live_production":
+            raise ProductionLifecycleError("production probes must use live_production scope")
+        if result not in {"passed", "failed"}:
+            raise ProductionLifecycleError("probe result must be passed or failed")
+        required = probe.get("required")
+        if not isinstance(required, bool):
+            raise ProductionLifecycleError("probe required must be boolean")
+        evidence_ref = _production_ref(
+            probe.get("evidence_ref"), f"probes[{ordinal}].evidence_ref"
+        )
+        probes.append({
+            "ordinal": ordinal,
+            "name": name,
+            "scope": scope,
+            "required": required,
+            "result": result,
+            "evidence_ref": evidence_ref,
+        })
+    if not any(p["required"] and p["result"] == "passed" for p in probes):
+        raise ProductionLifecycleError("a required passed live production probe is required")
+    if any(p["required"] and p["result"] != "passed" for p in probes):
+        raise ProductionLifecycleError("a required production probe failed")
+    normalised = {
+        "schema_version": 1,
+        "environment": _production_string(receipt.get("environment"), "environment"),
+        "target": _production_string(receipt.get("target"), "target"),
+        "deployed_at_utc": deployed_at,
+        "candidate_sha": candidate_sha,
+        "deployed_identity_kind": identity_kind,
+        "deployed_identity_value": identity_value,
+        "derivation_ref": _production_ref(receipt.get("derivation_ref"), "derivation_ref")
+        if receipt.get("derivation_ref") is not None else None,
+        "backup_ref": _production_ref(receipt.get("backup_ref"), "backup_ref"),
+        "rollback_ref": _production_ref(receipt.get("rollback_ref"), "rollback_ref"),
+        "verification_mode": verification_mode,
+        "probes": probes,
+    }
+    return normalised, probes
+
+
+def _board_for_connection(conn: sqlite3.Connection) -> str:
+    """Resolve the board owning an open connection, not the ambient board."""
+    try:
+        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+        resolved = str(Path(db_file).resolve()) if db_file else ""
+        for meta in list_boards(include_archived=True):
+            slug = meta.get("slug")
+            if slug and str(kanban_db_path(board=slug).resolve()) == resolved:
+                return slug
+    except Exception:
+        pass
+    return get_current_board()
+
+
+def _production_verifier(
+    conn: sqlite3.Connection, task_id: str, receipt: Mapping[str, Any]
+) -> dict:
+    """Run the board-scoped verifier without invoking a shell."""
+    board = _board_for_connection(conn)
+    meta = read_board_metadata(board)
+    automation = meta.get("automation") if isinstance(meta, dict) else None
+    production = automation.get("production") if isinstance(automation, dict) else None
+    if not isinstance(production, dict):
+        # Accept the candidate's spelling during the transition, but keep the
+        # board scope and fail-closed rules identical.
+        production = automation.get("auto_production") if isinstance(automation, dict) else None
+    if not isinstance(production, dict) or production.get("enabled") is not True:
+        raise ProductionLifecycleError("production verifier is disabled or not configured")
+    command_value = production.get("verifier_command")
+    command = Path(str(command_value or "")).expanduser()
+    if not command.is_absolute() or not command.is_file() or not os.access(command, os.X_OK):
+        raise ProductionLifecycleError("production verifier is not executable")
+    try:
+        timeout = max(1, min(int(production.get("verifier_timeout_seconds", 30)), 60))
+    except (TypeError, ValueError):
+        timeout = 30
+    task = conn.execute(
+        "SELECT id, title, body, workspace_path FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task is None:
+        raise ProductionLifecycleError("task not found")
+    request = {
+        "schema_version": 1,
+        "board": board,
+        "task": {"id": task_id, "title": task["title"], "body": task["body"]},
+        "receipt": dict(receipt),
+    }
+    try:
+        result = subprocess.run(
+            [str(command)], input=json.dumps(request, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProductionLifecycleError(f"production verifier failed: {type(exc).__name__}") from None
+    if result.returncode != 0 or len(result.stdout or "") > 64 * 1024:
+        raise ProductionLifecycleError("production verifier rejected the request")
+    try:
+        attestation = json.loads(result.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        raise ProductionLifecycleError("production verifier returned invalid JSON") from None
+    if not isinstance(attestation, dict) or attestation.get("ok") is not True:
+        raise ProductionLifecycleError("production verifier returned a negative receipt")
+    if attestation.get("task_id") != task_id:
+        raise ProductionLifecycleError("production verifier receipt task mismatch")
+    if not _production_string(attestation.get("receipt_id"), "verifier receipt_id"):
+        raise ProductionLifecycleError("production verifier receipt has no id")
+    checked_at = _production_string(attestation.get("checked_at"), "verifier checked_at")
+    try:
+        checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise ProductionLifecycleError("production verifier timestamp is invalid") from None
+    if checked.tzinfo is None:
+        raise ProductionLifecycleError("production verifier timestamp has no timezone")
+    facts = attestation.get("facts")
+    required_facts = (
+        "candidate_on_main", "deployed_revision_matches", "backup_exists",
+        "rollback_available", "required_probes_passed",
+    )
+    if not isinstance(facts, dict) or any(facts.get(key) is not True for key in required_facts):
+        raise ProductionLifecycleError("production verifier did not attest all required facts")
+    return attestation
+
+
+def _receipt_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ProductionReceipt:
+    probes = tuple(dict(p) for p in conn.execute(
+        "SELECT ordinal, name, scope, required, result, evidence_ref "
+        "FROM production_probes WHERE receipt_id = ? ORDER BY ordinal", (row["id"],)
+    ).fetchall())
+    return ProductionReceipt(
+        id=row["id"], task_id=row["task_id"], schema_version=row["schema_version"],
+        environment=row["environment"], target=row["target"],
+        deployed_at_utc=row["deployed_at_utc"], candidate_sha=row["candidate_sha"],
+        deployed_identity_kind=row["deployed_identity_kind"],
+        deployed_identity_value=row["deployed_identity_value"],
+        derivation_ref=row["derivation_ref"], backup_ref=row["backup_ref"],
+        rollback_ref=row["rollback_ref"], verification_mode=row["verification_mode"],
+        actor=row["actor"], idempotency_key=row["idempotency_key"],
+        evidence_sha256=row["evidence_sha256"], created_at=row["created_at"], probes=probes,
+    )
+
+
+def _production_receipt_matches(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    normalized: Mapping[str, Any],
+    *,
+    actor: str,
+) -> bool:
+    """Compare an idempotent retry with the immutable stored request.
+
+    A retry must be the same proof, not merely the same task and candidate.
+    This comparison deliberately excludes verifier-generated fields (receipt
+    id, attestation timestamp and evidence digest), which are unavailable
+    until a first attempt has actually run the verifier.
+    """
+    stored_fields = (
+        "schema_version", "environment", "target", "deployed_at_utc",
+        "candidate_sha", "deployed_identity_kind", "deployed_identity_value",
+        "derivation_ref", "backup_ref", "rollback_ref", "verification_mode",
+    )
+    if row["actor"] != actor:
+        return False
+    return all(row[field] == normalized.get(field) for field in stored_fields) and [
+        dict(
+            ordinal=probe["ordinal"], name=probe["name"],
+            scope=probe["scope"], required=bool(probe["required"]),
+            result=probe["result"], evidence_ref=probe["evidence_ref"],
+        )
+        for probe in conn.execute(
+            "SELECT ordinal, name, scope, required, result, evidence_ref "
+            "FROM production_probes WHERE receipt_id = ? ORDER BY ordinal",
+            (row["id"],),
+        ).fetchall()
+    ] == list(normalized.get("probes", []))
+
+
+def mark_task_prod(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    receipt: Mapping[str, Any],
+    actor: str,
+    idempotency_key: str,
+) -> ProductionReceipt:
+    """Atomically promote exactly one ``done`` task to ``prod``.
+
+    All validation happens before the CAS write, and every mutable write is in
+    one transaction.  The verifier is board-scoped and its facts, never a
+    caller-supplied actor or boolean, authorize the transition.
+    """
+    _assert_not_delegated_child_mutation()
+    if not isinstance(actor, str) or not actor.strip():
+        raise ProductionLifecycleError("actor is required")
+    actor = actor.strip()
+    idempotency_key = _production_ref(idempotency_key, "idempotency_key")
+    normalized, probes = _normalise_production_receipt(receipt)
+    existing = conn.execute(
+        "SELECT * FROM production_receipts WHERE idempotency_key = ?", (idempotency_key,)
+    ).fetchone()
+    if existing:
+        if (
+            existing["task_id"] != task_id
+            or not _production_receipt_matches(
+                conn, existing, normalized, actor=actor,
+            )
+        ):
+            raise ProductionLifecycleError("idempotency key conflicts with an existing receipt")
+        return _receipt_from_row(conn, existing)
+    current = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if current is None:
+        raise ProductionLifecycleError("task not found")
+    if current["status"] != "done":
+        raise ProductionLifecycleError("only done tasks can be promoted to prod")
+    board = _board_for_connection(conn)
+    board_meta = read_board_metadata(board)
+    automation = board_meta.get("automation") if isinstance(board_meta, dict) else None
+    production = automation.get("production") if isinstance(automation, dict) else None
+    allowed = production.get("allowed_profiles", []) if isinstance(production, dict) else []
+    if not isinstance(allowed, list) or actor not in {str(p) for p in allowed}:
+        raise ProductionLifecycleError("actor is not allowed to promote production on this board")
+    attestation = _production_verifier(conn, task_id, normalized)
+    receipt_id = str(attestation["receipt_id"]).strip()
+    if conn.execute(
+        "SELECT 1 FROM production_receipts WHERE id = ?", (receipt_id,)
+    ).fetchone():
+        raise ProductionLifecycleError("production verifier returned a duplicate receipt id")
+    normalized["actor"] = actor
+    normalized["idempotency_key"] = idempotency_key
+    evidence_sha = hashlib.sha256(
+        json.dumps({"receipt": normalized, "attestation": attestation},
+                   sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, completed_at, work_completed_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ProductionLifecycleError("task not found")
+        if row["status"] != "done":
+            raise ProductionLifecycleError("only done tasks can be promoted to prod")
+        if conn.execute("SELECT 1 FROM production_receipts WHERE task_id = ?", (task_id,)).fetchone():
+            raise ProductionLifecycleError("task already has a production receipt")
+        conn.execute(
+            """INSERT INTO production_receipts
+            (id, task_id, schema_version, environment, target, deployed_at_utc,
+             candidate_sha, deployed_identity_kind, deployed_identity_value,
+             derivation_ref, backup_ref, rollback_ref, verification_mode, actor,
+             idempotency_key, evidence_sha256, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (receipt_id, task_id, normalized["schema_version"], normalized["environment"],
+             normalized["target"], normalized["deployed_at_utc"], normalized["candidate_sha"],
+             normalized["deployed_identity_kind"], normalized["deployed_identity_value"],
+             normalized["derivation_ref"], normalized["backup_ref"], normalized["rollback_ref"],
+             normalized["verification_mode"], actor, idempotency_key, evidence_sha, now),
+        )
+        conn.executemany(
+            "INSERT INTO production_probes "
+            "(receipt_id, ordinal, name, scope, required, result, evidence_ref) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(receipt_id, p["ordinal"], p["name"], p["scope"], int(p["required"]),
+              p["result"], p["evidence_ref"]) for p in probes],
+        )
+        changed = conn.execute(
+            "UPDATE tasks SET status = 'prod', work_completed_at = COALESCE(work_completed_at, completed_at) "
+            "WHERE id = ? AND status = 'done'", (task_id,)
+        )
+        if changed.rowcount != 1:
+            raise ProductionLifecycleError("task changed during production promotion")
+        _append_event(conn, task_id, "production_promoted", {
+            "receipt_id": receipt_id, "environment": normalized["environment"],
+            "target": normalized["target"], "deployed_at_utc": normalized["deployed_at_utc"],
+            "candidate_sha": normalized["candidate_sha"],
+            "deployed_identity_kind": normalized["deployed_identity_kind"],
+            "deployed_identity_value": normalized["deployed_identity_value"],
+            "actor": actor, "schema_version": 1,
+            "passed_probes": sum(p["result"] == "passed" for p in probes),
+            "required_probes": sum(p["required"] for p in probes),
+        })
+        stored = conn.execute("SELECT * FROM production_receipts WHERE id = ?", (receipt_id,)).fetchone()
+    recompute_ready(conn)
+    return _receipt_from_row(conn, stored)
+
+
+def get_production_receipt(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[ProductionReceipt]:
+    """Return the immutable production proof for a task, if one exists."""
+    row = conn.execute(
+        "SELECT * FROM production_receipts WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return _receipt_from_row(conn, row) if row else None
+
+
+def route_done_to_deploy_todo(
+    conn: sqlite3.Connection, task_id: str, *, candidate_sha: str,
+    audit_id: str, reason: str, next_action: str, actor: str,
+) -> bool:
+    """Route an audited, not-yet-deployed delivery back to ``todo``."""
+    if actor != "amber":
+        raise ProductionLifecycleError("only amber may route audited deployment follow-up")
+    if not _PROD_SHA_RE.fullmatch(str(candidate_sha or "").lower()):
+        raise ProductionLifecycleError("candidate_sha must be an exact 40-hex SHA")
+    audit_id = _production_ref(audit_id, "audit_id")
+    reason = _production_ref(reason, "reason")
+    next_action = _production_ref(next_action, "next_action")
+    with write_txn(conn):
+        row = conn.execute("SELECT status, completed_at, work_completed_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] != "done":
+            return False
+        work_completed_at = row["work_completed_at"] or row["completed_at"]
+        if work_completed_at is None:
+            raise ProductionLifecycleError("no completion proof exists for deployment follow-up")
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', work_completed_at = ? WHERE id = ? AND status = 'done'",
+            (work_completed_at, task_id),
+        )
+        _append_event(conn, task_id, "production_followup_required", {
+            "candidate_sha": str(candidate_sha).lower(), "audit_id": audit_id,
+            "reason": reason, "next_action": next_action,
+        })
+    return True
+
+
+def list_tasks_page(
+    conn: sqlite3.Connection, *, status: str = "done", limit: int = 50,
+    cursor: Optional[str] = None, tenant: Optional[str] = None,
+) -> dict:
+    """Keyset page of tasks, stable by ``(completed_at, id)``."""
+    import base64
+    if status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    limit = max(1, min(int(limit), 50))
+    where = ["status = ?"]
+    params: list[Any] = [status]
+    if tenant is not None:
+        where.append("tenant = ?")
+        params.append(tenant)
+    if cursor:
+        try:
+            raw = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+            completed_at, task_id = int(raw[0]), str(raw[1])
+        except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
+            raise ValueError("invalid cursor") from None
+        where.append("(completed_at, id) > (?, ?)")
+        params.extend([completed_at, task_id])
+    predicate = " AND ".join(where)
+    total = int(conn.execute(f"SELECT COUNT(*) FROM tasks WHERE {predicate.split(' AND (completed_at')[0]}", tuple(params[:len(params) - (2 if cursor else 0)])).fetchone()[0])
+    rows = conn.execute(
+        f"SELECT * FROM tasks WHERE {predicate} ORDER BY completed_at ASC, id ASC LIMIT ?",
+        (*params, limit + 1),
+    ).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = base64.urlsafe_b64encode(
+            json.dumps([last["completed_at"], last["id"]]).encode("utf-8")
+        ).decode("ascii")
+    return {
+        "tasks": [Task.from_row(row) for row in rows],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "total_matching": total,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Workspace / tmux cleanup
 # ---------------------------------------------------------------------------
@@ -5916,7 +6462,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         _active_children = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks t ON t.id = l.child_id "
-            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'prod', 'archived', 'failed', 'cancelled') "
             "LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -6055,7 +6601,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             active = conn.execute(
                 "SELECT 1 FROM task_links l "
                 "JOIN tasks t ON t.id = l.child_id "
-                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'prod', 'archived', 'failed', 'cancelled') "
                 "LIMIT 1",
                 (parent_id,),
             ).fetchone()
@@ -7012,7 +7558,7 @@ def promote_task(
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] != "done"
+            if p["status"] not in WORK_COMPLETED_STATUSES
         ]
         if unsatisfied:
             return False, (
@@ -7084,7 +7630,8 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done') LIMIT 1",
+        "AND p.status NOT IN ('done', 'prod') "
+        "AND NOT (p.status = 'todo' AND p.work_completed_at IS NOT NULL) LIMIT 1",
         (task_id,),
     ).fetchone()
     return "todo" if undone_parents else "ready"
@@ -7325,7 +7872,7 @@ def invalidate_descendants_for_parent_reopen(
             # docstring for why this diverges from reopen_review_task.
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
-                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "work_completed_at = NULL, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                 "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?",
                 (row["id"],),
             )
@@ -7765,6 +8312,12 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        receipt = conn.execute(
+            "SELECT id FROM production_receipts WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if receipt:
+            conn.execute("DELETE FROM production_probes WHERE receipt_id = ?", (receipt["id"],))
+            conn.execute("DELETE FROM production_receipts WHERE id = ?", (receipt["id"],))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -7788,6 +8341,12 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        receipt = conn.execute(
+            "SELECT id FROM production_receipts WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if receipt:
+            conn.execute("DELETE FROM production_probes WHERE receipt_id = ?", (receipt["id"],))
+            conn.execute("DELETE FROM production_receipts WHERE id = ?", (receipt["id"],))
     recompute_ready(conn)
     return True
 
@@ -11346,7 +11905,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         wrote_header = False
         for pid in parent_ids:
             pt = get_task(conn, pid)
-            if not pt or pt.status != "done":
+            if not pt or pt.status not in WORK_COMPLETED_STATUSES:
                 continue
             runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
             runs.sort(key=lambda r: r.started_at, reverse=True)
@@ -12072,14 +12631,14 @@ def gc_events(
     conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
 ) -> int:
     """Delete task_events rows older than ``older_than_seconds`` for tasks
-    in a terminal state (``done`` or ``archived``). Returns the number of
+    in a terminal state (``done``, ``prod`` or ``archived``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
     history."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            "(SELECT id FROM tasks WHERE status IN ('done', 'prod', 'archived'))",
             (cutoff,),
         )
     return int(cur.rowcount or 0)

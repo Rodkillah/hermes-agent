@@ -39,6 +39,7 @@ _STATUS_ICONS = {
     "scheduled":"⏱",
     "blocked":  "⊘",
     "done":     "✓",
+    "prod":     "🚀",
     "archived": "—",
 }
 
@@ -707,6 +708,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "reason", nargs="+", help="Concrete changes required before re-review",
     )
 
+    p_mark_prod = sub.add_parser(
+        "mark-prod",
+        help="Promote a done task to Prod with an audited production receipt",
+    )
+    p_mark_prod.add_argument("task_id")
+    p_mark_prod.add_argument(
+        "--receipt-file", required=True,
+        help="JSON file containing the production receipt and probes",
+    )
+    p_mark_prod.add_argument(
+        "--idempotency-key", required=True,
+        help="Stable key for safe retries of this promotion",
+    )
+
+    p_route_deploy = sub.add_parser(
+        "route-deploy-todo",
+        help="Route an audited done task back to todo while preserving work completion",
+    )
+    p_route_deploy.add_argument("task_id")
+    p_route_deploy.add_argument("--candidate-sha", required=True)
+    p_route_deploy.add_argument("--audit-id", required=True)
+    p_route_deploy.add_argument("--reason", required=True)
+    p_route_deploy.add_argument("--next-action", required=True)
+
     p_reopen_review = sub.add_parser(
         "reopen-review",
         help="Send one or more review tasks back for changes (review -> ready/todo)",
@@ -1151,6 +1176,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "resolve-block-loop": _cmd_resolve_block_loop,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
+            "mark-prod": _cmd_mark_prod,
+            "route-deploy-todo": _cmd_route_deploy_todo,
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -2545,6 +2572,49 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             f"Requested changes for {tid}"
             + (f"; routed to {detail}" if detail else "")
         )
+    return 0
+
+
+def _cmd_mark_prod(args: argparse.Namespace) -> int:
+    try:
+        receipt = json.loads(Path(args.receipt_file).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"cannot read production receipt: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(receipt, dict):
+        print("cannot read production receipt: expected a JSON object", file=sys.stderr)
+        return 1
+    try:
+        with kb.connect_closing() as conn:
+            stored = kb.mark_task_prod(
+                conn,
+                args.task_id,
+                receipt=receipt,
+                actor=_profile_author(),
+                idempotency_key=args.idempotency_key,
+            )
+    except (ValueError, RuntimeError) as exc:
+        print(f"cannot mark {args.task_id} as prod: {exc}", file=sys.stderr)
+        return 1
+    print(f"Promoted {args.task_id} to prod (receipt {stored.id})")
+    return 0
+
+
+def _cmd_route_deploy_todo(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.route_done_to_deploy_todo(
+                conn, args.task_id, candidate_sha=args.candidate_sha,
+                audit_id=args.audit_id, reason=args.reason,
+                next_action=args.next_action, actor=_profile_author(),
+            )
+    except (ValueError, RuntimeError) as exc:
+        print(f"cannot route {args.task_id} to deploy todo: {exc}", file=sys.stderr)
+        return 1
+    if not ok:
+        print(f"cannot route {args.task_id} to deploy todo (not a done task)", file=sys.stderr)
+        return 1
+    print(f"Routed {args.task_id} to todo for audited deployment follow-up")
     return 0
 
 
