@@ -660,7 +660,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `request-review <id>` | Move a task to `review` with a reviewer handoff — NOT a block. Flags: `--summary`, `--metadata`, `--reviewer` (reassigns before review dispatch). |
 | `request-changes <id> <reason>` | Reviewer verdict for an active review run: close the review attempt and route the task back to its original implementer. |
 | `reopen-review <id>...` | Send review task(s) back for changes (`review` → ready/todo). Flag: `--reason` (appended as a comment). |
-| `resolve-block-loop <id> <decision>` | Resolve a `block_loop_detected` triage task with `retry`, `complete`, or `archive`; requires `--reason`, `--expected-event-id` from a fresh task read, and for `complete` also `--summary` or `--result`. |
+| `resolve-block-loop <id> <decision>` | Resolve a `block_loop_detected` triage task with `retry`, `complete`, or `archive`; obtain the current event id from `show <id> --json` (each event includes stable `id`), then pass it as required `--expected-event-id`; `--reason` is required, and `complete` also needs `--summary` or `--result`. |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Restore a blocked task to its source phase (`review` or `ready`), or `todo` while dependencies remain open. |
 | `archive <id>` | Hide from default list. `gc` will remove scratch workspaces. |

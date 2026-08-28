@@ -292,15 +292,18 @@ To resolve the resulting human gate, an orchestrator must use the dedicated
 transition rather than generic `unblock`, `promote`, or `specify`:
 
 ```bash
-hermes kanban resolve-block-loop t_abc retry --expected-event-id 123 --reason "retry after fixing the input"
-hermes kanban resolve-block-loop t_abc complete --expected-event-id 123 --reason "accepted as-is" \
+EVENT_ID="$(hermes kanban show t_abc --json | jq -r '[.events[] | select(.kind == "block_loop_detected")][-1].id')"
+hermes kanban resolve-block-loop t_abc retry --expected-event-id "$EVENT_ID" --reason "retry after fixing the input"
+hermes kanban resolve-block-loop t_abc complete --expected-event-id "$EVENT_ID" --reason "accepted as-is" \
     --summary "Reviewed the existing outcome; no further execution is required."
-hermes kanban resolve-block-loop t_abc archive --expected-event-id 123 --reason "superseded by the replacement task"
+hermes kanban resolve-block-loop t_abc archive --expected-event-id "$EVENT_ID" --reason "superseded by the replacement task"
 ```
 
 The transition is fail-closed: the task must still be `triage`, have no active
 run, retain its latest `block_loop_detected` provenance, and receive the exact
-`--expected-event-id` read from that current event. Missing or stale event ids
+`--expected-event-id` read from that current event. `hermes kanban show --json`
+and the `kanban_show` tool expose every event's stable `id` for this purpose.
+Missing or stale event ids
 are rejected without mutation. `retry` restores
 `review` or parent-gated `ready`/`todo` without erasing loop memory; `complete`
 resets that memory and promotes dependants; `archive` does not promote them.

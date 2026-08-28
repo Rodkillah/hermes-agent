@@ -1840,6 +1840,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             ],
             "events": [
                 {
+                    "id": e.id,
                     "kind": e.kind,
                     "payload": e.payload,
                     "created_at": e.created_at,
@@ -1958,7 +1959,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         for e in events[-20:]:
             pl = f" {e.payload}" if e.payload else ""
             run_tag = f" [run {e.run_id}]" if e.run_id else ""
-            print(f"  [{_fmt_ts(e.created_at)}]{run_tag} {e.kind}{pl}")
+            print(f"  [{_fmt_ts(e.created_at)}] id={e.id}{run_tag} {e.kind}{pl}")
     if runs:
         print()
         print(f"Runs ({len(runs)}):")
