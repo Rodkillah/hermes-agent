@@ -6533,6 +6533,12 @@ def resolve_block_loop_task(
         raise ValueError("actor is required")
     if not reason:
         raise ValueError("reason is required")
+    if expected_event_id is None:
+        raise ValueError("expected_event_id is required")
+    try:
+        expected_event_id = int(expected_event_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected_event_id must be an integer") from exc
     if handoff and not summary and not result:
         summary = handoff
     metadata = redact_review_value(metadata)
@@ -6582,7 +6588,7 @@ def resolve_block_loop_task(
         ).fetchone()
         if provenance is None or provenance["kind"] != "block_loop_detected":
             return False
-        if expected_event_id is not None and int(provenance["id"]) != int(expected_event_id):
+        if int(provenance["id"]) != expected_event_id:
             return False
         try:
             source = json.loads(provenance["payload"] or "{}")

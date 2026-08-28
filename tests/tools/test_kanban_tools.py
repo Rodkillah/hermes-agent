@@ -1152,6 +1152,9 @@ def test_resolve_block_loop_handler_archives_for_orchestrator(worker_env, monkey
                 "block_loop_detected",
                 {"source_status": "ready", "reason": "repeat"},
             )
+            expected_event_id = [
+                e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"
+            ][-1].id
     finally:
         conn.close()
 
@@ -1160,6 +1163,7 @@ def test_resolve_block_loop_handler_archives_for_orchestrator(worker_env, monkey
         "decision": "archive",
         "actor": "amber",
         "reason": "superseded",
+        "expected_event_id": expected_event_id,
     }))
     assert out["ok"] is True
     assert out["status"] == "archived"

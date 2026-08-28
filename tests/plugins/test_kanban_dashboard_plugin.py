@@ -1244,6 +1244,9 @@ def test_resolve_block_loop_endpoint_retries_with_audit(client):
         assert kb.claim_task(conn, tid, claimer="worker") is not None
         assert kb.block_task(conn, tid, reason="input", kind="capability")
         assert kb.get_task(conn, tid).status == "triage"
+        expected_event_id = [
+            e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"
+        ][-1].id
     finally:
         conn.close()
 
@@ -1256,7 +1259,12 @@ def test_resolve_block_loop_endpoint_retries_with_audit(client):
 
     response = client.post(
         f"/api/plugins/kanban/tasks/{tid}/resolve-block-loop",
-        json={"decision": "retry", "actor": "dashboard-user", "reason": "input fixed"},
+        json={
+            "decision": "retry",
+            "actor": "dashboard-user",
+            "reason": "input fixed",
+            "expected_event_id": expected_event_id,
+        },
     )
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "ready"
@@ -1266,5 +1274,85 @@ def test_resolve_block_loop_endpoint_retries_with_audit(client):
         event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_resolved"][-1]
         assert event.payload["actor"] == "dashboard-user"
         assert event.payload["decision"] == "retry"
+    finally:
+        conn.close()
+
+
+def test_resolve_block_loop_endpoint_rejects_missing_cas(client):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="input", kind="capability")
+        assert kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="input", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+    finally:
+        conn.close()
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{tid}/resolve-block-loop",
+        json={"decision": "archive", "actor": "dashboard-user", "reason": "missing CAS"},
+    )
+    assert response.status_code == 422, response.text
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "triage"
+    finally:
+        conn.close()
+
+
+def test_resolve_block_loop_endpoint_rejects_stale_first_loop(client):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="two loops", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="input", kind="capability")
+        assert kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="input", kind="capability")
+        first_event_id = [
+            e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"
+        ][-1].id
+        assert kb.resolve_block_loop_task(
+            conn, tid, decision="retry", actor="dashboard-user", reason="retry once",
+            expected_event_id=first_event_id,
+        )
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="input again", kind="capability")
+        second_event_id = [
+            e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"
+        ][-1].id
+        assert second_event_id != first_event_id
+    finally:
+        conn.close()
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{tid}/resolve-block-loop",
+        json={
+            "decision": "archive",
+            "actor": "dashboard-user",
+            "reason": "stale action",
+            "expected_event_id": first_event_id,
+        },
+    )
+    assert response.status_code == 409, response.text
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "triage"
+        resolved = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_resolved"]
+        assert len(resolved) == 1
+        assert resolved[0].payload["source_event_id"] == first_event_id
     finally:
         conn.close()

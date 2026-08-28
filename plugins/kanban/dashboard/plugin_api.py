@@ -1779,7 +1779,7 @@ class ResolveBlockLoopBody(BaseModel):
     summary: Optional[str] = None
     result: Optional[str] = None
     metadata: Optional[dict] = None
-    expected_event_id: Optional[int] = None
+    expected_event_id: int
 
 
 @router.post("/tasks/{task_id}/resolve-block-loop")

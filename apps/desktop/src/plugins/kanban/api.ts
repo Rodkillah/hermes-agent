@@ -248,7 +248,7 @@ export const resolveBlockLoopTask = (
   body: {
     actor: string
     decision: 'archive' | 'complete' | 'retry'
-    expected_event_id?: number
+    expected_event_id: number
     reason: string
     result?: string
     summary?: string
