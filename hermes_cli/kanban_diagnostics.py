@@ -1080,6 +1080,123 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
+def _rule_prod_without_receipt(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A task is in ``prod`` but no ``production_promoted`` event exists,
+    meaning the immutable receipt is missing. Fail-closed: flag it."""
+    status = _task_field(task, "status")
+    if status != "prod":
+        return []
+    promoted = [e for e in events if _event_kind(e) == "production_promoted"]
+    if promoted:
+        return []
+    ts = _event_ts(events[-1]) if events else now
+    return [Diagnostic(
+        kind="prod_without_receipt",
+        severity="critical",
+        title="Task in prod without a production receipt",
+        detail=(
+            "The task is marked prod but no production_promoted event (and thus "
+            "no immutable receipt) is recorded. This is a data-integrity breach: "
+            "prod must always be backed by a receipt."
+        ),
+        actions=[DiagnosticAction(kind="comment", label="Investigate the missing receipt", suggested=False)],
+        first_seen_at=ts,
+        last_seen_at=ts,
+        count=1,
+    )]
+
+
+def _rule_receipt_without_prod(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A production_promoted event exists but the task is not in ``prod``."""
+    status = _task_field(task, "status")
+    promoted = [e for e in events if _event_kind(e) == "production_promoted"]
+    if not promoted:
+        return []
+    if status == "prod":
+        return []
+    first = _event_ts(promoted[0])
+    last = _event_ts(promoted[-1])
+    return [Diagnostic(
+        kind="receipt_without_prod",
+        severity="error",
+        title="Production receipt exists but task is not prod",
+        detail=(
+            "A production_promoted event is recorded but the task status is "
+            f"'{status}', not 'prod'. The receipt and the status have diverged."
+        ),
+        actions=[DiagnosticAction(kind="comment", label="Reconcile receipt and status", suggested=False)],
+        first_seen_at=first,
+        last_seen_at=last,
+        count=len(promoted),
+    )]
+
+
+def _rule_prod_failed_required_probe(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A production_promoted event records a required probe that failed."""
+    promoted = [e for e in events if _event_kind(e) == "production_promoted"]
+    if not promoted:
+        return []
+    hits = []
+    for ev in promoted:
+        payload = _parse_payload(ev)
+        required = payload.get("required_probes", 0)
+        passed = payload.get("passed_probes", 0)
+        if required and passed < required:
+            hits.append(ev)
+    if not hits:
+        return []
+    first = _event_ts(hits[0])
+    last = _event_ts(hits[-1])
+    return [Diagnostic(
+        kind="prod_failed_required_probe",
+        severity="critical",
+        title="Production promotion with a failed required probe",
+        detail=(
+            "A production_promoted event records fewer passed probes than "
+            "required probes. A required probe must never fail on a valid "
+            "promotion."
+        ),
+        actions=[DiagnosticAction(kind="comment", label="Re-verify the production probes", suggested=False)],
+        first_seen_at=first,
+        last_seen_at=last,
+        count=len(hits),
+    )]
+
+
+def _rule_prod_candidate_mismatch(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A production_promoted event whose deployed identity diverges from the
+    candidate SHA (when the identity kind is a git SHA)."""
+    promoted = [e for e in events if _event_kind(e) == "production_promoted"]
+    if not promoted:
+        return []
+    hits = []
+    for ev in promoted:
+        payload = _parse_payload(ev)
+        kind = payload.get("deployed_identity_kind")
+        candidate = payload.get("candidate_sha")
+        deployed = payload.get("deployed_identity_value")
+        if kind == "git_sha" and candidate and deployed and candidate != deployed:
+            hits.append(ev)
+    if not hits:
+        return []
+    first = _event_ts(hits[0])
+    last = _event_ts(hits[-1])
+    return [Diagnostic(
+        kind="prod_candidate_mismatch",
+        severity="error",
+        title="Deployed identity does not match the candidate SHA",
+        detail=(
+            "A production_promoted event records a deployed git SHA that "
+            "differs from the candidate SHA. The deployed revision must equal "
+            "the reviewed candidate."
+        ),
+        actions=[DiagnosticAction(kind="comment", label="Verify the deployed revision", suggested=False)],
+        first_seen_at=first,
+        last_seen_at=last,
+        count=len(hits),
+    )]
+
+
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
@@ -1090,6 +1207,10 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_prod_without_receipt,
+    _rule_receipt_without_prod,
+    _rule_prod_failed_required_probe,
+    _rule_prod_candidate_mismatch,
 ]
 
 
@@ -1105,6 +1226,10 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "prod_without_receipt",
+    "receipt_without_prod",
+    "prod_failed_required_probe",
+    "prod_candidate_mismatch",
 )
 
 

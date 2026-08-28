@@ -263,7 +263,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "block_loop_resolved", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "block_loop_resolved", "review_requested", "changes_requested", "production_promoted")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -695,6 +695,25 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"✅ {board_tag}{tag}Kanban {sub['task_id']} block loop "
                                 f"resolved — {decision}{suffix}"
+                            )
+                        elif kind == "production_promoted":
+                            # M17: distinct "production verified" notification.
+                            # No sensitive content — only target, date and the
+                            # immutable deployed identity.
+                            payload = ev.payload or {}
+                            target = str(payload.get("target") or "")[:80]
+                            deployed_at = str(payload.get("deployed_at_utc") or "")[:40]
+                            identity = str(payload.get("deployed_identity_value") or "")[:40]
+                            suffix = ""
+                            if target:
+                                suffix += f" — {target}"
+                            if deployed_at:
+                                suffix += f" @ {deployed_at}"
+                            if identity:
+                                suffix += f" [{identity}]"
+                            msg = (
+                                f"🚀 {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"production verified{suffix}"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS

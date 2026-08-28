@@ -5819,7 +5819,12 @@ def _normalise_production_receipt(receipt: Mapping[str, Any]) -> tuple[dict, lis
 
 
 def _board_for_connection(conn: sqlite3.Connection) -> str:
-    """Resolve the board owning an open connection, not the ambient board."""
+    """Resolve the board owning an open connection, fail-closed (M07).
+
+    Never falls back to the ambient board: if the connection's board cannot be
+    resolved unambiguously, raise so the caller refuses the mutation instead of
+    silently operating on the wrong board.
+    """
     try:
         db_file = conn.execute("PRAGMA database_list").fetchone()[2]
         resolved = str(Path(db_file).resolve()) if db_file else ""
@@ -5827,9 +5832,13 @@ def _board_for_connection(conn: sqlite3.Connection) -> str:
             slug = meta.get("slug")
             if slug and str(kanban_db_path(board=slug).resolve()) == resolved:
                 return slug
-    except Exception:
-        pass
-    return get_current_board()
+    except Exception as exc:
+        raise ProductionLifecycleError(
+            "cannot resolve board for connection (fail-closed)"
+        ) from exc
+    raise ProductionLifecycleError(
+        "cannot resolve board for connection (fail-closed)"
+    )
 
 
 def _production_verifier(
@@ -6061,7 +6070,7 @@ def mark_task_prod(
             "required_probes": sum(p["required"] for p in probes),
         })
         stored = conn.execute("SELECT * FROM production_receipts WHERE id = ?", (receipt_id,)).fetchone()
-    recompute_ready(conn)
+    # M12: done -> prod must not touch children. No recompute_ready here.
     return _receipt_from_row(conn, stored)
 
 
@@ -12636,8 +12645,12 @@ def gc_events(
     history."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
+        # M18/rollback: never GC production_promoted events — they are the
+        # immutable proof of a production promotion and must survive any
+        # generic retention window (no explicit retention policy exists).
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? "
+            "AND kind != 'production_promoted' AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'prod', 'archived'))",
             (cutoff,),
         )
