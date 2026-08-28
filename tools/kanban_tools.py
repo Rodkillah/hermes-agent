@@ -570,7 +570,7 @@ def _handle_show(args: dict, **kw) -> str:
                     for c in comments
                 ],
                 "events": [
-                    {"kind": e.kind, "payload": e.payload,
+                    {"id": e.id, "kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
                     for e in events[-50:]   # cap; full log via CLI
                 ],

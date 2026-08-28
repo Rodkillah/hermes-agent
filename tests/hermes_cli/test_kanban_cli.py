@@ -70,6 +70,47 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_kanban_show_json_event_id_drives_block_loop_resolution(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "block_loop_detected",
+                {"source_status": "ready", "reason": "repeat"},
+            )
+
+    detail = json.loads(kc.run_slash(f"show {tid} --json"))
+    detection = [e for e in detail["events"] if e["kind"] == "block_loop_detected"][-1]
+    assert isinstance(detection["id"], int)
+
+    output = kc.run_slash(
+        f"resolve-block-loop {tid} archive --expected-event-id {detection['id']} "
+        "--reason superseded"
+    )
+    assert f"Resolved {tid}: archive → archived" in output
+
+
+def test_kanban_show_text_includes_event_id(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "block_loop_detected",
+                {"source_status": "ready", "reason": "repeat"},
+            )
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1]
+
+    output = kc.run_slash(f"show {tid}")
+    assert f"id={event.id}" in output
+    assert "block_loop_detected" in output
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
