@@ -218,6 +218,14 @@ function nudged<T>(write: Promise<T>): Promise<T> {
 export const patchTask = (id: string, patch: Record<string, unknown>) =>
   nudged(call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch }))
 
+/** Production is a proof-bearing transition; it must never use optimistic
+ * PATCH/drag semantics. */
+export const promoteTaskToProd = (id: string, receipt: Record<string, unknown>, idempotencyKey: string) =>
+  nudged(call(withBoard(`/tasks/${id}/prod`), {
+    method: 'POST',
+    body: { receipt, idempotency_key: idempotencyKey }
+  }))
+
 export const createTask = (body: Record<string, unknown>) =>
   nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
 
