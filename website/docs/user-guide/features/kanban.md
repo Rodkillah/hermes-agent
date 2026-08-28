@@ -292,14 +292,16 @@ To resolve the resulting human gate, an orchestrator must use the dedicated
 transition rather than generic `unblock`, `promote`, or `specify`:
 
 ```bash
-hermes kanban resolve-block-loop t_abc retry --reason "retry after fixing the input"
-hermes kanban resolve-block-loop t_abc complete --reason "accepted as-is" \
+hermes kanban resolve-block-loop t_abc retry --expected-event-id 123 --reason "retry after fixing the input"
+hermes kanban resolve-block-loop t_abc complete --expected-event-id 123 --reason "accepted as-is" \
     --summary "Reviewed the existing outcome; no further execution is required."
-hermes kanban resolve-block-loop t_abc archive --reason "superseded by the replacement task"
+hermes kanban resolve-block-loop t_abc archive --expected-event-id 123 --reason "superseded by the replacement task"
 ```
 
 The transition is fail-closed: the task must still be `triage`, have no active
-run, and retain its latest `block_loop_detected` provenance. `retry` restores
+run, retain its latest `block_loop_detected` provenance, and receive the exact
+`--expected-event-id` read from that current event. Missing or stale event ids
+are rejected without mutation. `retry` restores
 `review` or parent-gated `ready`/`todo` without erasing loop memory; `complete`
 resets that memory and promotes dependants; `archive` does not promote them.
 Every decision records the actor and reason in a `block_loop_resolved` event.
@@ -315,7 +317,7 @@ Every decision records the actor and reason in a `block_loop_resolved` event.
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
-| `kanban_resolve_block_loop` | Orchestrator-only human decision for a `block_loop_detected` triage task: `retry`, `complete`, or `archive`. Requires an actor and durable reason; `complete` also requires a handoff. | `decision`, `reason` |
+| `kanban_resolve_block_loop` | Orchestrator-only human decision for a `block_loop_detected` triage task: `retry`, `complete`, or `archive`. Requires an actor, durable reason, and the current `expected_event_id` CAS token; `complete` also requires a handoff. | `decision`, `reason`, `expected_event_id` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |

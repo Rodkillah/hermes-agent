@@ -47,6 +47,7 @@ import {
   uploadAttachment
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
+import { latestBlockLoopEventId } from './resolve'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -613,13 +614,16 @@ export function TaskDrawer({
     onSettled: invalidate
   })
 
-  const mutate = (fn: () => Promise<unknown>, onDone?: () => void) => () =>
+  const mutate = (fn: () => Promise<unknown>, onDone?: () => void, onError?: () => void) => () =>
     fn().then(
       () => {
         invalidate()
         onDone?.()
       },
-      (err: unknown) => host.notify({ kind: 'error', message: errText(err) })
+      (err: unknown) => {
+        host.notify({ kind: 'error', message: errText(err) })
+        onError?.()
+      }
     )
 
   const commentMut = useMutation({
@@ -644,7 +648,9 @@ export function TaskDrawer({
   })
 
   const resolveBlockLoop = (decision: 'archive' | 'complete' | 'retry') => {
-    if (!task || task.status !== 'triage' || !detail?.events.some(event => event.kind === 'block_loop_detected')) {
+    const expectedEventId = latestBlockLoopEventId(detail?.events ?? [])
+
+    if (!task || task.status !== 'triage' || expectedEventId === null) {
       return
     }
 
@@ -665,9 +671,10 @@ export function TaskDrawer({
     void mutate(() => resolveBlockLoopTask(task.id, {
       actor: 'desktop',
       decision,
+      expected_event_id: expectedEventId,
       reason,
       ...(summary ? { summary } : {})
-    }))()
+    }), undefined, invalidate)()
   }
 
   const uploadMut = useMutation({
@@ -820,7 +827,7 @@ export function TaskDrawer({
               </Callout>
             )}
 
-            {task.status === 'triage' && detail.events.some(event => event.kind === 'block_loop_detected') && (
+            {task.status === 'triage' && latestBlockLoopEventId(detail.events) !== null && (
               <Callout title={k.notify.blockLoopTitle} tone={SEVERITY_TONE.error}>
                 <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
                   This triage card came from a repeated block loop. Choose an explicit human decision.

@@ -41,7 +41,8 @@ def test_generic_triage_cannot_use_block_loop_resolution(kanban_home: Path) -> N
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="raw idea", assignee="worker", triage=True)
         assert not kb.resolve_block_loop_task(
-            conn, tid, decision="retry", actor="amber", reason="not this path"
+            conn, tid, decision="retry", actor="amber", reason="not this path",
+            expected_event_id=1,
         )
         assert kb.get_task(conn, tid).status == "triage"
 
@@ -80,6 +81,40 @@ def test_resolution_refuses_stale_provenance_cas(kanban_home: Path) -> None:
         assert kb.get_task(conn, tid).status == "triage"
 
 
+def test_resolution_requires_a_cas_token(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _escalated_task(conn)
+        with pytest.raises(ValueError, match="expected_event_id"):
+            kb.resolve_block_loop_task(
+                conn, tid, decision="archive", actor="amber", reason="superseded"
+            )
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_stale_first_loop_decision_cannot_resolve_second_loop(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _escalated_task(conn)
+        first_event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1]
+
+        assert kb.resolve_block_loop_task(
+            conn, tid, decision="retry", actor="amber", reason="retry once",
+            expected_event_id=first_event.id,
+        )
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="still missing input", kind="capability")
+        second_event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1]
+        assert second_event.id != first_event.id
+
+        assert not kb.resolve_block_loop_task(
+            conn, tid, decision="archive", actor="amber", reason="stale action",
+            expected_event_id=first_event.id,
+        )
+        assert kb.get_task(conn, tid).status == "triage"
+        resolved = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_resolved"]
+        assert len(resolved) == 1
+        assert resolved[0].payload["source_event_id"] == first_event.id
+
+
 def test_complete_resets_memory_and_releases_dependants(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _escalated_task(conn)
@@ -89,6 +124,7 @@ def test_complete_resets_memory_and_releases_dependants(kanban_home: Path) -> No
         assert kb.resolve_block_loop_task(
             conn, tid, decision="complete", actor="amber", reason="accepted",
             summary="The existing result satisfies the acceptance criteria.",
+            expected_event_id=[e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1].id,
         )
         assert kb.get_task(conn, tid).status == "done"
         assert kb.get_task(conn, tid).block_recurrences == 0
@@ -111,6 +147,7 @@ def test_complete_preserves_parent_gating(kanban_home: Path) -> None:
             actor="amber",
             reason="accepted",
             summary="handoff",
+            expected_event_id=[e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1].id,
         )
         assert kb.get_task(conn, tid).status == "triage"
 
@@ -122,7 +159,8 @@ def test_archive_does_not_release_dependants(kanban_home: Path) -> None:
         kb.link_tasks(conn, tid, child)
 
         assert kb.resolve_block_loop_task(
-            conn, tid, decision="archive", actor="amber", reason="superseded"
+            conn, tid, decision="archive", actor="amber", reason="superseded",
+            expected_event_id=[e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1].id,
         )
         assert kb.get_task(conn, tid).status == "archived"
         assert kb.get_task(conn, child).status == "todo"
@@ -136,7 +174,8 @@ def test_resolution_requires_handoff_for_complete(kanban_home: Path) -> None:
         tid = _escalated_task(conn)
         with pytest.raises(ValueError, match="handoff"):
             kb.resolve_block_loop_task(
-                conn, tid, decision="complete", actor="amber", reason="accepted"
+                conn, tid, decision="complete", actor="amber", reason="accepted",
+                expected_event_id=[e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1].id,
             )
         assert kb.get_task(conn, tid).status == "triage"
 
@@ -150,7 +189,8 @@ def test_resolution_refuses_an_orphaned_active_run(kanban_home: Path) -> None:
                 (tid,),
             )
         assert not kb.resolve_block_loop_task(
-            conn, tid, decision="archive", actor="amber", reason="superseded"
+            conn, tid, decision="archive", actor="amber", reason="superseded",
+            expected_event_id=[e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1].id,
         )
         assert kb.get_task(conn, tid).status == "triage"
 
@@ -170,6 +210,7 @@ def test_retry_restores_review_phase_when_loop_started_in_review(kanban_home: Pa
         assert kb.get_task(conn, tid).status == "triage"
 
         assert kb.resolve_block_loop_task(
-            conn, tid, decision="retry", actor="amber", reason="review input fixed"
+            conn, tid, decision="retry", actor="amber", reason="review input fixed",
+            expected_event_id=[e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1].id,
         )
         assert kb.get_task(conn, tid).status == "review"

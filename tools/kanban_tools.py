@@ -1689,6 +1689,9 @@ def _handle_resolve_block_loop(args: dict, **kw) -> str:
     actor = str(args.get("actor") or "").strip()
     if not actor:
         return tool_error("actor is required — identify the human decision maker")
+    expected_event_id = args.get("expected_event_id")
+    if expected_event_id is None:
+        return tool_error("expected_event_id is required — read the current block_loop_detected event first")
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
@@ -1697,7 +1700,7 @@ def _handle_resolve_block_loop(args: dict, **kw) -> str:
                 decision=args.get("decision"), actor=actor, reason=reason,
                 summary=args.get("summary"), result=args.get("result"),
                 metadata=metadata, handoff=args.get("handoff"),
-                expected_event_id=args.get("expected_event_id"),
+                expected_event_id=expected_event_id,
             )
             if not ok:
                 return tool_error(
@@ -2397,10 +2400,10 @@ KANBAN_RESOLVE_BLOCK_LOOP_SCHEMA = {
             "result": {"type": "string", "description": "Optional completion result."},
             "handoff": {"type": "string", "description": "Alias for summary."},
             "metadata": {"type": "object", "description": "Structured completion facts."},
-            "expected_event_id": {"type": "integer", "description": "Optional CAS id of the block_loop_detected event."},
+            "expected_event_id": {"type": "integer", "description": "Required CAS id of the current block_loop_detected event from a fresh task read."},
             "board": _board_schema_prop(),
         },
-        "required": ["decision", "actor", "reason"],
+        "required": ["decision", "actor", "reason", "expected_event_id"],
     },
 }
 

@@ -81,11 +81,15 @@ def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
                 "block_loop_detected",
                 {"source_status": "ready", "recurrences": 2, "reason": "repeat"},
             )
+        expected_event_id = [
+            e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"
+        ][-1].id
         # Subscribe after the detection event so this test isolates the
         # resolution notification rather than replaying both events.
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         assert kb.resolve_block_loop_task(
-            conn, tid, decision="archive", actor="amber", reason="superseded"
+            conn, tid, decision="archive", actor="amber", reason="superseded",
+            expected_event_id=expected_event_id,
         )
     finally:
         conn.close()

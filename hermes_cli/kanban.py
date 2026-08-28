@@ -665,6 +665,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_resolve_loop.add_argument("--reason", required=True, help="Durable reason for the human decision.")
     p_resolve_loop.add_argument("--actor", default=None, help="Decision maker (defaults to the active profile).")
+    p_resolve_loop.add_argument(
+        "--expected-event-id", type=int, required=True,
+        help="Current block_loop_detected event id from a fresh task detail read (CAS guard).",
+    )
     p_resolve_loop.add_argument("--summary", default=None, help="Required handoff for complete.")
     p_resolve_loop.add_argument("--result", default=None, help="Optional result text for complete.")
     p_resolve_loop.add_argument("--metadata", default=None, help="JSON object for the completion handoff.")
@@ -2449,6 +2453,7 @@ def _cmd_resolve_block_loop(args: argparse.Namespace) -> int:
             decision=args.decision,
             actor=actor,
             reason=args.reason,
+            expected_event_id=args.expected_event_id,
             summary=getattr(args, "summary", None),
             result=getattr(args, "result", None),
             metadata=metadata,
