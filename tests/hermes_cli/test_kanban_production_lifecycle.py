@@ -178,3 +178,67 @@ def test_done_page_is_keyset_paginated_and_prod_is_a_valid_status(kanban_home: P
         next_page = kb.list_tasks_page(conn, status="done", limit=2, cursor=page["next_cursor"])
         assert sorted([task.id for task in page["tasks"]] + [task.id for task in next_page["tasks"]]) == sorted(ids)
         assert "prod" in kb.VALID_STATUSES
+
+
+def test_production_verifier_fails_closed_when_ambient_db_override_is_incoherent(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verifier = _verifier(tmp_path)
+    _configure(kanban_home, verifier)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "unrelated.db"))
+    with kb.connect() as conn:
+        task_id = _done(conn)
+        with pytest.raises(kb.ProductionLifecycleError, match="board"):
+            kb.mark_task_prod(
+                conn, task_id, receipt=_receipt(), actor="amber", idempotency_key="idem-board"
+            )
+        assert kb.get_task(conn, task_id).status == "done"
+        assert kb.get_production_receipt(conn, task_id) is None
+
+
+def test_done_to_prod_does_not_recompute_or_mutate_child_tasks(
+    kanban_home: Path, tmp_path: Path
+) -> None:
+    _configure(kanban_home, _verifier(tmp_path))
+    with kb.connect() as conn:
+        parent_id = _done(conn)
+        child_id = _done(conn)
+        kb.link_tasks(conn, parent_id, child_id)
+        assert kb.route_done_to_deploy_todo(
+            conn,
+            child_id,
+            candidate_sha=SHA,
+            audit_id="audit-child",
+            reason="not deployed yet",
+            next_action="deploy child",
+            actor="amber",
+        )
+        assert kb.get_task(conn, child_id).status == "todo"
+        kb.mark_task_prod(
+            conn, parent_id, receipt=_receipt(), actor="amber", idempotency_key="idem-child"
+        )
+        assert kb.get_task(conn, child_id).status == "todo"
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'promoted'",
+            (child_id,),
+        ).fetchone()
+
+
+def test_gc_events_retains_production_promotion_event_for_prod_task(
+    kanban_home: Path, tmp_path: Path
+) -> None:
+    _configure(kanban_home, _verifier(tmp_path))
+    with kb.connect() as conn:
+        task_id = _done(conn)
+        kb.mark_task_prod(
+            conn, task_id, receipt=_receipt(), actor="amber", idempotency_key="idem-gc"
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = 0 WHERE task_id = ?", (task_id,)
+        )
+        conn.commit()
+        assert kb.gc_events(conn, older_than_seconds=1) > 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'production_promoted'",
+            (task_id,),
+        ).fetchone()[0] == 1

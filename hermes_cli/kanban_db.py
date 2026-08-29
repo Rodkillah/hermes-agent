@@ -5825,11 +5825,29 @@ def _board_for_connection(conn: sqlite3.Connection) -> str:
         resolved = str(Path(db_file).resolve()) if db_file else ""
         for meta in list_boards(include_archived=True):
             slug = meta.get("slug")
-            if slug and str(kanban_db_path(board=slug).resolve()) == resolved:
+            if not slug:
+                continue
+            # ``kanban_db_path`` deliberately honors HERMES_KANBAN_DB, so it
+            # cannot be used to identify the owner of an already-open
+            # connection: an incoherent ambient override would make every
+            # board appear to point at the override. Compare against the
+            # canonical per-board location instead.
+            expected = (
+                kanban_home() / "kanban.db"
+                if slug == DEFAULT_BOARD
+                else board_dir(slug) / "kanban.db"
+            )
+            if str(expected.resolve()) == resolved:
                 return slug
     except Exception:
-        pass
-    return get_current_board()
+        # Production promotion must never fall back to the ambient board when
+        # connection ownership cannot be established.
+        raise ProductionLifecycleError(
+            "cannot resolve the board owning the production connection"
+        ) from None
+    raise ProductionLifecycleError(
+        "cannot resolve the board owning the production connection"
+    )
 
 
 def _production_verifier(
@@ -6061,7 +6079,6 @@ def mark_task_prod(
             "required_probes": sum(p["required"] for p in probes),
         })
         stored = conn.execute("SELECT * FROM production_receipts WHERE id = ?", (receipt_id,)).fetchone()
-    recompute_ready(conn)
     return _receipt_from_row(conn, stored)
 
 
@@ -12638,7 +12655,8 @@ def gc_events(
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'prod', 'archived'))",
+            "(SELECT id FROM tasks WHERE status IN ('done', 'prod', 'archived')) "
+            "AND kind != 'production_promoted'",
             (cutoff,),
         )
     return int(cur.rowcount or 0)
