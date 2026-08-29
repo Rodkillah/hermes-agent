@@ -875,7 +875,7 @@ export function TaskDrawer({
                 <div className="flex flex-wrap gap-1.5">
                   <Button onClick={() => resolveBlockLoop('retry')} size="xs" variant="secondary">Retry</Button>
                   <Button onClick={() => resolveBlockLoop('complete')} size="xs" variant="outline">Complete</Button>
-                  <Button onClick={() => resolveBlockLoop('archive')} size="xs" variant="outline">{k.archiveTask}</Button>
+                  <Button onClick={() => resolveBlockLoop('archive')} size="xs" variant="outline">{k.archive}</Button>
                 </div>
               </Callout>
             )}
