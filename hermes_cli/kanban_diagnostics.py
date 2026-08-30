@@ -181,7 +181,23 @@ def _receipt_field(receipt: Any, name: str, default: Any = None) -> Any:
     return getattr(receipt, name, default)
 
 
-def _production_evidence(task, events, receipt):
+def _required_probe_value(value: Any) -> bool:
+    """Normalize booleans read from JSON and SQLite-backed mappings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
+def _production_evidence(
+    task,
+    events,
+    receipt,
+    receipt_storage_available: Optional[bool] = None,
+):
     """Return receipt-like evidence, with an event fallback for old boards.
 
     Current boards pass the normalized receipt row explicitly. Older compatible
@@ -192,6 +208,11 @@ def _production_evidence(task, events, receipt):
     """
     if receipt is not None:
         return receipt
+    if receipt_storage_available is True:
+        # The canonical table exists and this task has no row. Do not
+        # mistake a missing receipt for a legacy board and hide the defect
+        # behind an old production_promoted event.
+        return None
     promoted = [event for event in events if _event_kind(event) == "production_promoted"]
     if not promoted:
         return None
@@ -1127,6 +1148,7 @@ def _rule_prod_without_receipt(task, events, runs, now, cfg) -> list[Diagnostic]
         return []
     evidence = _production_evidence(
         task, events, cfg.get("_production_receipt"),
+        cfg.get("_production_receipt_storage_available"),
     )
     if evidence is not None:
         return []
@@ -1149,11 +1171,12 @@ def _rule_prod_without_receipt(task, events, runs, now, cfg) -> list[Diagnostic]
 
 
 def _rule_receipt_without_prod(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """Detect production proof whose task status is no longer ``prod``."""
+    """Detect production proof whose task status is not a valid terminal state."""
     evidence = _production_evidence(
         task, events, cfg.get("_production_receipt"),
+        cfg.get("_production_receipt_storage_available"),
     )
-    if evidence is None or _task_field(task, "status") == "prod":
+    if evidence is None or _task_field(task, "status") in {"prod", "archived"}:
         return []
     promoted = _production_event_hits(events)
     ts = _production_timestamp(evidence, events, now)
@@ -1179,6 +1202,7 @@ def _rule_prod_failed_required_probe(task, events, runs, now, cfg) -> list[Diagn
     """Detect a production proof containing a failed required probe."""
     evidence = _production_evidence(
         task, events, cfg.get("_production_receipt"),
+        cfg.get("_production_receipt_storage_available"),
     )
     if evidence is None:
         return []
@@ -1188,7 +1212,7 @@ def _rule_prod_failed_required_probe(task, events, runs, now, cfg) -> list[Diagn
         failed = [
             probe for probe in probes
             if isinstance(probe, dict)
-            and probe.get("required") is True
+            and _required_probe_value(probe.get("required"))
             and probe.get("result") != "passed"
         ]
     else:
@@ -1225,6 +1249,7 @@ def _rule_prod_candidate_mismatch(task, events, runs, now, cfg) -> list[Diagnost
     """Detect a git deployment identity different from its candidate SHA."""
     evidence = _production_evidence(
         task, events, cfg.get("_production_receipt"),
+        cfg.get("_production_receipt_storage_available"),
     )
     if evidence is None:
         return []
@@ -1358,6 +1383,7 @@ def compute_task_diagnostics(
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
     production_receipt: Any = None,
+    production_receipt_storage_available: Optional[bool] = None,
 ) -> list[Diagnostic]:
     """Run every rule against a single task's state and return a
     severity-sorted list of active diagnostics.
@@ -1369,6 +1395,7 @@ def compute_task_diagnostics(
     config = config or {}
     cfg = {**DEFAULT_CONFIG, **config}
     cfg["_production_receipt"] = production_receipt
+    cfg["_production_receipt_storage_available"] = production_receipt_storage_available
     if graph is not None:
         cfg["_graph"] = graph
     if (

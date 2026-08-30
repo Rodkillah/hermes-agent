@@ -6092,6 +6092,50 @@ def get_production_receipt(
     return _receipt_from_row(conn, row) if row else None
 
 
+def load_production_receipts(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    """Load normalized production evidence and report storage availability.
+
+    The boolean is deliberately separate from the result mapping: an empty
+    mapping means either "the current table has no matching rows" or "this is
+    a legacy board without the table". Callers must preserve that distinction
+    so a legacy event fallback cannot hide a missing receipt on a current DB.
+    """
+    task_ids = list(dict.fromkeys(task_ids))
+    if not task_ids:
+        return True, {}
+    placeholders = ",".join(["?"] * len(task_ids))
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM production_receipts WHERE task_id IN ({placeholders})",
+            tuple(task_ids),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False, {}
+
+    receipts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        receipt = dict(row)
+        try:
+            receipt["probes"] = [
+                dict(probe)
+                for probe in conn.execute(
+                    "SELECT ordinal, name, scope, required, result, evidence_ref "
+                    "FROM production_probes WHERE receipt_id = ? ORDER BY ordinal",
+                    (row["id"],),
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            # A partially migrated board can have the receipt table before
+            # the probe table. Keep the receipt visible and let diagnostics
+            # report what the available evidence supports.
+            receipt["probes"] = []
+        receipts[row["task_id"]] = receipt
+    return True, receipts
+
+
 def route_done_to_deploy_todo(
     conn: sqlite3.Connection, task_id: str, *, candidate_sha: str,
     audit_id: str, reason: str, next_action: str, actor: str,

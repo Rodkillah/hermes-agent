@@ -273,12 +273,30 @@ def test_prod_without_receipt_is_detected_from_normalized_receipt_state():
     assert {d.kind for d in diags} == {"prod_without_receipt"}
 
 
+def test_current_receipt_table_missing_row_does_not_use_event_fallback():
+    diags = kd.compute_task_diagnostics(
+        _task(status="prod"), [_production_event()], [], now=200,
+        production_receipt=None,
+        production_receipt_storage_available=True,
+    )
+    assert {d.kind for d in diags} == {"prod_without_receipt"}
+
+
 def test_receipt_without_prod_is_detected_without_promotion_event():
     diags = kd.compute_task_diagnostics(
         _task(status="done"), [], [], now=200,
         production_receipt=_production_receipt(),
     )
     assert {d.kind for d in diags} == {"receipt_without_prod"}
+
+
+def test_archived_task_with_receipt_is_a_valid_terminal_state():
+    diags = kd.compute_task_diagnostics(
+        _task(status="archived"), [], [], now=200,
+        production_receipt=_production_receipt(),
+        production_receipt_storage_available=True,
+    )
+    assert "receipt_without_prod" not in {d.kind for d in diags}
 
 
 def test_failed_required_probe_is_detected_from_receipt():
@@ -294,6 +312,25 @@ def test_failed_required_probe_is_detected_from_receipt():
     )
     diags = kd.compute_task_diagnostics(
         _task(status="prod"), [], [], now=200, production_receipt=receipt,
+    )
+    assert {d.kind for d in diags} == {"prod_failed_required_probe"}
+
+
+def test_sqlite_integer_required_probe_is_detected():
+    receipt = _production_receipt(
+        probes=[{
+            "ordinal": 0,
+            "name": "health",
+            "scope": "live_production",
+            "required": 1,
+            "result": "failed",
+            "evidence_ref": "probe-health",
+        }],
+    )
+    diags = kd.compute_task_diagnostics(
+        _task(status="prod"), [], [], now=200,
+        production_receipt=receipt,
+        production_receipt_storage_available=True,
     )
     assert {d.kind for d in diags} == {"prod_failed_required_probe"}
 

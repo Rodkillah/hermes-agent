@@ -1374,3 +1374,87 @@ def test_dashboard_diagnostics_include_prod_without_receipt(client):
         conn.close()
 
     assert [item["kind"] for item in diagnostics[task_id]] == ["prod_without_receipt"]
+
+
+def test_dashboard_diagnostics_do_not_use_event_fallback_for_missing_current_row(client):
+    from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="missing current receipt", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'prod' WHERE id = ?", (task_id,))
+            kb._append_event(
+                conn,
+                task_id,
+                "production_promoted",
+                {"candidate_sha": "a" * 40, "target": "local"},
+            )
+        diagnostics = _compute_task_diagnostics(conn, task_ids=[task_id])
+    finally:
+        conn.close()
+
+    assert [item["kind"] for item in diagnostics[task_id]] == ["prod_without_receipt"]
+
+
+def test_dashboard_diagnostics_keep_event_fallback_for_legacy_board(client):
+    from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="legacy production event", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'prod' WHERE id = ?", (task_id,))
+            kb._append_event(
+                conn,
+                task_id,
+                "production_promoted",
+                {
+                    "candidate_sha": "a" * 40,
+                    "deployed_identity_kind": "git_sha",
+                    "deployed_identity_value": "a" * 40,
+                    "required_probes": 1,
+                    "passed_probes": 1,
+                },
+            )
+            conn.execute("DROP TABLE production_probes")
+            conn.execute("DROP TABLE production_receipts")
+        diagnostics = _compute_task_diagnostics(conn, task_ids=[task_id])
+    finally:
+        conn.close()
+
+    assert task_id not in diagnostics
+
+
+def test_dashboard_diagnostics_detect_sqlite_integer_required_probe(client):
+    from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="failed stored probe", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'prod' WHERE id = ?", (task_id,))
+            conn.execute(
+                """INSERT INTO production_receipts
+                (id, task_id, schema_version, environment, target, deployed_at_utc,
+                 candidate_sha, deployed_identity_kind, deployed_identity_value,
+                 derivation_ref, backup_ref, rollback_ref, verification_mode, actor,
+                 idempotency_key, evidence_sha256, created_at)
+                VALUES (?, ?, 1, 'test', 'local', '2026-08-30T10:00:00+00:00',
+                        ?, 'git_sha', ?, NULL, 'backup-ref', 'rollback-ref',
+                        'system_verified', 'worker', ?, 'evidence', 100)""",
+                ("receipt-1", task_id, "a" * 40, "a" * 40, "idem-1"),
+            )
+            conn.execute(
+                """INSERT INTO production_probes
+                (receipt_id, ordinal, name, scope, required, result, evidence_ref)
+                VALUES (?, 0, 'health', 'live_production', 1, 'failed', 'probe-ref')""",
+                ("receipt-1",),
+            )
+        diagnostics = _compute_task_diagnostics(conn, task_ids=[task_id])
+    finally:
+        conn.close()
+
+    kinds = {item["kind"] for item in diagnostics[task_id]}
+    assert "prod_failed_required_probe" in kinds
+    assert "prod_without_receipt" not in kinds

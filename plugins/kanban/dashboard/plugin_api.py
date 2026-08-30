@@ -303,34 +303,12 @@ def _compute_task_diagnostics(
 
     # Production integrity diagnostics need the normalized receipt, but the
     # dashboard must remain readable against a legacy board opened before the
-    # additive receipt migration. In that case the diagnostic engine falls
-    # back to the committed production_promoted event.
-    receipts_by_task: dict[str, dict] = {}
-    try:
-        receipt_rows = conn.execute(
-            f"SELECT * FROM production_receipts WHERE task_id IN ({placeholders})",
-            tuple(row_ids),
-        ).fetchall()
-        for receipt_row in receipt_rows:
-            receipt = dict(receipt_row)
-            try:
-                receipt["probes"] = [
-                    dict(probe)
-                    for probe in conn.execute(
-                        "SELECT ordinal, name, scope, required, result, evidence_ref "
-                        "FROM production_probes WHERE receipt_id = ? ORDER BY ordinal",
-                        (receipt_row["id"],),
-                    ).fetchall()
-                ]
-            except sqlite3.OperationalError:
-                # A partially migrated legacy board has no probe table yet;
-                # keep the receipt fields and let the rules stay fail-safe.
-                receipt["probes"] = []
-            receipts_by_task[receipt_row["task_id"]] = receipt
-    except sqlite3.OperationalError:
-        # Compatibility fallback: no production receipt table means the
-        # production_promoted event is the only available proof.
-        receipts_by_task = {}
+    # additive receipt migration. The helper preserves whether the receipt
+    # table was available so the event fallback cannot hide a missing row on a
+    # current-schema board.
+    receipt_storage_available, receipts_by_task = kanban_db.load_production_receipts(
+        conn, row_ids,
+    )
 
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
     out: dict[str, list[dict]] = {}
@@ -343,6 +321,7 @@ def _compute_task_diagnostics(
             config=diag_config,
             graph=graph_by_task.get(tid),
             production_receipt=receipts_by_task.get(tid),
+            production_receipt_storage_available=receipt_storage_available,
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]

@@ -1838,6 +1838,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         return 2
     graph = None
+    production_receipt = None
+    production_receipt_storage_available = None
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
@@ -1852,6 +1854,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        production_receipt_storage_available, receipts = kb.load_production_receipts(
+            conn, [args.task_id],
+        )
+        production_receipt = receipts.get(args.task_id)
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
@@ -1859,6 +1865,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         payload = {
             "task": _task_to_dict(task),
             "latest_summary": latest_summary,
+            "production_receipt": production_receipt,
             "parents": parents,
             "children": children,
             "comments": [
@@ -1932,7 +1939,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # of show output so CLI users see them before scrolling through
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task,
+        events,
+        runs,
+        graph=graph,
+        production_receipt=production_receipt,
+        production_receipt_storage_available=production_receipt_storage_available,
+    )
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
@@ -2095,6 +2109,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
             if task is None:
                 print(f"no such task: {args.task}", file=sys.stderr)
                 return 1
+            receipt_storage_available, receipts_by_task = kb.load_production_receipts(
+                conn, [args.task],
+            )
             diags_by_task = {
                 args.task: kd.compute_task_diagnostics(
                     task,
@@ -2102,6 +2119,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     kb.list_runs(conn, args.task),
                     graph=kb.task_graph_context(conn, args.task),
                     config=diag_config,
+                    production_receipt=receipts_by_task.get(args.task),
+                    production_receipt_storage_available=receipt_storage_available,
                 )
             }
         else:
@@ -2126,6 +2145,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     tuple(ids),
                 ):
                     run_by.setdefault(row["task_id"], []).append(row)
+                receipt_storage_available, receipts_by_task = kb.load_production_receipts(
+                    conn, ids,
+                )
                 graph_by = kb.task_graph_contexts(conn, ids)
                 diags_by_task = {}
                 for r in rows:
@@ -2136,6 +2158,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                         run_by.get(tid, []),
                         graph=graph_by.get(tid),
                         config=diag_config,
+                        production_receipt=receipts_by_task.get(tid),
+                        production_receipt_storage_available=receipt_storage_available,
                     )
                     if dl:
                         diags_by_task[tid] = dl
