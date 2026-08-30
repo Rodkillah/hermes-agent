@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -149,7 +150,7 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "prod",
 ]
 
 
@@ -300,6 +301,15 @@ def _compute_task_diagnostics(
     ).fetchall():
         runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
+    # Production integrity diagnostics need the normalized receipt, but the
+    # dashboard must remain readable against a legacy board opened before the
+    # additive receipt migration. The helper preserves whether the receipt
+    # table was available so the event fallback cannot hide a missing row on a
+    # current-schema board.
+    receipt_storage_available, receipts_by_task = kanban_db.load_production_receipts(
+        conn, row_ids,
+    )
+
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
     out: dict[str, list[dict]] = {}
     for r in rows:
@@ -310,6 +320,8 @@ def _compute_task_diagnostics(
             runs_by_task.get(tid, []),
             config=diag_config,
             graph=graph_by_task.get(tid),
+            production_receipt=receipts_by_task.get(tid),
+            production_receipt_storage_available=receipt_storage_available,
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]
@@ -439,7 +451,7 @@ def get_board(
         ).fetchall():
             p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
             p["total"] += 1
-            if row["cstatus"] == "done":
+            if row["cstatus"] in ("done", "prod"):
                 p["done"] += 1
 
         # Diagnostics rollup for this board — see kanban_diagnostics.
@@ -517,6 +529,38 @@ def get_board(
 # GET /tasks/:id
 # ---------------------------------------------------------------------------
 
+@router.get("/tasks")
+def list_tasks_page(
+    status: str = Query("done"),
+    limit: int = Query(50, ge=1, le=50),
+    cursor: Optional[str] = Query(None),
+    tenant: Optional[str] = Query(None),
+    board: Optional[str] = Query(None),
+):
+    """Keyset-paginated task listing for audits and large boards."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        try:
+            page = kanban_db.list_tasks_page(
+                conn, status=status, limit=limit, cursor=cursor, tenant=tenant,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        summaries = kanban_db.latest_summaries(conn, [t.id for t in page["tasks"]])
+        tasks = []
+        for task in page["tasks"]:
+            tasks.append(_task_dict(task, latest_summary=summaries.get(task.id)))
+        return {
+            "tasks": tasks,
+            "next_cursor": page["next_cursor"],
+            "has_more": page["has_more"],
+            "total_matching": page["total_matching"],
+        }
+    finally:
+        conn.close()
+
+
 @router.get("/tasks/{task_id}")
 def get_task(
     task_id: str,
@@ -571,12 +615,14 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
+        production_receipt = kanban_db.get_production_receipt(conn, task_id)
         return {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
+            "production_receipt": production_receipt.to_dict() if production_receipt else None,
             "child_results": child_results,
             "runs": [
                 _run_dict(r)
@@ -867,11 +913,50 @@ def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
     return None
 
 
+class ProductionPromotionBody(BaseModel):
+    receipt: dict[str, Any]
+    idempotency_key: str
+
+
+@router.post("/tasks/{task_id}/prod")
+def promote_task_to_prod(
+    task_id: str,
+    payload: ProductionPromotionBody,
+    board: Optional[str] = Query(None),
+):
+    """Promote a done task through the sole audited production primitive."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        actor = os.environ.get("HERMES_PROFILE", "").strip()
+        try:
+            stored = kanban_db.mark_task_prod(
+                conn, task_id, receipt=payload.receipt,
+                actor=actor, idempotency_key=payload.idempotency_key,
+            )
+        except kanban_db.ProductionLifecycleError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        task = kanban_db.get_task(conn, task_id)
+        return {
+            "task": _task_dict(task) if task else None,
+            "production_receipt": stored.to_dict(),
+        }
+    finally:
+        conn.close()
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # Production is proof-bearing and must never be mixed with another
+        # generic PATCH mutation. Reject before assignee/model updates.
+        if payload.status == "prod":
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot set status to 'prod' directly; use POST /tasks/{task_id}/prod with an audited receipt",
+            )
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1177,11 +1262,15 @@ def _set_status_direct(
                 (task_id,),
             ).fetchall()
             if parent_statuses and not all(
-                p["status"] in {"done", "archived"} for p in parent_statuses
+                p["status"] in kanban_db.WORK_COMPLETED_STATUSES for p in parent_statuses
             ):
                 return False
 
         was_running = prev["status"] == "running"
+        if new_status == "prod":
+            raise ValueError("prod is only reachable through mark_task_prod")
+        if prev["status"] == "prod" and new_status not in {"prod", "archived"}:
+            raise ValueError("prod tasks may only be archived")
         reopening_satisfied_parent = (
             prev["status"] in {"done", "archived"}
             and effective_status not in {"done", "archived"}
@@ -1336,6 +1425,13 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
+    # Reject before the mutation loop: archive=true plus status=prod must not
+    # archive any card before the invalid production request is refused.
+    if payload.status == "prod":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot set status to 'prod' directly; use the audited production endpoint",
+        )
     results: list[dict] = []
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -1779,7 +1875,7 @@ class ResolveBlockLoopBody(BaseModel):
     summary: Optional[str] = None
     result: Optional[str] = None
     metadata: Optional[dict] = None
-    expected_event_id: Optional[int] = None
+    expected_event_id: int
 
 
 @router.post("/tasks/{task_id}/resolve-block-loop")

@@ -1152,6 +1152,9 @@ def test_resolve_block_loop_handler_archives_for_orchestrator(worker_env, monkey
                 "block_loop_detected",
                 {"source_status": "ready", "reason": "repeat"},
             )
+            expected_event_id = [
+                e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"
+            ][-1].id
     finally:
         conn.close()
 
@@ -1160,6 +1163,41 @@ def test_resolve_block_loop_handler_archives_for_orchestrator(worker_env, monkey
         "decision": "archive",
         "actor": "amber",
         "reason": "superseded",
+        "expected_event_id": expected_event_id,
+    }))
+    assert out["ok"] is True
+    assert out["status"] == "archived"
+
+
+def test_kanban_show_event_id_drives_block_loop_resolution(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "block_loop_detected",
+                {"source_status": "ready", "reason": "repeat"},
+            )
+    finally:
+        conn.close()
+
+    detail = json.loads(kt._handle_show({"task_id": tid}))
+    detection = [e for e in detail["events"] if e["kind"] == "block_loop_detected"][-1]
+    assert isinstance(detection["id"], int)
+
+    out = json.loads(kt._handle_resolve_block_loop({
+        "task_id": tid,
+        "decision": "archive",
+        "actor": "amber",
+        "reason": "superseded",
+        "expected_event_id": detection["id"],
     }))
     assert out["ok"] is True
     assert out["status"] == "archived"

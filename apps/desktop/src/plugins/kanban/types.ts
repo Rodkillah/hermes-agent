@@ -23,6 +23,7 @@ export interface KanbanTask {
   started_at?: null | number
   worker_pid?: null | number
   last_heartbeat_at?: null | number
+  work_completed_at?: null | number
 }
 
 export interface KanbanColumn {
@@ -120,6 +121,37 @@ export interface KanbanTaskDetail {
   attachments: KanbanAttachment[]
   links: { parents: string[]; children: string[] }
   runs: KanbanRun[]
+  production_receipt?: null | ProductionReceipt
+}
+
+export interface ProductionProbe {
+  ordinal: number
+  name: string
+  scope: string
+  required: boolean
+  result: string
+  evidence_ref: string
+}
+
+export interface ProductionReceipt {
+  id: string
+  task_id: string
+  schema_version: number
+  environment: string
+  target: string
+  deployed_at_utc: string
+  candidate_sha: string
+  deployed_identity_kind: string
+  deployed_identity_value: string
+  derivation_ref?: null | string
+  backup_ref: string
+  rollback_ref: string
+  verification_mode: string
+  actor: string
+  idempotency_key: string
+  evidence_sha256: string
+  created_at: number
+  probes: ProductionProbe[]
 }
 
 /** GET /boards — every board on disk + which one is the server's current. */
@@ -220,6 +252,7 @@ export const COLUMN_META: Record<string, { codicon: string; tone: string }> = {
   blocked: { codicon: 'error', tone: '#f87171' },
   review: { codicon: 'eye', tone: '#fbbf24' },
   done: { codicon: 'pass', tone: 'var(--ui-text-tertiary)' },
+  prod: { codicon: 'rocket', tone: '#34d399' },
   archived: { codicon: 'archive', tone: 'var(--ui-text-quaternary)' }
 }
 

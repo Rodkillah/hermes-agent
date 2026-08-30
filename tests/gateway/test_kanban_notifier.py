@@ -81,11 +81,15 @@ def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
                 "block_loop_detected",
                 {"source_status": "ready", "recurrences": 2, "reason": "repeat"},
             )
+        expected_event_id = [
+            e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"
+        ][-1].id
         # Subscribe after the detection event so this test isolates the
         # resolution notification rather than replaying both events.
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         assert kb.resolve_block_loop_task(
-            conn, tid, decision="archive", actor="amber", reason="superseded"
+            conn, tid, decision="archive", actor="amber", reason="superseded",
+            expected_event_id=expected_event_id,
         )
     finally:
         conn.close()
@@ -778,3 +782,65 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_notifier_delivers_production_promoted_post_commit_without_replay(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "production-promoted-notifier.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="production candidate", assignee="worker",
+        )
+        kb.complete_task(conn, task_id, summary="source complete")
+        # Subscribe after the work-completion event so this test isolates the
+        # distinct production transition.
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat-1",
+        )
+        # This write is committed before the watcher tick, matching the
+        # post-commit production transition contract.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'prod' WHERE id = ?", (task_id,))
+            kb._append_event(
+                conn,
+                task_id,
+                "production_promoted",
+                {
+                    "receipt_id": "receipt-1",
+                    "environment": "production",
+                    "target": "ironrod",
+                    "deployed_at_utc": "2026-08-30T10:00:00Z",
+                    "candidate_sha": "a" * 40,
+                    "deployed_identity_kind": "git_sha",
+                    "deployed_identity_value": "a" * 40,
+                    "actor": "amber",
+                    "schema_version": 1,
+                    "passed_probes": 1,
+                    "required_probes": 1,
+                },
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "production verified" in message
+    assert "ironrod" in message
+    assert "a" * 40 in message
+    assert "receipt-1" not in message
+    assert "backup" not in message
+
+    # The committed event is consumed exactly once; retaining the subscription
+    # for future lifecycle events must not replay this promotion.
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1

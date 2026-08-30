@@ -134,12 +134,12 @@ Registered when the agent is either (a) spawned by the kanban dispatcher (`HERME
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `kanban_show` | Show the active kanban task assigned to this worker (title, description, comments, dependencies). | `HERMES_KANBAN_TASK` or `kanban` toolset |
+| `kanban_show` | Show the active kanban task assigned to this worker (title, description, comments, dependencies, and event ids usable as CAS tokens). | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_list` | List board tasks with filters. Orchestrator-only; hidden from dispatcher-spawned task workers. | profile with `kanban` toolset |
 | `kanban_complete` | Mark the current task done with a structured handoff payload (results, artifacts, follow-ups). | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_block` | Block the current task on a question for the user — the dispatcher pauses, surfaces the question, and resumes once a human replies. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_request_review` | Hand the implementation to a reviewer with `summary`, optional structured `metadata`, and an optional reviewer profile. Moves the same task to `review`; it is not a block and does not affect block-loop accounting. | `HERMES_KANBAN_TASK` or `kanban` toolset |
-| `kanban_resolve_block_loop` | Orchestrator-only decision on a `block_loop_detected` triage task: `retry`, `complete`, or `archive`, with durable actor/reason audit. | `kanban` toolset |
+| `kanban_resolve_block_loop` | Orchestrator-only decision on a `block_loop_detected` triage task: `retry`, `complete`, or `archive`, with durable actor/reason audit and required `expected_event_id` CAS from a fresh task read. | `kanban` toolset |
 | `kanban_request_changes` | Reviewer verdict for an actively claimed review run. Closes the review run, reapplies parent gating, and routes the task back to the original implementer without using a block. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_heartbeat` | Send a progress heartbeat during a long-running operation so the dispatcher knows the worker is still alive. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_comment` | Add a comment to the task thread without changing its state — useful for surfacing intermediate findings. | `HERMES_KANBAN_TASK` or `kanban` toolset |

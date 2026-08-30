@@ -169,6 +169,64 @@ def _event_ts(ev) -> int:
     return int(t or 0)
 
 
+def _receipt_field(receipt: Any, name: str, default: Any = None) -> Any:
+    """Read a normalized receipt from either a mapping or dataclass."""
+    if receipt is None:
+        return default
+    try:
+        if hasattr(receipt, "keys") and name in receipt.keys():
+            return receipt[name]
+    except Exception:
+        pass
+    return getattr(receipt, name, default)
+
+
+def _required_probe_value(value: Any) -> bool:
+    """Normalize booleans read from JSON and SQLite-backed mappings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
+def _production_evidence(
+    task,
+    events,
+    receipt,
+    receipt_storage_available: Optional[bool] = None,
+):
+    """Return receipt-like evidence, with an event fallback for old boards.
+
+    Current boards pass the normalized receipt row explicitly. Older compatible
+    readers may not have the additive receipt table, but a committed
+    ``production_promoted`` event still carries the minimal integrity fields.
+    That event is a compatibility hint only; it never replaces the canonical
+    receipt when the table is available.
+    """
+    if receipt is not None:
+        return receipt
+    if receipt_storage_available is True:
+        # The canonical table exists and this task has no row. Do not
+        # mistake a missing receipt for a legacy board and hide the defect
+        # behind an old production_promoted event.
+        return None
+    promoted = [event for event in events if _event_kind(event) == "production_promoted"]
+    if not promoted:
+        return None
+    return _parse_payload(promoted[-1])
+
+
+def _production_timestamp(evidence, events, now: int) -> int:
+    created_at = _receipt_field(evidence, "created_at", 0)
+    if created_at:
+        return int(created_at)
+    promoted = [event for event in events if _event_kind(event) == "production_promoted"]
+    return _event_ts(promoted[-1]) if promoted else int(now)
+
+
 def _active_hallucination_events(
     events: Iterable[Any],
     kind: str,
@@ -542,7 +600,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     "failed Nx", which reads as a current failure. It re-fires if the new
     run fails too (status leaves ``running`` with a recorded outcome).
     """
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in ("done", "prod", "archived", "running"):
         return []
     threshold = _positive_int(cfg.get(
         "failure_threshold",
@@ -674,7 +732,7 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     so a retried card kept showing "crashed Nx" over an active run. The
     banner re-fires if the new attempt also crashes.
     """
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in ("done", "prod", "archived", "running"):
         return []
     failure_threshold = int(cfg.get(
         "failure_threshold",
@@ -1080,6 +1138,146 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
+def _production_event_hits(events: list[Any]) -> list[Any]:
+    return [event for event in events if _event_kind(event) == "production_promoted"]
+
+
+def _rule_prod_without_receipt(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Detect a ``prod`` task without canonical or compatible proof."""
+    if _task_field(task, "status") != "prod":
+        return []
+    evidence = _production_evidence(
+        task, events, cfg.get("_production_receipt"),
+        cfg.get("_production_receipt_storage_available"),
+    )
+    if evidence is not None:
+        return []
+    ts = _event_ts(events[-1]) if events else int(now)
+    return [Diagnostic(
+        kind="prod_without_receipt",
+        severity="critical",
+        title="Task in prod without a production receipt",
+        detail=(
+            "The task is marked prod but no immutable production receipt or "
+            "compatible production_promoted proof is recorded."
+        ),
+        actions=[DiagnosticAction(
+            kind="comment", label="Investigate the missing receipt",
+        )],
+        first_seen_at=ts,
+        last_seen_at=ts,
+        data={"task_id": _task_field(task, "id")},
+    )]
+
+
+def _rule_receipt_without_prod(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Detect production proof whose task status is not a valid terminal state."""
+    evidence = _production_evidence(
+        task, events, cfg.get("_production_receipt"),
+        cfg.get("_production_receipt_storage_available"),
+    )
+    if evidence is None or _task_field(task, "status") in {"prod", "archived"}:
+        return []
+    promoted = _production_event_hits(events)
+    ts = _production_timestamp(evidence, events, now)
+    return [Diagnostic(
+        kind="receipt_without_prod",
+        severity="error",
+        title="Production receipt exists but task is not prod",
+        detail=(
+            "Production proof is recorded but the task status is "
+            f"{_task_field(task, 'status')!r}, not 'prod'."
+        ),
+        actions=[DiagnosticAction(
+            kind="comment", label="Reconcile receipt and status",
+        )],
+        first_seen_at=ts,
+        last_seen_at=ts,
+        count=len(promoted) or 1,
+        data={"task_id": _task_field(task, "id")},
+    )]
+
+
+def _rule_prod_failed_required_probe(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Detect a production proof containing a failed required probe."""
+    evidence = _production_evidence(
+        task, events, cfg.get("_production_receipt"),
+        cfg.get("_production_receipt_storage_available"),
+    )
+    if evidence is None:
+        return []
+    probes = _receipt_field(evidence, "probes")
+    failed = []
+    if isinstance(probes, (list, tuple)):
+        failed = [
+            probe for probe in probes
+            if isinstance(probe, dict)
+            and _required_probe_value(probe.get("required"))
+            and probe.get("result") != "passed"
+        ]
+    else:
+        try:
+            required = int(_receipt_field(evidence, "required_probes", 0) or 0)
+            passed = int(_receipt_field(evidence, "passed_probes", 0) or 0)
+        except (TypeError, ValueError):
+            required = passed = 0
+        if required and passed < required:
+            failed = [True]
+    if not failed:
+        return []
+    promoted = _production_event_hits(events)
+    ts = _production_timestamp(evidence, events, now)
+    return [Diagnostic(
+        kind="prod_failed_required_probe",
+        severity="critical",
+        title="Production promotion has a failed required probe",
+        detail=(
+            "Production proof contains a required probe that did not pass; "
+            "the production state is not fully verified."
+        ),
+        actions=[DiagnosticAction(
+            kind="comment", label="Re-verify the production probes",
+        )],
+        first_seen_at=ts,
+        last_seen_at=ts,
+        count=len(promoted) or len(failed),
+        data={"failed_required_probe_count": len(failed)},
+    )]
+
+
+def _rule_prod_candidate_mismatch(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Detect a git deployment identity different from its candidate SHA."""
+    evidence = _production_evidence(
+        task, events, cfg.get("_production_receipt"),
+        cfg.get("_production_receipt_storage_available"),
+    )
+    if evidence is None:
+        return []
+    kind = _receipt_field(evidence, "deployed_identity_kind")
+    candidate = str(_receipt_field(evidence, "candidate_sha") or "").lower()
+    deployed = str(_receipt_field(evidence, "deployed_identity_value") or "").lower()
+    if kind != "git_sha" or not candidate or not deployed or candidate == deployed:
+        return []
+    promoted = _production_event_hits(events)
+    ts = _production_timestamp(evidence, events, now)
+    return [Diagnostic(
+        kind="prod_candidate_mismatch",
+        severity="error",
+        title="Deployed identity does not match the candidate SHA",
+        detail=(
+            "Production proof records a deployed git SHA different from the "
+            "reviewed candidate SHA."
+        ),
+        actions=[DiagnosticAction(
+            kind="comment", label="Verify the deployed revision",
+        )],
+        first_seen_at=ts,
+        last_seen_at=ts,
+        count=len(promoted) or 1,
+        data={"candidate_sha": candidate, "deployed_identity_value": deployed},
+    )]
+
+
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
@@ -1090,6 +1288,10 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_prod_without_receipt,
+    _rule_receipt_without_prod,
+    _rule_prod_failed_required_probe,
+    _rule_prod_candidate_mismatch,
 ]
 
 
@@ -1105,6 +1307,10 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "prod_without_receipt",
+    "receipt_without_prod",
+    "prod_failed_required_probe",
+    "prod_candidate_mismatch",
 )
 
 
@@ -1176,6 +1382,8 @@ def compute_task_diagnostics(
     now: Optional[int] = None,
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
+    production_receipt: Any = None,
+    production_receipt_storage_available: Optional[bool] = None,
 ) -> list[Diagnostic]:
     """Run every rule against a single task's state and return a
     severity-sorted list of active diagnostics.
@@ -1186,6 +1394,8 @@ def compute_task_diagnostics(
     now_ts = int(now if now is not None else time.time())
     config = config or {}
     cfg = {**DEFAULT_CONFIG, **config}
+    cfg["_production_receipt"] = production_receipt
+    cfg["_production_receipt_storage_available"] = production_receipt_storage_available
     if graph is not None:
         cfg["_graph"] = graph
     if (

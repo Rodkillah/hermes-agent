@@ -601,7 +601,7 @@ def _handle_show(args: dict, **kw) -> str:
                     for c in comments
                 ],
                 "events": [
-                    {"kind": e.kind, "payload": e.payload,
+                    {"id": e.id, "kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
                     for e in events[-50:]   # cap; full log via CLI
                 ],
@@ -645,12 +645,27 @@ def _handle_list(args: dict, **kw) -> str:
     if limit > KANBAN_LIST_MAX_LIMIT:
         return tool_error(f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
     board = args.get("board")
+    cursor = args.get("cursor")
     try:
         kb, conn = _connect(board=board)
         try:
             # Match CLI list: dependencies that cleared since the last
             # dispatcher tick should be visible to orchestrators immediately.
             promoted = kb.recompute_ready(conn)
+            if status == "done" or cursor is not None:
+                page = kb.list_tasks_page(
+                    conn, status="done" if status is None else status,
+                    limit=limit, cursor=cursor, tenant=tenant,
+                )
+                return json.dumps({
+                    "tasks": [_task_summary_dict(kb, conn, t) for t in page["tasks"]],
+                    "count": len(page["tasks"]),
+                    "limit": limit,
+                    "next_cursor": page["next_cursor"],
+                    "has_more": page["has_more"],
+                    "total_matching": page["total_matching"],
+                    "promoted": promoted,
+                })
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
             rows = kb.list_tasks(
@@ -681,6 +696,38 @@ def _handle_list(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_list failed")
         return tool_error(f"kanban_list: {e}")
+
+
+def _handle_mark_prod(args: dict, **kw) -> str:
+    """Promote a completed task using the canonical production proof gate."""
+    delegated_err = _reject_delegated_child_mutation("kanban_mark_prod")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    receipt = args.get("receipt")
+    if not isinstance(receipt, dict):
+        return tool_error("receipt must be an object")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            stored = kb.mark_task_prod(
+                conn, tid, receipt=receipt,
+                actor=os.environ.get("HERMES_PROFILE", ""),
+                idempotency_key=args.get("idempotency_key", ""),
+            )
+            return json.dumps({"task_id": tid, "status": "prod", "receipt": stored.to_dict()})
+        finally:
+            conn.close()
+    except (ValueError, RuntimeError) as exc:
+        return tool_error(f"kanban_mark_prod: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_mark_prod failed")
+        return tool_error(f"kanban_mark_prod: {exc}")
 
 
 def _handle_complete(args: dict, **kw) -> str:
@@ -1748,6 +1795,9 @@ def _handle_resolve_block_loop(args: dict, **kw) -> str:
     actor = str(args.get("actor") or "").strip()
     if not actor:
         return tool_error("actor is required — identify the human decision maker")
+    expected_event_id = args.get("expected_event_id")
+    if expected_event_id is None:
+        return tool_error("expected_event_id is required — read the current block_loop_detected event first")
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
@@ -1756,7 +1806,7 @@ def _handle_resolve_block_loop(args: dict, **kw) -> str:
                 decision=args.get("decision"), actor=actor, reason=reason,
                 summary=args.get("summary"), result=args.get("result"),
                 metadata=metadata, handoff=args.get("handoff"),
-                expected_event_id=args.get("expected_event_id"),
+                expected_event_id=expected_event_id,
             )
             if not ok:
                 return tool_error(
@@ -1846,8 +1896,8 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "triage", "todo", "scheduled", "ready", "running",
+                    "blocked", "review", "done", "prod", "archived",
                 ],
                 "description": "Optional task status filter.",
             },
@@ -1861,13 +1911,55 @@ KANBAN_LIST_SCHEMA = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Optional maximum rows to return (default 50, max 200).",
+                "description": "Optional maximum rows to return (default 50, max 50 for paginated done audit).",
+            },
+            "cursor": {
+                "type": "string",
+                "description": "Opaque keyset cursor returned for a done-task page.",
             },
             "board": _board_schema_prop(),
         },
         "required": [],
     },
 }
+
+KANBAN_MARK_PROD_SCHEMA = {
+    "name": "kanban_mark_prod",
+    "description": (
+        "Promote a done task to prod through the audited, board-scoped production "
+        "verifier. The receipt must include the exact candidate SHA, deployment "
+        "identity, backup/rollback references, and live production probes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "idempotency_key": {"type": "string", "description": "Opaque stable retry key."},
+            "receipt": {
+                "type": "object",
+                "description": "Production proof; sensitive values and raw logs are forbidden.",
+                "properties": {
+                    "schema_version": {"type": "integer", "enum": [1]},
+                    "environment": {"type": "string"},
+                    "target": {"type": "string"},
+                    "deployed_at_utc": {"type": "string"},
+                    "candidate_sha": {"type": "string"},
+                    "deployed_identity_kind": {"type": "string", "enum": ["git_sha", "artifact_sha256", "release_id"]},
+                    "deployed_identity_value": {"type": "string"},
+                    "derivation_ref": {"type": "string"},
+                    "backup_ref": {"type": "string"},
+                    "rollback_ref": {"type": "string"},
+                    "verification_mode": {"type": "string", "enum": ["system_verified", "authorized_attestation"]},
+                    "probes": {"type": "array", "items": {"type": "object"}},
+                },
+                "required": ["schema_version", "environment", "target", "deployed_at_utc", "candidate_sha", "deployed_identity_kind", "deployed_identity_value", "backup_ref", "rollback_ref", "verification_mode", "probes"],
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["idempotency_key", "receipt"],
+    },
+}
+
 
 KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
@@ -2456,10 +2548,10 @@ KANBAN_RESOLVE_BLOCK_LOOP_SCHEMA = {
             "result": {"type": "string", "description": "Optional completion result."},
             "handoff": {"type": "string", "description": "Alias for summary."},
             "metadata": {"type": "object", "description": "Structured completion facts."},
-            "expected_event_id": {"type": "integer", "description": "Optional CAS id of the block_loop_detected event."},
+            "expected_event_id": {"type": "integer", "description": "Required CAS id of the current block_loop_detected event from a fresh task read."},
             "board": _board_schema_prop(),
         },
-        "required": ["decision", "actor", "reason"],
+        "required": ["decision", "actor", "reason", "expected_event_id"],
     },
 }
 
@@ -2503,6 +2595,15 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_mark_prod",
+    toolset="kanban",
+    schema=KANBAN_MARK_PROD_SCHEMA,
+    handler=_handle_mark_prod,
+    check_fn=_check_kanban_mode,
+    emoji="🚀",
 )
 
 registry.register(

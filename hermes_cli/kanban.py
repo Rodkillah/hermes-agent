@@ -39,6 +39,7 @@ _STATUS_ICONS = {
     "scheduled":"⏱",
     "blocked":  "⊘",
     "done":     "✓",
+    "prod":     "🚀",
     "archived": "—",
 }
 
@@ -703,6 +704,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_resolve_loop.add_argument("--reason", required=True, help="Durable reason for the human decision.")
     p_resolve_loop.add_argument("--actor", default=None, help="Decision maker (defaults to the active profile).")
+    p_resolve_loop.add_argument(
+        "--expected-event-id", type=int, required=True,
+        help="Current block_loop_detected event id from a fresh task detail read (CAS guard).",
+    )
     p_resolve_loop.add_argument("--summary", default=None, help="Required handoff for complete.")
     p_resolve_loop.add_argument("--result", default=None, help="Optional result text for complete.")
     p_resolve_loop.add_argument("--metadata", default=None, help="JSON object for the completion handoff.")
@@ -740,6 +745,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_request_changes.add_argument(
         "reason", nargs="+", help="Concrete changes required before re-review",
     )
+
+    p_mark_prod = sub.add_parser(
+        "mark-prod",
+        help="Promote a done task to Prod with an audited production receipt",
+    )
+    p_mark_prod.add_argument("task_id")
+    p_mark_prod.add_argument(
+        "--receipt-file", required=True,
+        help="JSON file containing the production receipt and probes",
+    )
+    p_mark_prod.add_argument(
+        "--idempotency-key", required=True,
+        help="Stable key for safe retries of this promotion",
+    )
+
+    p_route_deploy = sub.add_parser(
+        "route-deploy-todo",
+        help="Route an audited done task back to todo while preserving work completion",
+    )
+    p_route_deploy.add_argument("task_id")
+    p_route_deploy.add_argument("--candidate-sha", required=True)
+    p_route_deploy.add_argument("--audit-id", required=True)
+    p_route_deploy.add_argument("--reason", required=True)
+    p_route_deploy.add_argument("--next-action", required=True)
 
     p_reopen_review = sub.add_parser(
         "reopen-review",
@@ -1185,6 +1214,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "resolve-block-loop": _cmd_resolve_block_loop,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
+            "mark-prod": _cmd_mark_prod,
+            "route-deploy-todo": _cmd_route_deploy_todo,
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -1807,6 +1838,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         return 2
     graph = None
+    production_receipt = None
+    production_receipt_storage_available = None
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
@@ -1821,6 +1854,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        production_receipt_storage_available, receipts = kb.load_production_receipts(
+            conn, [args.task_id],
+        )
+        production_receipt = receipts.get(args.task_id)
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
@@ -1828,6 +1865,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         payload = {
             "task": _task_to_dict(task),
             "latest_summary": latest_summary,
+            "production_receipt": production_receipt,
             "parents": parents,
             "children": children,
             "comments": [
@@ -1836,6 +1874,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             ],
             "events": [
                 {
+                    "id": e.id,
                     "kind": e.kind,
                     "payload": e.payload,
                     "created_at": e.created_at,
@@ -1900,7 +1939,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # of show output so CLI users see them before scrolling through
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task,
+        events,
+        runs,
+        graph=graph,
+        production_receipt=production_receipt,
+        production_receipt_storage_available=production_receipt_storage_available,
+    )
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
@@ -1954,7 +2000,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         for e in events[-20:]:
             pl = f" {e.payload}" if e.payload else ""
             run_tag = f" [run {e.run_id}]" if e.run_id else ""
-            print(f"  [{_fmt_ts(e.created_at)}]{run_tag} {e.kind}{pl}")
+            print(f"  [{_fmt_ts(e.created_at)}] id={e.id}{run_tag} {e.kind}{pl}")
     if runs:
         print()
         print(f"Runs ({len(runs)}):")
@@ -2063,6 +2109,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
             if task is None:
                 print(f"no such task: {args.task}", file=sys.stderr)
                 return 1
+            receipt_storage_available, receipts_by_task = kb.load_production_receipts(
+                conn, [args.task],
+            )
             diags_by_task = {
                 args.task: kd.compute_task_diagnostics(
                     task,
@@ -2070,6 +2119,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     kb.list_runs(conn, args.task),
                     graph=kb.task_graph_context(conn, args.task),
                     config=diag_config,
+                    production_receipt=receipts_by_task.get(args.task),
+                    production_receipt_storage_available=receipt_storage_available,
                 )
             }
         else:
@@ -2094,6 +2145,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     tuple(ids),
                 ):
                     run_by.setdefault(row["task_id"], []).append(row)
+                receipt_storage_available, receipts_by_task = kb.load_production_receipts(
+                    conn, ids,
+                )
                 graph_by = kb.task_graph_contexts(conn, ids)
                 diags_by_task = {}
                 for r in rows:
@@ -2104,6 +2158,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                         run_by.get(tid, []),
                         graph=graph_by.get(tid),
                         config=diag_config,
+                        production_receipt=receipts_by_task.get(tid),
+                        production_receipt_storage_available=receipt_storage_available,
                     )
                     if dl:
                         diags_by_task[tid] = dl
@@ -2549,6 +2605,7 @@ def _cmd_resolve_block_loop(args: argparse.Namespace) -> int:
             decision=args.decision,
             actor=actor,
             reason=args.reason,
+            expected_event_id=args.expected_event_id,
             summary=getattr(args, "summary", None),
             result=getattr(args, "result", None),
             metadata=metadata,
@@ -2639,6 +2696,49 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             f"Requested changes for {tid}"
             + (f"; routed to {detail}" if detail else "")
         )
+    return 0
+
+
+def _cmd_mark_prod(args: argparse.Namespace) -> int:
+    try:
+        receipt = json.loads(Path(args.receipt_file).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"cannot read production receipt: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(receipt, dict):
+        print("cannot read production receipt: expected a JSON object", file=sys.stderr)
+        return 1
+    try:
+        with kb.connect_closing() as conn:
+            stored = kb.mark_task_prod(
+                conn,
+                args.task_id,
+                receipt=receipt,
+                actor=_profile_author(),
+                idempotency_key=args.idempotency_key,
+            )
+    except (ValueError, RuntimeError) as exc:
+        print(f"cannot mark {args.task_id} as prod: {exc}", file=sys.stderr)
+        return 1
+    print(f"Promoted {args.task_id} to prod (receipt {stored.id})")
+    return 0
+
+
+def _cmd_route_deploy_todo(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.route_done_to_deploy_todo(
+                conn, args.task_id, candidate_sha=args.candidate_sha,
+                audit_id=args.audit_id, reason=args.reason,
+                next_action=args.next_action, actor=_profile_author(),
+            )
+    except (ValueError, RuntimeError) as exc:
+        print(f"cannot route {args.task_id} to deploy todo: {exc}", file=sys.stderr)
+        return 1
+    if not ok:
+        print(f"cannot route {args.task_id} to deploy todo (not a done task)", file=sys.stderr)
+        return 1
+    print(f"Routed {args.task_id} to todo for audited deployment follow-up")
     return 0
 
 

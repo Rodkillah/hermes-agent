@@ -70,6 +70,85 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_cli_show_and_diagnostics_read_normalized_production_probes(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="failed production probe", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'prod' WHERE id = ?", (task_id,))
+            conn.execute(
+                """INSERT INTO production_receipts
+                (id, task_id, schema_version, environment, target, deployed_at_utc,
+                 candidate_sha, deployed_identity_kind, deployed_identity_value,
+                 derivation_ref, backup_ref, rollback_ref, verification_mode, actor,
+                 idempotency_key, evidence_sha256, created_at)
+                VALUES (?, ?, 1, 'test', 'local', '2026-08-30T10:00:00+00:00',
+                        ?, 'git_sha', ?, NULL, 'backup-ref', 'rollback-ref',
+                        'system_verified', 'worker', ?, 'evidence', 100)""",
+                ("receipt-1", task_id, "a" * 40, "a" * 40, "idem-1"),
+            )
+            conn.execute(
+                """INSERT INTO production_probes
+                (receipt_id, ordinal, name, scope, required, result, evidence_ref)
+                VALUES (?, 0, 'health', 'live_production', 1, 'failed', 'probe-ref')""",
+                ("receipt-1",),
+            )
+
+    diagnostics = json.loads(kc.run_slash(f"diagnostics --task {task_id} --json"))
+    kinds = {item["kind"] for item in diagnostics[0]["diagnostics"]}
+    assert "prod_failed_required_probe" in kinds
+    assert "prod_without_receipt" not in kinds
+
+    fleet = json.loads(kc.run_slash("diagnostics --json"))
+    fleet_item = next(item for item in fleet if item["task_id"] == task_id)
+    fleet_kinds = {item["kind"] for item in fleet_item["diagnostics"]}
+    assert "prod_failed_required_probe" in fleet_kinds
+    assert "prod_without_receipt" not in fleet_kinds
+
+    show = kc.run_slash(f"show {task_id}")
+    assert "Production promotion has a failed required probe" in show
+
+
+def test_kanban_show_json_event_id_drives_block_loop_resolution(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "block_loop_detected",
+                {"source_status": "ready", "reason": "repeat"},
+            )
+
+    detail = json.loads(kc.run_slash(f"show {tid} --json"))
+    detection = [e for e in detail["events"] if e["kind"] == "block_loop_detected"][-1]
+    assert isinstance(detection["id"], int)
+
+    output = kc.run_slash(
+        f"resolve-block-loop {tid} archive --expected-event-id {detection['id']} "
+        "--reason superseded"
+    )
+    assert f"Resolved {tid}: archive → archived" in output
+
+
+def test_kanban_show_text_includes_event_id(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "block_loop_detected",
+                {"source_status": "ready", "reason": "repeat"},
+            )
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1]
+
+    output = kc.run_slash(f"show {tid}")
+    assert f"id={event.id}" in output
+    assert "block_loop_detected" in output
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
