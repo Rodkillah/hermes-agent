@@ -2738,21 +2738,27 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         async with self._get_general_request_drain_lock():
             try:
-                await general_req.shutdown()
+                await _await_with_thread_deadline(
+                    general_req.shutdown(), timeout=_DRAIN_TIMEOUT
+                )
             except Exception:
                 logger.debug(
-                    "[%s] General request shutdown failed after pool timeout (non-fatal)",
+                    "[%s] General request shutdown failed/timed out after pool "
+                    "timeout (non-fatal)",
                     self.name, exc_info=True,
                 )
             try:
-                await general_req.initialize()
+                await _await_with_thread_deadline(
+                    general_req.initialize(), timeout=_DRAIN_TIMEOUT
+                )
                 logger.warning(
                     "[%s] General request pool drained after Telegram pool timeout",
                     self.name,
                 )
             except Exception:
                 logger.debug(
-                    "[%s] General request re-initialize failed after pool timeout (non-fatal)",
+                    "[%s] General request re-initialize failed/timed out after "
+                    "pool timeout (non-fatal)",
                     self.name, exc_info=True,
                 )
 
@@ -3037,6 +3043,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
         except Exception:
             pass
+
+        if getattr(self, "_polling_teardown_started", False):
+            return
+        # start_polling() performs Bot API bootstrap calls through PTB's
+        # general request pool before it starts getUpdates. If that pool is
+        # exhausted by stale proxy sockets, draining only the polling request
+        # below cannot recover: every retry fails in bootstrap before polling
+        # begins. A confirmed pool timeout means the request was not sent, so
+        # it is safe to rebuild the general pool before retrying. Keep generic
+        # network-error recovery polling-only so in-flight sends are untouched.
+        if self._looks_like_pool_timeout(error):
+            await self._drain_general_connections_after_pool_timeout()
 
         if getattr(self, "_polling_teardown_started", False):
             return
@@ -7728,10 +7746,34 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        _transcoded_voice_path: Optional[str] = None
         try:
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
+
+            # Telegram sendVoice only accepts Ogg/Opus. When the caller
+            # explicitly asked for a voice bubble ([[audio_as_voice]] →
+            # is_voice=True in kwargs), transcode any other audio format
+            # (mp3/wav/flac/...) to Ogg/Opus on the fly via the shared
+            # ffmpeg engine — previously that intent dead-ended into
+            # document delivery. Without the explicit intent, extension
+            # behavior is unchanged (.mp3/.m4a → sendAudio; .ogg → here
+            # only when flagged; others → document fallback below).
+            _voice_ext = os.path.splitext(audio_path)[1].lower()
+            if kwargs.get("is_voice") and _voice_ext not in (".ogg", ".opus"):
+                from gateway.platforms.base import transcode_to_ogg_opus
+                _transcoded_voice_path = await asyncio.to_thread(
+                    transcode_to_ogg_opus, audio_path
+                )
+                if _transcoded_voice_path:
+                    audio_path = _transcoded_voice_path
+                else:
+                    logger.warning(
+                        "[%s] voice transcode unavailable for %s — sending "
+                        "original format (install ffmpeg for voice bubbles)",
+                        self.name, os.path.basename(audio_path),
+                    )
             
             # Compute duration locally — Telegram drops it for long clips
             # (~5 min+), which then show 0:00 in the player.
@@ -7866,6 +7908,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
+        finally:
+            if _transcoded_voice_path:
+                try:
+                    os.unlink(_transcoded_voice_path)
+                except OSError:
+                    pass
 
     async def send_multiple_images(
         self,
