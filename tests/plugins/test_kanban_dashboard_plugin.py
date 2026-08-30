@@ -1356,3 +1356,21 @@ def test_resolve_block_loop_endpoint_rejects_stale_first_loop(client):
         assert resolved[0].payload["source_event_id"] == first_event_id
     finally:
         conn.close()
+
+
+def test_dashboard_diagnostics_include_prod_without_receipt(client):
+    """The dashboard feeds production state into the shared rule engine."""
+    from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="orphaned production state", assignee="worker",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'prod' WHERE id = ?", (task_id,))
+        diagnostics = _compute_task_diagnostics(conn, task_ids=[task_id])
+    finally:
+        conn.close()
+
+    assert [item["kind"] for item in diagnostics[task_id]] == ["prod_without_receipt"]

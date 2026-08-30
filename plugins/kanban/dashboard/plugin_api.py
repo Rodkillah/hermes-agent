@@ -301,6 +301,37 @@ def _compute_task_diagnostics(
     ).fetchall():
         runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
+    # Production integrity diagnostics need the normalized receipt, but the
+    # dashboard must remain readable against a legacy board opened before the
+    # additive receipt migration. In that case the diagnostic engine falls
+    # back to the committed production_promoted event.
+    receipts_by_task: dict[str, dict] = {}
+    try:
+        receipt_rows = conn.execute(
+            f"SELECT * FROM production_receipts WHERE task_id IN ({placeholders})",
+            tuple(row_ids),
+        ).fetchall()
+        for receipt_row in receipt_rows:
+            receipt = dict(receipt_row)
+            try:
+                receipt["probes"] = [
+                    dict(probe)
+                    for probe in conn.execute(
+                        "SELECT ordinal, name, scope, required, result, evidence_ref "
+                        "FROM production_probes WHERE receipt_id = ? ORDER BY ordinal",
+                        (receipt_row["id"],),
+                    ).fetchall()
+                ]
+            except sqlite3.OperationalError:
+                # A partially migrated legacy board has no probe table yet;
+                # keep the receipt fields and let the rules stay fail-safe.
+                receipt["probes"] = []
+            receipts_by_task[receipt_row["task_id"]] = receipt
+    except sqlite3.OperationalError:
+        # Compatibility fallback: no production receipt table means the
+        # production_promoted event is the only available proof.
+        receipts_by_task = {}
+
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
     out: dict[str, list[dict]] = {}
     for r in rows:
@@ -311,6 +342,7 @@ def _compute_task_diagnostics(
             runs_by_task.get(tid, []),
             config=diag_config,
             graph=graph_by_task.get(tid),
+            production_receipt=receipts_by_task.get(tid),
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]
