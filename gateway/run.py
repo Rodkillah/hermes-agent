@@ -4590,6 +4590,36 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        # Failed subagent → one clean user-facing notice. Handled FIRST,
+        # before every progress-queue gate: platforms that keep
+        # tool_progress off (Telegram, Slack, ...) must still hear about a
+        # delegation that died — a silently-vanishing subagent looks like
+        # the agent just dropped the task (community report, Aug 2026).
+        # Success/interrupt completions stay quiet; only terminal failure
+        # statuses render, via the same notice rail as credit warnings.
+        if event_type == "subagent.complete":
+            _sub_status = kwargs.get("status")
+            try:
+                from tools.delegate_tool import (
+                    SUBAGENT_FAILURE_STATUSES,
+                    format_subagent_failure_line,
+                )
+                if _sub_status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
+                    _line = format_subagent_failure_line(
+                        kwargs.get("goal"),
+                        _sub_status,
+                        error=kwargs.get("summary") or preview,
+                        duration_seconds=kwargs.get("duration_seconds"),
+                    )
+                    safe_schedule_threadsafe(
+                        self._runner._deliver_platform_notice(ctx.source, _line),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="subagent failure notice scheduling error",
+                    )
+            except Exception:
+                logger.debug("subagent failure notice failed", exc_info=True)
+            return
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
@@ -6108,15 +6138,12 @@ class TurnRunner:
         # who set thinking_progress:true but kept tool_progress:off got a
         # None callback — so _thinking scratch bubbles never relayed even
         # though the progress queue was created for them.
-        agent.tool_progress_callback = (
-            ctx.progress_callback
-            if (
-                ctx.needs_progress_queue
-                or ctx.log_mode_enabled
-                or ctx._live_status_adapter is not None
-            )
-            else None
-        )
+        # Always attached (previously gated to None when no progress surface
+        # was active): the callback body gates each event class itself, and
+        # subagent-failure notices must fire even on platforms with
+        # tool_progress/thinking off — the None gate was exactly why a dead
+        # subagent vanished silently there.
+        agent.tool_progress_callback = ctx.progress_callback
         # Compose ID-bearing lifecycle consumers: Discord's one-time voice
         # ack and Slack's native task cards both ride the authoritative
         # start callback, so neither has to infer identity from tool names.
@@ -13055,6 +13082,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Legacy session recovery on startup failed: %s", exc)
         return exact, fallback
 
+    @staticmethod
+    def _start_hosted_room_worker_sync():
+        """Start the local Group Chat worker without importing the dashboard."""
+
+        import tui_gateway.server  # noqa: F401
+        from tui_gateway import methods_groups
+
+        service = methods_groups.get_hosted_room_service()
+        if service is None:
+            service = methods_groups.start_hosted_room_service()
+        if service is None:
+            raise RuntimeError("Group Chat worker has no bound session backend")
+        status = service.runtime.status()
+        if not status.get("running") or status.get("stopping"):
+            raise RuntimeError("Group Chat worker did not start")
+        return service
+
+    async def _ensure_hosted_room_worker(self):
+        return await asyncio.to_thread(self._start_hosted_room_worker_sync)
+
+    async def _hosted_room_worker_watcher(self, interval: float = 1.0) -> None:
+        """Keep the room worker alive for the messaging gateway lifetime."""
+
+        while self._running:
+            await self._ensure_hosted_room_worker()
+            await asyncio.sleep(interval)
+
+    async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
+        """Pause room execution durably without interrupting accepted turns."""
+
+        from tui_gateway import methods_groups
+
+        return await asyncio.to_thread(
+            methods_groups.stop_hosted_room_service,
+            timeout=timeout,
+        )
+
     def _start_loop_heartbeat_task(self) -> None:
         """Start the loop-liveness heartbeat task (#66892), idempotent.
 
@@ -13860,6 +13924,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
+
+        try:
+            await self._ensure_hosted_room_worker()
+        except Exception:
+            logger.error(
+                "Group Chat worker failed to start; mutating Group Chat commands "
+                "will fail closed until supervision recovers it",
+                exc_info=True,
+            )
+        self._spawn_supervised(
+            self._hosted_room_worker_watcher,
+            "hosted_room_worker",
+        )
 
         self._start_loop_heartbeat_task()
 
@@ -15716,6 +15793,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._clear_plugin_message_injector()
             self._draining = True
+
+            stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
+            if callable(stop_room_worker):
+                try:
+                    stopped = await stop_room_worker(timeout=5.0)
+                    if not stopped:
+                        logger.warning(
+                            "Group Chat worker is still settling durable work; "
+                            "the next gateway start will recover it"
+                        )
+                except Exception:
+                    logger.warning(
+                        "Group Chat worker could not stop cleanly; the next gateway "
+                        "start will recover durable work",
+                        exc_info=True,
+                    )
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
