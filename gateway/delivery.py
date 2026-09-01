@@ -576,12 +576,25 @@ class DeliveryRouter:
                     )
                 created_thread_id = await ensure_dm_topic(target.chat_id, target_thread_id)
                 if not created_thread_id:
-                    raise RuntimeError(
-                        f"Failed to create Telegram private DM topic '{target_thread_id}'"
+                    # Patch local ironrod-local-patches (2026-09-01) : 454 messages
+                    # de cron perdus depuis juillet sur 31 jobs, silencieusement,
+                    # parce que ce raise n'avait aucun repli. Topics DM (Bot API
+                    # 9.4) exige une bascule manuelle cote utilisateur ; en
+                    # attendant (ou si elle echoue pour une autre raison), on
+                    # livre quand meme dans le DM principal plutot que de perdre
+                    # le message. A revalider apres chaque mise a jour Hermes.
+                    logger.warning(
+                        "[%s] Topic DM '%s' indisponible pour chat %s (creation "
+                        "echouee) : envoi a plat dans le DM principal plutot que "
+                        "de perdre le message.",
+                        target.platform.value, target_thread_id, target.chat_id,
                     )
-                target_thread_id = str(created_thread_id)
-                send_metadata["thread_id"] = target_thread_id
-                send_metadata["telegram_dm_topic_created_for_send"] = True
+                    is_named_telegram_private_topic = False
+                    named_telegram_private_topic_name = None
+                else:
+                    target_thread_id = str(created_thread_id)
+                    send_metadata["thread_id"] = target_thread_id
+                    send_metadata["telegram_dm_topic_created_for_send"] = True
             elif (
                 target.platform == Platform.TELEGRAM
                 and looks_like_telegram_private_chat_id(target.chat_id)
@@ -626,11 +639,22 @@ class DeliveryRouter:
                     force_create=True,
                 )
                 if not refreshed_thread_id:
-                    raise RuntimeError(
-                        f"Failed to refresh Telegram private DM topic '{named_telegram_private_topic_name}'"
+                    # Meme repli que la creation (cf. commentaire plus haut) :
+                    # le rafraichissement d'un topic DM devenu introuvable peut
+                    # echouer pour la meme raison (Topics desactive cote
+                    # utilisateur). On retente en envoi a plat au lieu de perdre
+                    # le message.
+                    logger.warning(
+                        "[%s] Topic DM '%s' indisponible pour chat %s "
+                        "(rafraichissement echoue) : envoi a plat dans le DM "
+                        "principal plutot que de perdre le message.",
+                        target.platform.value, named_telegram_private_topic_name, target.chat_id,
                     )
-                send_metadata["thread_id"] = str(refreshed_thread_id)
-                send_metadata["telegram_dm_topic_created_for_send"] = True
+                    send_metadata.pop("thread_id", None)
+                    send_metadata.pop("message_thread_id", None)
+                else:
+                    send_metadata["thread_id"] = str(refreshed_thread_id)
+                    send_metadata["telegram_dm_topic_created_for_send"] = True
                 result = await transport.send(
                     target.platform,
                     target.chat_id,
