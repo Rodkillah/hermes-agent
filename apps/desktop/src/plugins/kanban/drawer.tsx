@@ -661,21 +661,24 @@ export function TaskDrawer({
       return
     }
 
-    const summary = decision === 'complete'
-      ? window.prompt('Completion handoff (required):')?.trim()
-      : undefined
+    const summary = decision === 'complete' ? window.prompt('Completion handoff (required):')?.trim() : undefined
 
     if (decision === 'complete' && !summary) {
       return
     }
 
-    void mutate(() => resolveBlockLoopTask(task.id, {
-      actor: 'desktop',
-      decision,
-      expected_event_id: expectedEventId,
-      reason,
-      ...(summary ? { summary } : {})
-    }), undefined, invalidate)()
+    void mutate(
+      () =>
+        resolveBlockLoopTask(task.id, {
+          actor: 'desktop',
+          decision,
+          expected_event_id: expectedEventId,
+          reason,
+          ...(summary ? { summary } : {})
+        }),
+      undefined,
+      invalidate
+    )()
   }
 
   const uploadMut = useMutation({
@@ -716,29 +719,40 @@ export function TaskDrawer({
     if (!task || task.status !== 'done') {
       return
     }
+
     const raw = window.prompt(
       'Production receipt JSON (include candidate_sha, backup_ref, rollback_ref and probes):',
       '{"schema_version":1,"environment":"production","target":"","deployed_at_utc":"","candidate_sha":"","deployed_identity_kind":"git_sha","deployed_identity_value":"","backup_ref":"","rollback_ref":"","verification_mode":"system_verified","probes":[]}'
     )
+
     if (raw == null) {
       return
     }
+
     const key = window.prompt('Unique idempotency key:')?.trim()
+
     if (!key) {
       host.notify({ kind: 'error', message: 'An idempotency key is required.' })
+
       return
     }
+
     let receipt: Record<string, unknown>
+
     try {
       const parsed: unknown = JSON.parse(raw)
+
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error('receipt must be an object')
       }
+
       receipt = parsed as Record<string, unknown>
     } catch (err) {
       host.notify({ kind: 'error', message: `Invalid production receipt: ${String(err)}` })
+
       return
     }
+
     promoteTaskToProd(task.id, receipt, key).then(
       () => {
         host.notify({ kind: 'info', message: 'Task promoted to Prod.' })
@@ -873,9 +887,15 @@ export function TaskDrawer({
                   This triage card came from a repeated block loop. Choose an explicit human decision.
                 </p>
                 <div className="flex flex-wrap gap-1.5">
-                  <Button onClick={() => resolveBlockLoop('retry')} size="xs" variant="secondary">Retry</Button>
-                  <Button onClick={() => resolveBlockLoop('complete')} size="xs" variant="outline">Complete</Button>
-                  <Button onClick={() => resolveBlockLoop('archive')} size="xs" variant="outline">{k.archive}</Button>
+                  <Button onClick={() => resolveBlockLoop('retry')} size="xs" variant="secondary">
+                    Retry
+                  </Button>
+                  <Button onClick={() => resolveBlockLoop('complete')} size="xs" variant="outline">
+                    Complete
+                  </Button>
+                  <Button onClick={() => resolveBlockLoop('archive')} size="xs" variant="outline">
+                    {k.archive}
+                  </Button>
                 </div>
               </Callout>
             )}
