@@ -436,19 +436,56 @@ def _audit_path() -> Path:
     return base / "a2a_audit.jsonl"
 
 
-def audit(direction: str, peer: str, task_id: str, summary: str) -> None:
-    """Append an audit record. Best-effort — never raises into the caller."""
+def audit(
+    direction: str,
+    peer: str,
+    task_id: str,
+    summary: str = "",
+    *,
+    context_id: str = "",
+    method: str = "",
+    decision: str = "",
+    state: str = "",
+    latency_ms: Optional[float] = None,
+    request_bytes: Optional[int] = None,
+    response_bytes: Optional[int] = None,
+    rejection_code: Optional[int] = None,
+) -> None:
+    """Append metadata only; content arguments are intentionally discarded.
+
+    ``summary`` remains accepted for source compatibility with older callers,
+    but no message, prompt, argument, header, or exception text is persisted.
+    Best-effort — never raises into the caller.
+    """
     try:
         rec = {
             "ts": time.time(),
             "direction": direction,  # "inbound" | "outbound" | "push"
             "peer": peer,
             "task_id": task_id,
-            "summary": (summary or "")[:500],
         }
+        metadata = {
+            "context_id": context_id,
+            "method": method,
+            "decision": decision,
+            "state": state,
+            "latency_ms": latency_ms,
+            "request_bytes": request_bytes,
+            "response_bytes": response_bytes,
+            "rejection_code": rejection_code,
+        }
+        rec.update({key: value for key, value in metadata.items() if value not in (None, "")})
         path = _audit_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        os.chmod(path.parent, 0o700)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fd = -1
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        finally:
+            if fd != -1:
+                os.close(fd)
     except Exception:
         logger.debug("A2A: audit write failed", exc_info=True)

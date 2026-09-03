@@ -66,6 +66,38 @@ _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaus
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 
 
+def _bool_setting(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _iron_rod_mode(extra: dict) -> bool:
+    mode = str(extra.get("mode") or "").strip().lower()
+    return bool(
+        _bool_setting(extra.get("iron_rod_mode"))
+        or _bool_setting(extra.get("strict_mode"))
+        or mode in {"iron-rod", "iron_rod", "strict"}
+        or _bool_setting(os.getenv("A2A_IRON_ROD_MODE"))
+    )
+
+
+def _bounded_int(value: Any, default: int, minimum: int = 1, maximum: int = 2**31 - 1) -> int:
+    try:
+        return max(minimum, min(int(value), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        return max(0.1, float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _reply_timeout() -> float:
     """Seconds to wait for the agent to answer an inbound task."""
     try:
@@ -263,8 +295,35 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):  # noqa: N802
+        slots = self.adapter._request_slots
+        if slots is not None and not slots.acquire(blocking=False):
+            self._json(429, protocol.jsonrpc_error(
+                None, protocol.ERR_RATE_LIMITED, "A2A concurrency limit reached"))
+            return
+        try:
+            self._do_POST()
+        finally:
+            if slots is not None:
+                slots.release()
+
+    def _do_POST(self):  # noqa: N802
         adapter = self.adapter
         client_ip = self.client_address[0] if self.client_address else ""
+        try:
+            declared_length: Optional[int] = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            declared_length = None
+
+        def reject_audit(code: int, *, peer: str = client_ip, method: str = "", request_bytes: Optional[int] = None):
+            security.audit(
+                "inbound",
+                peer,
+                "",
+                method=method,
+                decision="rejected",
+                request_bytes=request_bytes,
+                rejection_code=code,
+            )
 
         # Identity comes from the presented credential (or the socket in
         # localhost-only mode) — never from the request body.
@@ -272,12 +331,15 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self.headers.get("Authorization"), client_ip
         )
         if identity is None:
+            reject_audit(protocol.ERR_UNAUTHORIZED, request_bytes=declared_length)
             self._json(401, protocol.jsonrpc_error(None, protocol.ERR_UNAUTHORIZED, "unauthorized"))
             return
 
         try:
             length = int(self.headers.get("Content-Length", 0))
-            if length > _MAX_BODY:
+            self.connection.settimeout(adapter._read_timeout_seconds)
+            if length > adapter._max_body_bytes:
+                reject_audit(protocol.ERR_PARSE, peer=identity, request_bytes=length)
                 self._json(413, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "payload too large"))
                 return
             raw = self.rfile.read(length) if length else b"{}"
@@ -326,6 +388,12 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 req_id, protocol.ERR_METHOD_NOT_FOUND, f"method not found: {method}"))
             return
 
+        if not adapter._method_allowed(method):
+            code = protocol.ERR_PUSH_NOT_SUPPORTED if operation.startswith("push_") else protocol.ERR_METHOD_NOT_FOUND
+            reject_audit(code, peer=identity, method=method, request_bytes=length)
+            self._json(200, protocol.jsonrpc_error(req_id, code, "A2A method is not enabled"))
+            return
+
         if operation == "send":
             self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1))
             return
@@ -370,21 +438,52 @@ class A2AAdapter(BasePlatformAdapter):
         # Scope-aware: a secondary multiplex profile must not borrow the
         # default profile's bridged A2A_PORT (mirrors the Buzz/SimpleX fix
         # for #98738) — an unconfigured profile falls closed to the module
-        # default port instead. (advertised_toolsets has the same env-leak
-        # shape but is left unscoped here — see the "Scope note" in this
-        # fix's PR description: open PR #98937 is actively rewriting this
-        # field's None-vs-empty-list semantics.)
+        # default port instead. advertised_toolsets follows the same explicit-
+        # config-over-env precedence, while preserving None (dynamic registry
+        # discovery) and [] (an intentional empty allowlist) as distinct values.
         self._security_context = security.A2ASecurityContext.capture()
         _port_env = None if _profile_scoped() else os.getenv("A2A_PORT")
         self.port = int(_port_env or extra.get("port", _DEFAULT_PORT))
         self.host = self._security_context.resolve_bind_host()
         self.agent_name = _default_agent_name()
-        self._advertised_toolsets = [
-            t.strip() for t in (
-                list(extra.get("advertised_toolsets") or [])
-                or os.getenv("A2A_ADVERTISED_TOOLSETS", "").split(",")
-            ) if str(t).strip()
+        self._iron_rod_mode = _iron_rod_mode(extra)
+        if "advertised_toolsets" in extra:
+            advertised = extra.get("advertised_toolsets")
+        elif self._iron_rod_mode:
+            advertised = []
+        elif _profile_scoped():
+            advertised = None
+        else:
+            raw_advertised = os.getenv("A2A_ADVERTISED_TOOLSETS")
+            advertised = None if raw_advertised is None else raw_advertised.split(",")
+        advertised_values = advertised if isinstance(advertised, (list, tuple)) else [advertised]
+        self._advertised_toolsets = None if advertised is None else [
+            str(t).strip() for t in advertised_values if str(t).strip()
         ]
+        methods = extra.get("allowed_methods")
+        if methods is None:
+            methods = ["SendMessage"] if self._iron_rod_mode else None
+        if isinstance(methods, str):
+            methods = [methods]
+        self._allowed_methods = None if methods is None else frozenset(str(m) for m in methods)
+        self._max_body_bytes = _bounded_int(
+            extra.get("max_body_bytes"),
+            65536 if self._iron_rod_mode else _MAX_BODY,
+            maximum=_MAX_BODY,
+        )
+        self._read_timeout_seconds = _positive_float(
+            extra.get("read_timeout"), 10.0 if self._iron_rod_mode else 300.0
+        )
+        self._reply_timeout_seconds = _positive_float(
+            extra.get("reply_timeout"), 90.0 if self._iron_rod_mode else _reply_timeout()
+        )
+        concurrency = extra.get("max_concurrency")
+        if concurrency is None and self._iron_rod_mode:
+            concurrency = 1
+        self._request_slots = (
+            threading.BoundedSemaphore(_bounded_int(concurrency, 1))
+            if concurrency is not None else None
+        )
         self._active_profile = _active_profile_name()
         self._agents = self._load_served_agents(extra)
 
@@ -575,7 +674,12 @@ class A2AAdapter(BasePlatformAdapter):
                 continue
             profile = str(val.get("profile") or slug).strip()
             path = "/" + path_segment
-            toolsets = val.get("advertised_toolsets") or val.get("toolsets") or val.get("capabilities") or []
+            if "advertised_toolsets" in val:
+                toolsets = val["advertised_toolsets"]
+            elif "toolsets" in val:
+                toolsets = val["toolsets"]
+            else:
+                toolsets = val.get("capabilities")
             if isinstance(toolsets, str):
                 toolsets = [t.strip() for t in toolsets.split(",") if t.strip()]
             local = bool(val.get("local")) or profile in ("", "default", self._active_profile)
@@ -596,7 +700,7 @@ class A2AAdapter(BasePlatformAdapter):
                 "local": local,
                 "name": str(val.get("name") or f"Hermes {slug}"),
                 "description": str(val.get("description") or f"Hermes profile '{profile or slug}' exposed over A2A."),
-                "advertised_toolsets": list(toolsets or []),
+                "advertised_toolsets": None if toolsets is None else list(toolsets or []),
                 "timeout": int(val.get("timeout") or _reply_timeout()),
             }
         return agents
@@ -654,8 +758,8 @@ class A2AAdapter(BasePlatformAdapter):
             url=url,
             description=agent.get("description") or "Hermes Agent — a general-purpose agent reachable over A2A.",
             skills=self._advertised_skills(agent),
-            streaming=bool(agent.get("local", True)),
-            push_notifications=True,
+            streaming=False if self._iron_rod_mode else bool(agent.get("local", True)),
+            push_notifications=False if self._iron_rod_mode else True,
             auth_required=not self._security_context.localhost_only(),
             tenant=str(agent.get("tenant") or ""),
         )
@@ -672,7 +776,9 @@ class A2AAdapter(BasePlatformAdapter):
             from tools.registry import registry as tool_registry
             names = tool_registry.get_registered_toolset_names()
             configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-            allowed = set(configured or []) or None
+            if configured == []:
+                return protocol.skills_from_toolsets([])
+            allowed = set(configured) if configured is not None else None
             mapping = {
                 n: tool_registry.get_tool_names_for_toolset(n)
                 for n in names
@@ -683,7 +789,10 @@ class A2AAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
         configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-        return protocol.skills_from_toolsets(configured or [])
+        return protocol.skills_from_toolsets(configured)
+
+    def _method_allowed(self, method: str) -> bool:
+        return self._allowed_methods is None or method in self._allowed_methods
 
     # ── Pending reply plumbing ────────────────────────────────────────────
 
@@ -775,7 +884,15 @@ class A2AAdapter(BasePlatformAdapter):
             ), None
 
         framed = security.wrap_inbound(peer, text)
-        security.audit("inbound", peer, task_id, text)
+        security.audit(
+            "inbound",
+            peer,
+            task_id,
+            method="SendMessage",
+            decision="accepted",
+            context_id=context_id,
+            request_bytes=len(text.encode("utf-8")),
+        )
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
 
@@ -786,7 +903,15 @@ class A2AAdapter(BasePlatformAdapter):
             reply, state = self._forward_to_profile(agent, peer, context_id, framed)
             self.tasks.complete(task_id, state, reply)
             protocol.persist_message(context_id, "agent", reply, task_id)
-            security.audit("outbound", peer, task_id, reply)
+            security.audit(
+                "outbound",
+                peer,
+                task_id,
+                method="SendMessage",
+                state=state,
+                context_id=context_id,
+                response_bytes=len(reply.encode("utf-8")),
+            )
             if state == protocol.STATE_COMPLETED:
                 protocol.metrics.outbound_total += 1
                 protocol.metrics.tasks_completed += 1
@@ -957,7 +1082,15 @@ class A2AAdapter(BasePlatformAdapter):
                 reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
 
         protocol.persist_message(context_id, "agent", reply, task_id)
-        security.audit("outbound", peer, task_id, reply)
+        security.audit(
+            "outbound",
+            peer,
+            task_id,
+            method="SendMessage",
+            state=state,
+            context_id=context_id,
+            response_bytes=len(reply.encode("utf-8")),
+        )
 
         if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
             protocol.metrics.outbound_total += 1
@@ -978,7 +1111,7 @@ class A2AAdapter(BasePlatformAdapter):
         raises, the client is gone and we stop waiting.
         """
         fut: Future = pending["future"]
-        deadline = pending["started"] + _reply_timeout()
+        deadline = pending["started"] + self._reply_timeout_seconds
         while True:
             try:
                 return fut.result(timeout=_SSE_KEEPALIVE if keepalive else max(0.0, deadline - time.time()))
@@ -1086,7 +1219,7 @@ class A2AAdapter(BasePlatformAdapter):
             if fut is None:
                 self._sse_write(handler, protocol.sse_done())
                 return
-            deadline = time.time() + _reply_timeout()
+            deadline = time.time() + self._reply_timeout_seconds
             while True:
                 try:
                     state, reply = fut.result(timeout=_SSE_KEEPALIVE)

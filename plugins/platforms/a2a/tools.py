@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +37,52 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 120
 _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _iron_rod_policy(config: Optional[dict] = None) -> tuple[bool, bool]:
+    """Return (strict_mode, allow_direct_urls) for outbound A2A.
+
+    The upstream-compatible defaults remain intentionally permissive.  The
+    Iron Rod profile opts in through config, where credentials can then only
+    be referenced by environment name and peers must be named entries.
+    """
+    cfg = config if isinstance(config, dict) else _load_config()
+    if not isinstance(cfg, dict):
+        cfg = {}
+    section = cfg.get("a2a") if isinstance(cfg.get("a2a"), dict) else {}
+    mode = str(section.get("mode") or "").strip().lower()
+    strict = bool(
+        _as_bool(section.get("iron_rod_mode"))
+        or _as_bool(section.get("strict_mode"))
+        or mode in {"iron-rod", "iron_rod", "strict"}
+        or _as_bool(os.getenv("A2A_IRON_ROD_MODE"))
+    )
+    allow_direct = section.get("allow_direct_urls")
+    if allow_direct is None:
+        allow_direct = section.get("allow_direct_url")
+    if allow_direct is None:
+        allow_direct = not strict
+    return strict, _as_bool(allow_direct)
+
+
+def _resolve_secret_reference(name: str) -> str:
+    """Resolve a peer token through the active profile secret scope."""
+    try:
+        from agent.secret_scope import get_secret
+
+        return str(get_secret(name, "") or "").strip()
+    except Exception:
+        # In a multiplexed process this also catches UnscopedSecretError and
+        # deliberately fails closed instead of reading another profile's env.
+        return ""
 
 
 # --------------------------------------------------------------------------
@@ -52,16 +99,31 @@ def _load_config() -> dict:
 
 def _resolve_peer(agent: str) -> Optional[dict]:
     """Resolve a peer name to {url, auth, timeout, capabilities}, or treat ``agent`` as a URL."""
-    if agent.startswith("http://") or agent.startswith("https://"):
-        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
     cfg = _load_config()
+    strict, allow_direct_urls = _iron_rod_policy(cfg)
+    if agent.startswith("http://") or agent.startswith("https://"):
+        if not allow_direct_urls:
+            return None
+        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
     peers = cfg.get("a2a_agents") or {}
     entry = peers.get(agent)
     if not entry:
         return None
+    auth = dict(entry.get("auth", {}) or {})
+    token_env = str(auth.get("token_env") or "").strip()
+    if token_env:
+        token = _resolve_secret_reference(token_env)
+        if not token:
+            return None
+        auth.pop("token_env", None)
+        auth["token"] = token
+    elif strict:
+        # Literal credentials in config are forbidden in the explicit
+        # hardened mode.  Requiring token_env also rejects an empty auth map.
+        return None
     return {
         "url": entry.get("url", ""),
-        "auth": entry.get("auth", {}) or {},
+        "auth": auth,
         "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
         "capabilities": entry.get("capabilities", []) or [],
         "tenant": entry.get("tenant", ""),
@@ -179,7 +241,15 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     if tenant:
         rpc_body["params"]["tenant"] = tenant
 
-    security.audit("outbound", agent_label, rpc_body["id"], safe_message)
+    security.audit(
+        "outbound",
+        agent_label,
+        rpc_body["id"],
+        method="SendMessage",
+        decision="accepted",
+        context_id=ctx,
+        request_bytes=len(json.dumps(rpc_body, ensure_ascii=False).encode("utf-8")),
+    )
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 
@@ -226,6 +296,9 @@ def a2a_discover(args: dict, **_: Any) -> str:
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: 'url' is required (e.g. http://localhost:9999)."
+    _strict, allow_direct_urls = _iron_rod_policy()
+    if not allow_direct_urls:
+        return "Error: direct A2A URLs are disabled; configure a named peer under 'a2a_agents'."
     try:
         card = _fetch_card(url, {}, _DEFAULT_TIMEOUT)
     except urllib.error.HTTPError as e:

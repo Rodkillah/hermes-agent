@@ -788,6 +788,25 @@ class TaskStore:
 # Conversation persistence (outside the context-compaction pipeline)
 # --------------------------------------------------------------------------
 
+def persist_conversations_enabled() -> bool:
+    """Return whether A2A conversation content may be written to disk.
+
+    Persistence stays upstream-compatible by default, while the pilot can set
+    ``A2A_PERSIST_CONVERSATIONS=false`` to avoid duplicating message content.
+    """
+    raw = os.getenv("A2A_PERSIST_CONVERSATIONS")
+    if raw is None:
+        try:
+            from hermes_cli.config import load_config
+
+            value = (load_config() or {}).get("a2a", {}).get("persist_conversations")
+            if value is not None:
+                return bool(value) if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            pass
+        return True
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 def _conv_dir() -> Path:
     try:
         from hermes_constants import get_hermes_home
@@ -803,18 +822,32 @@ def _safe_name(context_id: str) -> str:
 
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
     """Append one message to the context's on-disk conversation log."""
+    if not persist_conversations_enabled():
+        return
     try:
         d = _conv_dir()
         d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
         rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
-        with (d / f"{_safe_name(context_id)}.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        path = d / f"{_safe_name(context_id)}.jsonl"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fd = -1
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        finally:
+            if fd != -1:
+                os.close(fd)
     except Exception:
         pass
 
 
 def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
     """Load the last *limit* messages for a context (empty list if none)."""
+    if not persist_conversations_enabled():
+        return []
     path = _conv_dir() / f"{_safe_name(context_id)}.jsonl"
     if not path.exists():
         return []
@@ -836,6 +869,8 @@ def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
 
 def list_conversations() -> list[str]:
     """Return known context-ids that have persisted conversations."""
+    if not persist_conversations_enabled():
+        return []
     d = _conv_dir()
     if not d.exists():
         return []
