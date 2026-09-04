@@ -630,7 +630,8 @@ class A2AAdapter(BasePlatformAdapter):
 
         Preferred config location is ``platforms.a2a.extra.agents``. A top-level
         ``a2a_served_agents`` fallback is accepted for scripts/tests. Root/default
-        always maps to the live gateway session for backward compatibility.
+        maps to the live gateway session unless ``forward_active_profile`` is
+        explicitly enabled for an isolated profile subprocess.
         """
         raw = extra.get("agents") or extra.get("served_agents")
         if raw is None:
@@ -653,7 +654,7 @@ class A2AAdapter(BasePlatformAdapter):
             "path": "",
             "tenant": "",
             "profile": self._active_profile,
-            "local": True,
+            "local": not _bool_setting(extra.get("forward_active_profile")),
             "name": self.agent_name,
             "description": default_desc,
             "advertised_toolsets": self._advertised_toolsets,

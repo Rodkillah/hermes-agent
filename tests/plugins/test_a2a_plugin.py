@@ -1392,6 +1392,17 @@ def test_agent_card_can_advertise_tenant():
 
 
 class TestMultiAgentRouting:
+    def test_root_can_forward_to_active_profile_subprocess(self):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "forward_active_profile": True,
+        }))
+
+        assert adapter._agents[""]["profile"] == adapter._active_profile
+        assert adapter._agents[""]["local"] is False
+
     def test_path_routed_agent_card_uses_prefix_and_canonical_path(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
