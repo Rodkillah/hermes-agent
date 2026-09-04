@@ -688,6 +688,39 @@ class TestReplyCapture:
         finally:
             adapter._pop_pending("task-ok")
 
+    def test_authenticated_peer_is_authorized_for_gateway_dispatch(self, monkeypatch):
+        adapter = _bare_adapter()
+        captured = {}
+
+        def fake_handle_message(event):
+            captured["event"] = event
+
+            async def noop():
+                return None
+
+            return noop()
+
+        def fake_run_coroutine_threadsafe(coroutine, _loop):
+            coroutine.close()
+            return None
+
+        adapter._loop = object()
+        adapter._message_handler = object()
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", fake_run_coroutine_threadsafe)
+
+        terminal, pending = adapter._prepare_task(
+            {"message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-auth")},
+            "ip:10.66.66.5",
+        )
+        try:
+            assert terminal is None
+            assert pending is not None
+            assert captured["event"].source.role_authorized is True
+        finally:
+            if pending is not None:
+                adapter._pop_pending(pending["task_id"])
+
 
 # --------------------------------------------------------------------------
 # Adapter RPC handlers (driven directly, no HTTP)

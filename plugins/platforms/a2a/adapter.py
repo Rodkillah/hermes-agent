@@ -940,6 +940,7 @@ class A2AAdapter(BasePlatformAdapter):
                 chat_type="dm",
                 user_id=peer,
                 user_name=peer,
+                role_authorized=True,
             ),
             message_id=task_id,
         )
