@@ -1713,6 +1713,36 @@ print('fake reply')
         con.close()
         assert title == "a2a-dev-ctx-unsafe-value"
 
+    def test_forward_to_profile_strips_parent_gateway_context(self, monkeypatch, tmp_path):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        captured = {}
+
+        def fake_run(_cmd, **kwargs):
+            captured.update(kwargs["env"])
+            return SimpleNamespace(returncode=0, stdout="reply", stderr="")
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "a2a")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "parent-task")
+        monkeypatch.setattr("plugins.platforms.a2a.adapter.subprocess.run", fake_run)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda _profile: str(tmp_path))
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-clean", "hello"
+        )
+
+        assert (reply, state) == ("reply", protocol.STATE_COMPLETED)
+        assert captured["HERMES_HOME"] == str(tmp_path)
+        assert captured["HERMES_A2A_PEER"] == "peer"
+        assert "_HERMES_GATEWAY" not in captured
+        assert "HERMES_SESSION_PLATFORM" not in captured
+        assert "HERMES_KANBAN_TASK" not in captured
+
 
 # --------------------------------------------------------------------------
 # Multiplex secondary-profile scope (construction-time config leak)

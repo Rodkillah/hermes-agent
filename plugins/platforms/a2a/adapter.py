@@ -1040,10 +1040,18 @@ class A2AAdapter(BasePlatformAdapter):
             if session_id:
                 cmd.extend(["--resume", session_id])
 
-            env = os.environ.copy()
             home = _profile_home(profile)
-            if home:
-                env["HERMES_HOME"] = home
+            from tools.environments.local import build_subprocess_env
+
+            env = build_subprocess_env(
+                scrub_secrets=True,
+                extra={"HERMES_HOME": home} if home else None,
+            )
+            for key in list(env):
+                if key in {"_HERMES_GATEWAY", "HERMES_GATEWAY", "HERMES_GATEWAY_MODE"}:
+                    env.pop(key, None)
+                elif key.startswith("HERMES_SESSION_") or key.startswith("HERMES_KANBAN_"):
+                    env.pop(key, None)
             env["HERMES_A2A_PEER"] = peer
             start = time.time()
             try:
