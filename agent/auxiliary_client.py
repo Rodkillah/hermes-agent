@@ -2431,6 +2431,20 @@ class AsyncCodexAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+def _is_aux_probe_client(client: Any) -> bool:
+    """Return whether ``client`` is or wraps a probe-only leaf client.
+
+    Only the known Codex wrappers are traversed.  This keeps the probe
+    classifier side-effect free for third-party clients while covering both
+    sync and async cache entries.
+    """
+    if isinstance(client, _AuxProbeClientStub):
+        return True
+    if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        return isinstance(client._real_client, _AuxProbeClientStub)
+    return False
+
+
 def _translate_anthropic_response_format(
     anthropic_kwargs: Dict[str, Any], response_format: Any,
 ) -> None:
@@ -8272,7 +8286,7 @@ def _client_cache_key(
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
-    if isinstance(client, _AuxProbeClientStub):
+    if _is_aux_probe_client(client):
         # Probe stubs must never enter the cache — a runtime caller would
         # receive a non-functional client on the next cache hit.
         return
@@ -8604,7 +8618,12 @@ def _get_cached_client(
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
+            if _is_aux_probe_client(cached_client):
+                # A probe stub can only be a stale entry from a previous
+                # availability check (or a mixed-version caller).  Never
+                # expose it to runtime inference; evict and rebuild below.
+                del _client_cache[cache_key]
+            elif async_mode:
                 # Validate: the cached client must be bound to the CURRENT,
                 # OPEN loop.  If the loop changed or was closed, the httpx
                 # transport inside is dead — force-close and replace.
@@ -8652,6 +8671,10 @@ def _get_cached_client(
         task=task,
     )
     if client is not None:
+        if _is_aux_probe_client(client):
+            # Availability probes may resolve a stub, but that object is not
+            # usable for inference and must never become a cache hit.
+            return client, model or default_model
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
