@@ -1398,10 +1398,16 @@ class TestMultiAgentRouting:
 
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
             "forward_active_profile": True,
+            "model": "gpt-fast",
+            "provider": "test-provider",
+            "reasoning_effort": "low",
         }))
 
         assert adapter._agents[""]["profile"] == adapter._active_profile
         assert adapter._agents[""]["local"] is False
+        assert adapter._agents[""]["model"] == "gpt-fast"
+        assert adapter._agents[""]["provider"] == "test-provider"
+        assert adapter._agents[""]["reasoning_effort"] == "low"
 
     def test_path_routed_agent_card_uses_prefix_and_canonical_path(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1698,7 +1704,14 @@ print('fake reply')
         monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda profile: str(profile_home))
 
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
-            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+            "agents": {"dev": {
+                "profile": "dev",
+                "tenant": "dev",
+                "timeout": 5,
+                "model": "gpt-fast",
+                "provider": "test-provider",
+                "reasoning_effort": "low",
+            }}
         }))
         agent = adapter._agents["dev"]
         reply, state = adapter._forward_to_profile(agent, "peer", "ctx/unsafe value", "hello")
@@ -1707,6 +1720,9 @@ print('fake reply')
         assert (reply2, state2) == ("fake reply", protocol.STATE_COMPLETED)
         argv_lines = [json.loads(line) for line in calls.read_text().splitlines()]
         assert "--resume" not in argv_lines[0]
+        assert argv_lines[0][argv_lines[0].index("--model") + 1] == "gpt-fast"
+        assert argv_lines[0][argv_lines[0].index("--provider") + 1] == "test-provider"
+        assert argv_lines[0][argv_lines[0].index("--reasoning") + 1] == "low"
         assert argv_lines[1][argv_lines[1].index("--resume") + 1] == "sess-1"
         con = sqlite3.connect(db)
         title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
