@@ -658,9 +658,6 @@ class A2AAdapter(BasePlatformAdapter):
             "name": self.agent_name,
             "description": default_desc,
             "advertised_toolsets": self._advertised_toolsets,
-            "model": str(extra.get("model") or "").strip(),
-            "provider": str(extra.get("provider") or "").strip(),
-            "reasoning_effort": str(extra.get("reasoning_effort") or "").strip(),
         }
 
         reserved = {"health", "metrics", ".well-known"}
@@ -706,9 +703,6 @@ class A2AAdapter(BasePlatformAdapter):
                 "description": str(val.get("description") or f"Hermes profile '{profile or slug}' exposed over A2A."),
                 "advertised_toolsets": None if toolsets is None else list(toolsets or []),
                 "timeout": int(val.get("timeout") or _reply_timeout()),
-                "model": str(val.get("model") or "").strip(),
-                "provider": str(val.get("provider") or "").strip(),
-                "reasoning_effort": str(val.get("reasoning_effort") or "").strip(),
             }
         return agents
 
@@ -1043,15 +1037,6 @@ class A2AAdapter(BasePlatformAdapter):
         with lock:
             session_id = self._profile_sessions.get(key) or self._lookup_forward_session(profile, session_title)
             cmd = ["hermes", "chat", "-q", framed_text, "-Q", "--source", "a2a"]
-            model = str(agent.get("model") or "").strip()
-            provider = str(agent.get("provider") or "").strip()
-            reasoning_effort = str(agent.get("reasoning_effort") or "").strip().lower()
-            if model:
-                cmd.extend(["--model", model])
-            if provider:
-                cmd.extend(["--provider", provider])
-            if reasoning_effort:
-                cmd.extend(["--reasoning", reasoning_effort])
             if session_id:
                 cmd.extend(["--resume", session_id])
 
