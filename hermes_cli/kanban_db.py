@@ -12431,6 +12431,60 @@ def add_notify_sub(
             )
 
 
+def transfer_notify_sub_owner(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    expected_owner: Optional[str],
+    new_owner: str,
+) -> bool:
+    """Atomically transfer one subscription's notifier owner with CAS.
+
+    This is the native handoff primitive for moving a Forge-owned
+    subscription to Amber (and for the inverse rollback). The compare is
+    against the persisted ``notifier_profile`` owner; every other column,
+    including the event cursor and origin identity, is left untouched.
+
+    A retry is idempotent when the row is already owned by ``new_owner``.
+    Otherwise an unexpected owner (including a missing row) returns ``False``
+    without changing the subscription. The single guarded UPDATE runs inside
+    :func:`write_txn`, so the owner change and its CAS are one transaction.
+    """
+    if not isinstance(new_owner, str) or not new_owner:
+        raise ValueError("new_owner must be a non-empty profile name")
+
+    key = (task_id, platform, chat_id, thread_id or "")
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT notifier_profile
+              FROM kanban_notify_subs
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            key,
+        ).fetchone()
+        if row is None:
+            return False
+        current_owner = row["notifier_profile"]
+        if current_owner == new_owner:
+            return True
+        if current_owner != expected_owner:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND notifier_profile IS ?
+            """,
+            (new_owner, *key, expected_owner),
+        )
+        return cur.rowcount == 1
+
+
 def _notify_profile_filter(
     notifier_profiles: Optional[Iterable[str]],
     *,
