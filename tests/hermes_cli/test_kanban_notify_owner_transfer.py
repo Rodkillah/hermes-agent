@@ -184,3 +184,150 @@ def test_transfer_does_not_lose_new_event_and_cursor_remains_claimable(kanban_ho
     assert new_cursor > old_cursor
     assert [event.kind for event in events] == ["changes_requested", "changes_requested"]
     assert events[-1].payload["reason"] == "second event"
+
+
+def test_migration_batch_composes_add_and_transfer_under_one_outer_transaction(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = _seed(conn)
+        with kb.write_txn(conn):
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                delivery_mode="wake",
+            )
+            assert kb.transfer_notify_sub_owner(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                expected_owner="forge",
+                new_owner="amber",
+            ) is True
+        sub = _sub(conn, task_id)
+    finally:
+        conn.close()
+
+    assert sub["notifier_profile"] == "amber"
+    assert sub["delivery_mode"] == "wake"
+    assert sub["last_event_id"] == 1
+
+
+def test_migration_unexpected_owner_returns_false_and_caller_can_abort_all(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = _seed(conn)
+        with pytest.raises(RuntimeError, match="unexpected owner"):
+            with kb.write_txn(conn):
+                assert kb.transfer_notify_sub_owner(
+                    conn,
+                    task_id=task_id,
+                    platform="telegram",
+                    chat_id="chat-1",
+                    thread_id="thread-1",
+                    expected_owner="forge",
+                    new_owner="amber",
+                ) is True
+                assert kb.transfer_notify_sub_owner(
+                    conn,
+                    task_id=task_id,
+                    platform="telegram",
+                    chat_id="chat-1",
+                    thread_id="thread-1",
+                    expected_owner="forge",
+                    new_owner="amber-2",
+                ) is False
+                raise RuntimeError("unexpected owner")
+        sub = _sub(conn, task_id)
+    finally:
+        conn.close()
+
+    assert sub["notifier_profile"] == "forge"
+
+
+def test_migration_exception_after_multiple_transfers_and_mode_changes_aborts_all(kanban_home):
+    conn = kb.connect()
+    try:
+        first = _seed(conn)
+        second = kb.create_task(conn, title="second handoff", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=second,
+            platform="telegram",
+            chat_id="chat-2",
+            thread_id="thread-2",
+            notifier_profile="forge",
+            delivery_mode="notify",
+        )
+        with pytest.raises(ValueError, match="abort migration"):
+            with kb.write_txn(conn):
+                for task_id, chat_id, thread_id in (
+                    (first, "chat-1", "thread-1"),
+                    (second, "chat-2", "thread-2"),
+                ):
+                    kb.add_notify_sub(
+                        conn,
+                        task_id=task_id,
+                        platform="telegram",
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        delivery_mode="wake",
+                    )
+                    assert kb.transfer_notify_sub_owner(
+                        conn,
+                        task_id=task_id,
+                        platform="telegram",
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        expected_owner="forge",
+                        new_owner="amber",
+                    ) is True
+                raise ValueError("abort migration")
+        first_sub = _sub(conn, first)
+        second_sub = _sub(conn, second)
+    finally:
+        conn.close()
+
+    assert first_sub["notifier_profile"] == "forge"
+    assert first_sub["delivery_mode"] == "notify+wake"
+    assert second_sub["notifier_profile"] == "forge"
+    assert second_sub["delivery_mode"] == "notify"
+
+
+def test_nested_transfer_savepoint_does_not_rewind_advanced_cursor(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = _seed(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = 7 WHERE task_id = ?",
+                (task_id,),
+            )
+            assert kb.transfer_notify_sub_owner(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                expected_owner="forge",
+                new_owner="amber",
+            ) is True
+            assert kb.transfer_notify_sub_owner(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="thread-1",
+                expected_owner="amber",
+                new_owner="forge",
+            ) is True
+        sub = _sub(conn, task_id)
+    finally:
+        conn.close()
+
+    assert sub["notifier_profile"] == "forge"
+    assert sub["last_event_id"] == 7

@@ -12352,7 +12352,8 @@ def add_notify_sub(
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    # Savepoint composition: migration callers own the outer atomic commit.
+    with write_txn(conn, allow_nested=True):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -12457,7 +12458,8 @@ def transfer_notify_sub_owner(
         raise ValueError("new_owner must be a non-empty profile name")
 
     key = (task_id, platform, chat_id, thread_id or "")
-    with write_txn(conn):
+    # Savepoint composition: migration callers own the outer atomic commit.
+    with write_txn(conn, allow_nested=True):
         row = conn.execute(
             """
             SELECT notifier_profile
