@@ -5,30 +5,33 @@ Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 ## Identité contrôlée
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
-- Tête candidate: branche `ironrod/forge-amber-subscription-transfer-20260907` (le commit documentaire courant ne change que ce manifeste).
-- Implémentation: `ad5c7d632c88a6f501e3c6d78f54587c77dc7fdd`; parent de rework: `c28f7fced3b190fe882135d6ee1c67918049579e`.
-- Fichiers concernés dans ce delta: `hermes_cli/kanban_db.py`, `artifacts/verify-amber-subscription-rollback.py`, `artifacts/amber-subscription-rollback-manifest.md`.
+- Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
+- Implémentation exacte de ce rework: `ae6d32788d9a132bc3a8b327765eb3576a1d8dfc` (parent `14f860d24a0580239c326be3dd15724f8732b020`).
+- Fichiers de ce rework: `artifacts/verify-amber-subscription-rollback.py`, `cron/jobs.py`, `hermes_cli/kanban_db.py`.
+- Le worktree candidat doit être relu propre et le SHA final exact doit être gelé avant revue; aucun autre SHA ne vaut candidat.
 
 ## Autorité et atomicité
 
 1. `kanban_notify_batches` et `kanban_notify_batch_entries` sont l'autorité durable dans le même `kanban.db` que `kanban_notify_subs`. Leur installation, index et triggers se fait dans une transaction `BEGIN IMMEDIATE`; une migration interrompue ne laisse pas de demi-ledger.
-2. Le schéma réel est validé: colonnes, `NOT NULL`, clés primaires, FK, `UNIQUE`, `CHECK`, JSON valides et triggers d'immuabilité. Un schéma homonyme affaibli est refusé; aucun import automatique de vieux JSON.
+2. Le schéma réel est validé par `PRAGMA table_info`, clés/FK/index et comparaison de la définition complète des tables et des quatre triggers canoniques. Un schéma homonyme dont un `CHECK`, type, index ou trigger est affaibli est refusé; aucun import automatique de vieux JSON.
 3. Forward et inverse co-committent les abonnements et leurs images complètes. Les images doivent partager la clé `(task_id, platform, chat_id, thread_id)`. L'inverse vérifie le board du forward, restaure via les gardes natives et journalise l'observation réellement présente après restauration; une absence finale est représentée par JSON `null`.
 4. Les générations d'abonnement, origines, métadonnées, `created_at` et curseurs sont conservés. Les curseurs ne régressent pas, les conflits humains annulent l'inverse sans écrasement, et le replay lit le ledger SQLite par `batch_id`/digest.
 
 ## Paquet durable de rollback
 
-`artifacts/verify-amber-subscription-rollback.py` sépare la préparation et la consommation. La préparation privée lit une fois les trois sources et le job, conserve les trois pré-images/hash/modes et les pré/post-images administratives du job sous une racine jetable. Elle fsync le `package-manifest.json` d'état `prepared` avant l'exécution mutative et conserve un reçu `completed` après succès.
+`artifacts/verify-amber-subscription-rollback.py` sépare la préparation et la consommation. La préparation privée lit une fois les trois sources et le job, conserve les trois pré-images/hash/modes et les pré/post-images administratives du job sous une racine jetable. Le job post-image persiste la valeur exacte de `paused_at` au format natif; la pause privée applique cette valeur via l'API cron native. Chaque document et image de récupération est fsyncé avant publication du manifeste `prepared` et avant tout effet sur les copies.
 
-L'entrée opérationnelle consomme ensuite ce paquet existant: DB + `forward_batch_id` explicite, document de job privé et trois fichiers privés. Elle ne reseed pas, ne recopie pas de source live, ne réinstalle pas de fixture et ne reconstruit pas les pré-images après interruption. Les pré-images et post-images sont validées contre le manifeste immuable; une décision job tierce est refusée sans écrasement. Un marqueur de restauration fichier laissé par SIGKILL est récupéré avant toute classification, puis le fichier est restauré par CAS. Un état terminal est rejoué depuis le reçu et ses copies privées, sans lecture live. Une interruption au job ou sur chacun des trois fichiers est rejouable dans un processus neuf sur les mêmes copies.
+L'entrée opérationnelle consomme ensuite ce paquet existant: DB + `forward_batch_id` explicite, document de job privé et trois fichiers privés. Un répertoire de consommation existant sans manifeste est refusé avant l'inverse; la préparation implicite n'existe plus. La consommation ne reseed pas, ne recopie pas de source live, ne réinstalle pas de fixture et ne reconstruit pas les pré-images après interruption. Les pré-images et post-images sont validées contre le manifeste immuable; une décision job tierce est refusée sans écrasement. Un marqueur de restauration fichier laissé par SIGKILL est récupéré avant toute classification, puis le fichier est restauré par CAS. Un état terminal est rejoué depuis le reçu et ses copies privées, sans lecture live.
 
-Ordre exercé: verrou historique → lecture/recovery du ledger SQLite → inverse native → restauration guarded du job → restauration conditionnelle des trois fichiers. Le replay d'un batch déjà `reverted` n'applique aucun second inverse.
+Publication: manifeste temporaire écrit et fsyncé, répertoire fsyncé, remplacement atomique, sans `write_text` tronquant le primaire. Lors d'une récupération, le primaire endommagé n'écrase jamais la seule copie `.previous` valide. Le paquet nominal est préparé et durable avant l'ordre exercé `inverse SQLite -> job CAS -> trois fichiers CAS`; le replay du même paquet ne réapplique aucune inverse.
 
-## Exports et classification post-COMMIT
+## Preuves source-only réellement exécutées
 
-Les JSON sont des exports facultatifs non autoritatifs, générés après COMMIT. Le code ne lit plus un export existant sous le verrou; `lstat` refuse FIFO/symlink/non-fichier et une panne d'export conserve le batch SQLite `committed` avec avertissement.
-
-Si une exception survient après un COMMIT possible, le script rouvre la DB de confiance, relit le `batch_id` et classe l'état durable; DB illisible ou incohérente = `unknown` fail-closed, jamais retry implicite ni succès déduit d'un export.
+- `python -m pytest -q tests/profile_overlay/test_telegram_subscribe.py tests/profile_overlay/test_telegram_subscription_batches.py` → 21 passed, rc 0.
+- `python -m pytest -q tests/hermes_cli/test_kanban_notify.py tests/hermes_cli/test_kanban_notify_owner_transfer.py tests/hermes_cli/test_kanban_review_lifecycle_complete.py tests/hermes_cli/test_kanban_db_init.py tests/cron/test_jobs_crossprocess_lock.py` → 65 passed, rc 0.
+- Revue indépendante confinée, `test_review_round10.py test_review_round11.py test_review_round12_supplement.py test_review_round13_contract.py` → 64 passed, 2 failures, rc 1. Les deux échecs sont les anciens seams qui injectent un SIGKILL en interceptant `Path.open/write_text` sur le chemin primaire; ils n'observent plus l'implémentation atomique par fichier temporaire + `os.replace`. Les nouveaux contrôles métier R13 sont 8/8 verts; la réexécution de ces deux seams doit être adaptée à la frontière atomique, sans réintroduire une écriture primaire tronquante.
+- `env -u HERMES_KANBAN_TASK -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD python artifacts/verify-amber-subscription-rollback.py` → `targeted Amber rollback verifier: PASS`, `quick_check=ok`, conflit concurrent refusé sans overwrite, rc 0.
+- `python3 -m py_compile artifacts/verify-amber-subscription-rollback.py cron/jobs.py hermes_cli/kanban_db.py` → rc 0; `git diff --check` → rc 0 avant commit.
 
 ## Préconditions de gate (non réalisées)
 
@@ -40,4 +43,4 @@ Si une exception survient après un COMMIT possible, le script rouvre la DB de c
 
 ## Retour sûr
 
-Le rollback candidat est un revert Git du SHA exact vers son parent, après revue. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.
+Le rollback candidat est un revert Git du SHA exact `ae6d32788d9a132bc3a8b327765eb3576a1d8dfc` vers son parent `14f860d24a0580239c326be3dd15724f8732b020`, après revue. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.
