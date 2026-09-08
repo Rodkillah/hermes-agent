@@ -383,37 +383,38 @@ def test_reconcile_captures_preimage_after_outer_transaction(monkeypatch, db):
             return planned
 
         monkeypatch.setattr(mod, "plan", plan_after_begin)
-        journal = []
-        mod.reconcile(conn, journal=journal)
-        entry = next(item for item in journal if item["task_id"] == forge)
-        mod.rollback_journal(conn, journal)
+        batch_id = "capture-after-begin"
+        mod.reconcile(conn, batch_id=batch_id)
+        entry = next(item for item in kb.list_notify_batch_entries(conn, batch_id) if json.loads(item["post_image_json"])["task_id"] == forge)
+        mod.rollback_batch(conn, batch_id)
         restored = kb.list_notify_subs(conn, forge)[0]
     finally:
         conn.close()
 
-    assert entry["pre_image"]["delivery_mode"] == "wake"
+    assert json.loads(entry["pre_image_json"])["delivery_mode"] == "wake"
     assert restored["delivery_mode"] == "wake"
 
 
-def test_prepare_failure_rolls_back_without_unjournaled_commit(monkeypatch, db):
+def test_ledger_insert_failure_rolls_back_without_subscription_mutation(monkeypatch, db):
     mod = load_script(monkeypatch)
     kb = mod.kb
     conn = kb.connect(db)
     try:
         seed_task(kb, conn, owner="amber")
         forge = seed_task(kb, conn, owner="forge")
-        with pytest.raises(OSError, match="journal disk full"):
-            mod.reconcile(
-                conn,
-                prepare_journal=lambda entries: (_ for _ in ()).throw(OSError("journal disk full")),
-            )
+        monkeypatch.setattr(
+            kb, "record_notify_batch",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("ledger disk full")),
+        )
+        with pytest.raises(OSError, match="ledger disk full"):
+            mod.reconcile(conn, batch_id="ledger-write-failure")
         row = kb.list_notify_subs(conn, forge)[0]
     finally:
         conn.close()
     assert row["notifier_profile"] == "forge"
 
 
-def test_main_private_batches_are_non_overwriting_and_recover_markers(monkeypatch, db, tmp_path, capsys):
+def test_main_exports_committed_sqlite_batch_without_private_journal(monkeypatch, db, tmp_path, capsys):
     mod = load_script(monkeypatch)
     kb = mod.kb
     conn = kb.connect(db)
@@ -424,30 +425,46 @@ def test_main_private_batches_are_non_overwriting_and_recover_markers(monkeypatc
         conn.close()
     monkeypatch.setattr(mod, "DB_PATH", db)
     monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
-    monkeypatch.setattr(mod, "JOURNAL_ROOT", tmp_path / "private-journals")
-    export = tmp_path / "legacy-export.json"
+    export = tmp_path / "compatibility-export.json"
+    batch_id = "main-committed-batch"
 
-    assert mod.main(["--journal", str(export)]) == 0
+    assert mod.main(["--batch-id", batch_id, "--journal", str(export)]) == 0
     first = json.loads(export.read_text())
-    batches = list((tmp_path / "private-journals").iterdir())
-    assert len(first) == len(batches) == 1
-    prepared = batches[0] / "prepared.json"
-    assert (batches[0] / "committed.json").is_file()
-    assert prepared.stat().st_mode & 0o777 == 0o600
-    assert batches[0].stat().st_mode & 0o777 == 0o700
-
-    assert mod.main(["--journal", str(export)]) == 0
-    assert json.loads(export.read_text()) == first
-    assert len(list((tmp_path / "private-journals").iterdir())) == 1
-
-    (batches[0] / "committed.json").unlink()
     conn = kb.connect(db)
     try:
-        mod.BatchJournal.recover_pending(conn, tmp_path / "private-journals")
+        batch = kb.get_notify_batch(conn, batch_id)
+        assert batch and batch["state"] == "committed" and batch["entry_count"] == len(first) == 1
+        assert not (tmp_path / "private-journals").exists()
     finally:
         conn.close()
-    assert (batches[0] / "committed.json").is_file()
+    assert mod.main(["--batch-id", batch_id, "--journal", str(export)]) == 0
+    assert json.loads(export.read_text()) == first
     assert capsys.readouterr().err == ""
+
+
+def test_export_failure_after_commit_reports_warning_without_rollback(monkeypatch, db, tmp_path, capsys):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        seed_task(kb, conn, owner="amber")
+        forge = seed_task(kb, conn, owner="forge")
+    finally:
+        conn.close()
+    monkeypatch.setattr(mod, "DB_PATH", db)
+    monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
+    export_directory = tmp_path / "export-directory"
+    export_directory.mkdir()
+    batch_id = "committed-despite-export-failure"
+    assert mod.main(["--batch-id", batch_id, "--journal", str(export_directory)]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["export_failed"] == 1
+    conn = kb.connect(db)
+    try:
+        assert kb.get_notify_batch(conn, batch_id)["state"] == "committed"
+        assert kb.list_notify_subs(conn, forge)[0]["notifier_profile"] == "amber"
+    finally:
+        conn.close()
 
 
 def test_same_second_recreate_gets_new_generation_and_refuses_inverse(monkeypatch, db):
@@ -457,8 +474,8 @@ def test_same_second_recreate_gets_new_generation_and_refuses_inverse(monkeypatc
     try:
         seed_task(kb, conn, owner="amber")
         created = seed_task(kb, conn)
-        journal = []
-        mod.reconcile(conn, journal=journal)
+        batch_id = "same-second-recreate"
+        mod.reconcile(conn, batch_id=batch_id)
         post = kb.list_notify_subs(conn, created)[0]
         kb.remove_notify_sub(conn, task_id=created, platform="telegram", chat_id="chat", thread_id="thread")
         kb.add_notify_sub(
@@ -469,7 +486,7 @@ def test_same_second_recreate_gets_new_generation_and_refuses_inverse(monkeypatc
         )
         recreated = kb.list_notify_subs(conn, created)[0]
         with pytest.raises(RuntimeError, match="rollback conflict"):
-            mod.rollback_journal(conn, journal)
+            mod.rollback_batch(conn, batch_id)
         after = kb.list_notify_subs(conn, created)[0]
     finally:
         conn.close()
@@ -478,126 +495,19 @@ def test_same_second_recreate_gets_new_generation_and_refuses_inverse(monkeypatc
     assert after == recreated
 
 
-def test_private_journal_parent_swap_at_publish_is_cleaned_without_db_commit(monkeypatch, db, tmp_path):
-    """A rename after the final preparation check must abort before SQLite commits.
-
-    This injects at the actual link(2) publication seam.  A secure implementation
-    may write through a directory descriptor, but it must then prove the batch is
-    still attached below JOURNAL_ROOT and clean that descriptor-relative write on
-    failure.
-    """
-    mod = load_script(monkeypatch)
-    kb = mod.kb
-    conn = kb.connect(db)
-    try:
-        forge = seed_task(kb, conn, owner="forge")
-        monkeypatch.setattr(mod, "DB_PATH", db)
-        monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
-        root = tmp_path / "private-journals"
-        monkeypatch.setattr(mod, "JOURNAL_ROOT", root)
-        original_link = mod.os.link
-        injected = []
-
-        def link(source, destination, *args, **kwargs):
-            if Path(destination).name == "prepared.json" and not injected:
-                batch = next(root.iterdir())
-                outside = tmp_path / "outside-journal"
-                batch.rename(outside)
-                batch.symlink_to(outside, target_is_directory=True)
-                injected.append(outside)
-            return original_link(source, destination, *args, **kwargs)
-
-        monkeypatch.setattr(mod.os, "link", link)
-        assert mod.main([]) == 1
-        assert injected
-        assert not (injected[0] / "prepared.json").exists()
-        assert kb.list_notify_subs(conn, forge)[0]["notifier_profile"] == "forge"
-    finally:
-        conn.close()
-
-
-def test_private_journal_marker_open_refuses_aba_symlink_without_transfer(monkeypatch, db, tmp_path):
-    """Recovery must open the observed marker with O_NOFOLLOW, not read a path."""
+def test_export_tampering_cannot_change_sqlite_batch_recovery(monkeypatch, db, tmp_path):
     mod = load_script(monkeypatch)
     kb = mod.kb
     conn = kb.connect(db)
     try:
         seed_task(kb, conn, owner="amber")
-        seed_task(kb, conn, owner="forge")
-        monkeypatch.setattr(mod, "DB_PATH", db)
-        monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
-        root = tmp_path / "private-journals"
-        monkeypatch.setattr(mod, "JOURNAL_ROOT", root)
-        assert mod.main([]) == 0
-        marker = next(root.iterdir()) / "committed.json"
         forge = seed_task(kb, conn, owner="forge")
-        original_open = mod.os.open
-        injected = []
-
-        def open_no_follow(path, flags, *args, **kwargs):
-            if Path(path).name == "committed.json" and not (flags & os.O_WRONLY) and not injected:
-                saved = tmp_path / "outside-marker.json"
-                marker.rename(saved)
-                marker.symlink_to(saved)
-                injected.append(saved)
-                try:
-                    return original_open(path, flags, *args, **kwargs)
-                finally:
-                    marker.unlink()
-                    saved.rename(marker)
-            return original_open(path, flags, *args, **kwargs)
-
-        monkeypatch.setattr(mod.os, "open", open_no_follow)
-        assert mod.main([]) == 1
-        assert injected
+        batch_id = "export-is-not-authority"
+        mod.reconcile(conn, batch_id=batch_id)
+        export = tmp_path / "tampered.json"
+        export.write_text('[{"post_image":{"notifier_profile":"human"}}]')
+        assert mod.rollback_batch(conn, batch_id) == 1
         assert kb.list_notify_subs(conn, forge)[0]["notifier_profile"] == "forge"
-    finally:
-        conn.close()
-
-
-def test_recovery_reads_marker_via_anchored_nofollow_descriptor(monkeypatch, db, tmp_path):
-    """Recovery opens each marker via an anchored descriptor with O_NOFOLLOW."""
-    mod = load_script(monkeypatch)
-    kb = mod.kb
-    conn = kb.connect(db)
-    try:
-        seed_task(kb, conn, owner="amber")
-        seed_task(kb, conn, owner="forge")
-        monkeypatch.setattr(mod, "DB_PATH", db)
-        monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
-        root = tmp_path / "private-journals"
-        monkeypatch.setattr(mod, "JOURNAL_ROOT", root)
-        assert mod.main([]) == 0
-        batch = next(root.iterdir())
-        (batch / "committed.json").unlink()
-        forge = seed_task(kb, conn, owner="forge")
-        marker = batch / "prepared.json"
-        saved = tmp_path / "prepared-outside.json"
-        original_open = mod.os.open
-        injected = []
-
-        def open_at(path, flags, *args, **kwargs):
-            if (
-                Path(path).name == "prepared.json"
-                and kwargs.get("dir_fd") is not None
-                and not (flags & os.O_WRONLY)
-                and not injected
-            ):
-                assert flags & mod._O_NOFOLLOW
-                marker.rename(saved)
-                marker.symlink_to(saved)
-                injected.append(True)
-                try:
-                    return original_open(path, flags, *args, **kwargs)
-                finally:
-                    marker.unlink()
-                    saved.rename(marker)
-            return original_open(path, flags, *args, **kwargs)
-
-        monkeypatch.setattr(mod.os, "open", open_at)
-        with pytest.raises(RuntimeError, match="cannot be opened safely"):
-            mod.BatchJournal.recover_pending(conn, root)
-        assert injected
-        assert kb.list_notify_subs(conn, forge)[0]["notifier_profile"] == "forge"
+        assert kb.get_notify_batch(conn, batch_id)["state"] == "reverted"
     finally:
         conn.close()

@@ -56,6 +56,7 @@ MAX_BATCH_SIZE = 50
 # silently dropping the no-follow protection.
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0o200000)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0o400000)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0o4000)
 _ALLOWED_OWNERS = {PROFILE, SOURCE_PROFILE}
 
 
@@ -263,7 +264,10 @@ def _validate_image(image: Any, *, label: str) -> dict[str, Any]:
 def _read_regular_json_at(parent_fd: int, name: str, *, label: str) -> tuple[dict[str, Any], bytes]:
     """Read a marker by descriptor, never resolving its parent again."""
     try:
-        fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=parent_fd)
+        # A FIFO/device can block at open(2), before a post-open fstat has a
+        # chance to reject it.  Open non-blocking, then accept regular files
+        # only by the descriptor actually obtained.
+        fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK, dir_fd=parent_fd)
     except FileNotFoundError as exc:
         raise RuntimeError(f"{label} is missing") from exc
     except OSError as exc:
@@ -392,7 +396,11 @@ class BatchJournal:
     def _read(self, name: str, *, label: str) -> tuple[dict[str, Any], bytes]:
         self._assert_attached()
         try:
-            fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=self.batch_fd)
+            # See _read_regular_json_at: do not let a hostile FIFO retain the
+            # process-wide reconciliation lock before descriptor validation.
+            fd = os.open(
+                name, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK, dir_fd=self.batch_fd
+            )
         except FileNotFoundError as exc:
             raise RuntimeError(f"{label} is missing") from exc
         except OSError as exc:
@@ -528,21 +536,19 @@ def _validate_export_path(path: Path) -> None:
             raise RuntimeError("journal export is not a list")
 
 
-def _append_export(path: Path, entries: list[dict[str, Any]]) -> None:
-    """Compatibility export: preserve older entries and never replace on no-op."""
+def _append_export(path: Path, entries: list[dict[str, Any]], *, batch_id: str) -> None:
+    """Regenerate one non-authoritative compatibility export after COMMIT.
+
+    Replacing the requested export with its uniquely identified batch avoids a
+    read of untrusted existing JSON, so a FIFO/symlink race cannot retain the
+    reconciliation lock.  The authoritative ledger remains untouched if this
+    best-effort publication fails.
+    """
     if not entries:
         return
     _validate_export_path(path)
-    old: list[Any] = []
-    if path.exists():
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(parsed, list):
-            raise RuntimeError("journal export is not a list")
-        old = parsed
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    # The legacy interface is a JSON list; write it atomically after the
-    # durable batch marker, so an export failure never erases recovery data.
-    data = (json.dumps(old + entries, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    data = (json.dumps(entries, indent=2, sort_keys=True) + "\n").encode("utf-8")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         os.write(fd, data)
@@ -551,6 +557,20 @@ def _append_export(path: Path, entries: list[dict[str, Any]]) -> None:
         os.close(fd)
     os.replace(temporary, path)
     _fsync_directory(path.parent)
+
+
+def _export_batch_entries(conn: sqlite3.Connection, batch_id: str) -> list[dict[str, Any]]:
+    """Regenerate a compatibility export from the committed SQLite ledger."""
+    exported: list[dict[str, Any]] = []
+    for entry in kb.list_notify_batch_entries(conn, batch_id):
+        exported.append({
+            "schema_version": 1,
+            "batch_id": batch_id,
+            "action": entry["action"],
+            "pre_image": json.loads(entry["pre_image_json"]) if entry["pre_image_json"] else None,
+            "post_image": json.loads(entry["post_image_json"]),
+        })
+    return exported
 
 
 def _value(row: Any, key: str, default: Any = None) -> Any:
@@ -741,32 +761,36 @@ def _ensure_amber_notify_wake(
         raise RuntimeError(f"Amber subscription read-back failed for {task_id}")
 
 
+def _forward_request_digest(limit: int) -> str:
+    """Stable request identity independent of post-application DB state."""
+    request = {"board": BOARD, "operation": "amber-notify-wake-v1", "limit": limit}
+    return hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def rollback_batch(conn: sqlite3.Connection, forward_batch_id: str, *, batch_id: str | None = None) -> int:
+    """Inverse a persisted forward batch; caller-provided JSON is never authority."""
+    inverse_id = batch_id or hashlib.sha256(
+        f"amber-notify-wake-inverse-v1:{forward_batch_id}".encode()
+    ).hexdigest()
+    request = {"board": BOARD, "operation": "amber-notify-wake-inverse-v1", "forward_batch_id": forward_batch_id}
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return kb.inverse_notify_batch(
+        conn,
+        forward_batch_id=forward_batch_id,
+        inverse_batch_id=inverse_id,
+        board=BOARD,
+        request_digest=digest,
+    )
+
+
 def rollback_journal(conn: sqlite3.Connection, journal: Iterable[Mapping[str, Any]]) -> int:
-    """Reverse one committed journal without overwriting concurrent changes."""
-    entries = list(journal)
-    if not entries:
-        return 0
-    # The inverse itself is a durable operation.  Its prepared record is
-    # written before the database transaction, so a crash after its commit is
-    # classified conservatively by recover_pending on the next pass.
-    inverse = BatchJournal(JOURNAL_ROOT, phase="inverse")
-    inverse.prepare(entries)
-    restored = 0
-    with kb.write_txn(conn):
-        for entry in reversed(entries):
-            pre_image = entry.get("pre_image")
-            post_image = entry.get("post_image")
-            if not isinstance(post_image, dict):
-                raise RuntimeError("rollback journal entry has no post-image")
-            if not kb.restore_notify_sub_state(
-                conn, pre_image=pre_image if isinstance(pre_image, dict) else None,
-                post_image=post_image,
-            ):
-                key = ":".join(str(post_image.get(field, "")) for field in ("task_id", "chat_id", "thread_id"))
-                raise RuntimeError(f"rollback conflict for {key}")
-            restored += 1
-    inverse.mark_committed()
-    return restored
+    """Reject obsolete caller-authoritative JSON rollback input.
+
+    Compatibility exports remain readable outside this primitive, but neither
+    they nor an in-memory list can decide an inverse after a crash.
+    """
+    del conn, journal
+    raise RuntimeError("rollback requires a persisted forward batch_id")
 
 
 def reconcile(
@@ -774,6 +798,7 @@ def reconcile(
     *,
     dry_run: bool = False,
     limit: int = MAX_BATCH_SIZE,
+    batch_id: str | None = None,
     journal: Optional[list[dict[str, Any]]] = None,
     prepare_journal: Optional[Callable[[list[dict[str, Any]]], None]] = None,
 ) -> dict[str, int]:
@@ -795,12 +820,26 @@ def reconcile(
             "changed": 0,
         }
 
+    if prepare_journal is not None:
+        raise RuntimeError("external JSON journal preparation is no longer authoritative")
+    batch_id = batch_id or uuid.uuid4().hex
+    request_digest = _forward_request_digest(limit)
     pending_journal: list[dict[str, Any]] = []
     # One outer transaction is deliberate: if any CAS/read-back fails, every
     # transfer, mode repair, and new row in this batch is rolled back.  The
     # plan and every pre-image are captured only after BEGIN IMMEDIATE, so a
     # native writer cannot make a stale pre-image rollback its own update.
     with kb.write_txn(conn):
+        existing = kb.get_notify_batch(conn, batch_id)
+        if existing is not None:
+            if existing["request_digest"] != request_digest or existing["phase"] != "forward":
+                raise RuntimeError("notify batch id was reused with a different request")
+            if existing["state"] == "reverted":
+                raise RuntimeError("notify batch is reverted; refusing to reapply it")
+            stored = json.loads(existing["result_json"])
+            if not isinstance(stored, dict):
+                raise RuntimeError("notify batch result is malformed")
+            return {key: int(value) for key, value in stored.items()}
         tasks = kb.list_tasks(conn, include_archived=False, limit=None)
         subscriptions = kb.list_notify_subs(conn)
         active, anchor, targets, actions = plan(tasks, subscriptions, limit)
@@ -848,12 +887,19 @@ def reconcile(
         expected = result["missing"] - result["changed"]
         if remaining != expected:
             raise RuntimeError("Amber subscription coverage read-back failed")
-        # Persist exact images while the SQLite transaction is still open.
-        # A failed fsync/write raises here and makes write_txn roll back; a
-        # crash after DB commit but before the committed marker is resolved by
-        # BatchJournal.recover_pending using these complete images.
-        if pending_journal and prepare_journal is not None:
-            prepare_journal(pending_journal)
+        # The authoritative ledger row and every exact image are inserted in
+        # this same BEGIN IMMEDIATE transaction as subscription mutations.
+        # There is no prepared filesystem state whose attachment must survive
+        # until COMMIT.
+        kb.record_notify_batch(
+            conn,
+            batch_id=batch_id,
+            board=BOARD,
+            phase="forward",
+            request_digest=request_digest,
+            result=result,
+            entries=pending_journal,
+        )
     if journal is not None:
         journal.extend(pending_journal)
     return result
@@ -875,6 +921,7 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="write the committed batch's exact pre/post-images to this JSON path",
     )
+    parser.add_argument("--batch-id", help="stable opaque ID for one idempotent forward batch")
     args = parser.parse_args(argv)
     if not DB_PATH.is_file():
         print("kanban_subscription_error: canonical board missing; refusing fallback", file=sys.stderr)
@@ -893,33 +940,24 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 # Explicit db_path and board make inherited HERMES_KANBAN_*
                 # variables irrelevant; no CLI fallback is possible here.
-                if args.journal is not None:
-                    # Validate before the transaction: a bad compatibility
-                    # export cannot turn a committed batch into an
-                    # unjournaled batch. The durable private journal below is
-                    # still authoritative for recovery.
-                    _validate_export_path(args.journal)
-                committed_journal: list[dict[str, Any]] = []
+                # The optional compatibility export is deliberately after the
+                # durable SQLite commit. Its failure is surfaced as a warning,
+                # never recast as an uncommitted subscription batch.
+                batch_id = args.batch_id or uuid.uuid4().hex
                 with kb.connect(DB_PATH, board=BOARD) as conn:
-                    BatchJournal.recover_pending(conn, JOURNAL_ROOT)
-                    batch: list[BatchJournal] = []
-
-                    def prepare(entries: list[dict[str, Any]]) -> None:
-                        current = BatchJournal(JOURNAL_ROOT)
-                        current.prepare(entries)
-                        batch.append(current)
-
                     result = reconcile(
                         conn,
                         dry_run=False,
                         limit=args.limit,
-                        journal=committed_journal,
-                        prepare_journal=prepare,
+                        batch_id=batch_id,
                     )
-                    if batch:
-                        batch[0].mark_committed()
+                    committed_journal = _export_batch_entries(conn, batch_id)
                 if args.journal is not None:
-                    _append_export(args.journal, committed_journal)
+                    try:
+                        _append_export(args.journal, committed_journal, batch_id=batch_id)
+                    except (OSError, RuntimeError, TypeError, ValueError) as export_error:
+                        result["export_failed"] = 1
+                        print(f"kanban_subscription_export_warning: {export_error}", file=sys.stderr)
         print(json.dumps(result, sort_keys=True))
         return 0
     except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as error:

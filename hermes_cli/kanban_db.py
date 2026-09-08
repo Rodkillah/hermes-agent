@@ -1534,6 +1534,41 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     UNIQUE (subscription_generation)
 );
 
+-- Authoritative, transactionally co-committed evidence for bounded
+-- notification reconciliation batches.  JSON exports are deliberately not
+-- referenced here: they are compatibility artifacts only and cannot drive
+-- recovery or inverse decisions.
+CREATE TABLE IF NOT EXISTS kanban_notify_batches (
+    batch_id       TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    board          TEXT NOT NULL,
+    phase          TEXT NOT NULL CHECK (phase IN ('forward', 'inverse')),
+    inverse_of     TEXT UNIQUE REFERENCES kanban_notify_batches(batch_id),
+    state          TEXT NOT NULL CHECK (state IN ('committed', 'reverted')),
+    request_digest TEXT NOT NULL,
+    entry_count    INTEGER NOT NULL CHECK (entry_count >= 0),
+    result_json    TEXT NOT NULL,
+    committed_at   INTEGER NOT NULL,
+    reverted_at    INTEGER,
+    CHECK (
+        (phase = 'forward' AND inverse_of IS NULL AND
+         ((state = 'committed' AND reverted_at IS NULL) OR
+          (state = 'reverted' AND reverted_at IS NOT NULL))) OR
+        (phase = 'inverse' AND inverse_of IS NOT NULL AND state = 'committed' AND reverted_at IS NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS kanban_notify_batch_entries (
+    batch_id       TEXT NOT NULL REFERENCES kanban_notify_batches(batch_id),
+    ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+    action         TEXT NOT NULL CHECK (action IN ('create', 'transfer', 'repair')),
+    pre_image_json TEXT,
+    post_image_json TEXT NOT NULL,
+    PRIMARY KEY (batch_id, ordinal),
+    CHECK (pre_image_json IS NULL OR json_valid(pre_image_json)),
+    CHECK (json_valid(post_image_json))
+);
+
 -- Immutable production proof.  These tables are additive and deliberately
 -- have no backfill: legacy done cards remain exactly as they were.
 CREATE TABLE IF NOT EXISTS production_receipts (
@@ -1577,6 +1612,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_batches_inverse ON kanban_notify_batches(inverse_of);
 CREATE INDEX IF NOT EXISTS idx_production_probes_receipt ON production_probes(receipt_id, ordinal);
 """
 
@@ -2519,6 +2555,7 @@ def connect(
                     # process are cheap. The lock prevents same-process dispatcher
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
+                    _preflight_notify_batch_schema(conn)
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
                     _INITIALIZED_PATHS.add(resolved)
@@ -2907,6 +2944,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
     _ensure_notify_subscription_generation(conn)
+    _ensure_notify_batch_schema(conn)
 
 
 def _ensure_notify_subscription_generation(conn: sqlite3.Connection) -> None:
@@ -3000,6 +3038,90 @@ def _ensure_notify_subscription_generation(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def _ensure_notify_batch_schema(conn: sqlite3.Connection) -> None:
+    """Validate and finish the additive authoritative notify-batch ledger.
+
+    ``CREATE TABLE IF NOT EXISTS`` is intentionally insufficient for this
+    proof-bearing ledger: accepting a same-named legacy table with missing
+    constraints would make a recovery decision depend on an unknown schema.
+    There is no backfill or repair path because historical JSON files do not
+    carry a trustworthy subscription incarnation.
+    """
+    required = {
+        "kanban_notify_batches": {
+            "batch_id", "schema_version", "board", "phase", "inverse_of",
+            "state", "request_digest", "entry_count", "result_json",
+            "committed_at", "reverted_at",
+        },
+        "kanban_notify_batch_entries": {
+            "batch_id", "ordinal", "action", "pre_image_json", "post_image_json",
+        },
+    }
+    for table, fields in required.items():
+        actual = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if actual != fields:
+            raise RuntimeError(f"notify batch ledger schema is incompatible for {table}")
+    foreign_keys = conn.execute("PRAGMA foreign_key_list(kanban_notify_batch_entries)").fetchall()
+    if not any(row["table"] == "kanban_notify_batches" and row["from"] == "batch_id" for row in foreign_keys):
+        raise RuntimeError("notify batch ledger schema is incompatible: missing entry foreign key")
+    if conn.in_transaction:
+        raise RuntimeError("notify batch ledger migration requires a fresh transaction")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_notify_batch_entries_immutable "
+            "BEFORE UPDATE ON kanban_notify_batch_entries "
+            "BEGIN SELECT RAISE(ABORT, 'notify batch entries are immutable'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_notify_batch_entries_no_delete "
+            "BEFORE DELETE ON kanban_notify_batch_entries "
+            "BEGIN SELECT RAISE(ABORT, 'notify batch entries are immutable'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_notify_batches_no_delete "
+            "BEFORE DELETE ON kanban_notify_batches "
+            "BEGIN SELECT RAISE(ABORT, 'notify batches are immutable'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_notify_batches_only_revert "
+            "BEFORE UPDATE ON kanban_notify_batches "
+            "WHEN NOT (OLD.phase = 'forward' AND OLD.state = 'committed' "
+            "AND NEW.batch_id IS OLD.batch_id AND NEW.schema_version IS OLD.schema_version "
+            "AND NEW.board IS OLD.board AND NEW.phase IS OLD.phase "
+            "AND NEW.inverse_of IS OLD.inverse_of AND NEW.request_digest IS OLD.request_digest "
+            "AND NEW.entry_count IS OLD.entry_count AND NEW.result_json IS OLD.result_json "
+            "AND NEW.committed_at IS OLD.committed_at AND NEW.state = 'reverted' "
+            "AND NEW.reverted_at IS NOT NULL) "
+            "BEGIN SELECT RAISE(ABORT, 'notify batch fields are immutable'); END"
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _preflight_notify_batch_schema(conn: sqlite3.Connection) -> None:
+    """Refuse a conflicting legacy table before SCHEMA_SQL parses its indexes."""
+    expected = {
+        "kanban_notify_batches": {
+            "batch_id", "schema_version", "board", "phase", "inverse_of",
+            "state", "request_digest", "entry_count", "result_json", "committed_at", "reverted_at",
+        },
+        "kanban_notify_batch_entries": {
+            "batch_id", "ordinal", "action", "pre_image_json", "post_image_json",
+        },
+    }
+    for table, fields in expected.items():
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if exists is not None:
+            actual = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if actual != fields:
+                raise RuntimeError(f"notify batch ledger schema is incompatible for {table}")
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -12710,6 +12832,177 @@ def restore_notify_sub_state(
              post_image[identity_field]),
         )
         return cur.rowcount == 1
+
+
+_NOTIFY_BATCH_IMAGE_FIELDS = (
+    "task_id", "platform", "chat_id", "thread_id", "user_id", "user_id_alt",
+    "chat_type", "notifier_profile", "delivery_mode", "delivery_metadata",
+    "created_at", "last_event_id", "subscription_generation",
+)
+
+
+def _canonical_notify_batch_json(value: Any) -> str:
+    """Encode ledger data deterministically without normalizing SQLite values."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _validate_notify_batch_image(image: Optional[Mapping[str, Any]], *, label: str) -> None:
+    if image is None:
+        return
+    if not isinstance(image, Mapping) or set(image) != set(_NOTIFY_BATCH_IMAGE_FIELDS):
+        raise ValueError(f"{label} is not a complete exact subscription image")
+    if not isinstance(image["task_id"], str) or not image["task_id"]:
+        raise ValueError(f"{label} has an invalid subscription key")
+    for field in ("platform", "chat_id", "thread_id", "notifier_profile", "delivery_mode"):
+        if not isinstance(image[field], str):
+            raise ValueError(f"{label} has an invalid {field}")
+    generation = image["subscription_generation"]
+    if not isinstance(generation, str) or len(generation) != 32 or any(c not in "0123456789abcdef" for c in generation):
+        raise ValueError(f"{label} has an invalid subscription generation")
+    if not isinstance(image["created_at"], int) or not isinstance(image["last_event_id"], int):
+        raise ValueError(f"{label} has an invalid timestamp or cursor")
+
+
+def get_notify_batch(conn: sqlite3.Connection, batch_id: str) -> Optional[dict[str, Any]]:
+    """Read authoritative batch status; exports are intentionally ignored."""
+    row = conn.execute("SELECT * FROM kanban_notify_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_notify_batch_entries(conn: sqlite3.Connection, batch_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM kanban_notify_batch_entries WHERE batch_id = ? ORDER BY ordinal", (batch_id,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_notify_batch(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    board: str,
+    phase: str,
+    request_digest: str,
+    result: Mapping[str, Any],
+    entries: Iterable[Mapping[str, Any]],
+    inverse_of: Optional[str] = None,
+    committed_at: Optional[int] = None,
+) -> dict[str, Any]:
+    """Insert one immutable authoritative batch inside the caller's transaction.
+
+    This native primitive never reads or writes an export.  Reusing an ID is
+    only idempotent for exactly the same normalized request; callers must check
+    that case before applying any subscription mutation.
+    """
+    if not isinstance(batch_id, str) or not batch_id:
+        raise ValueError("batch_id must be a non-empty stable identifier")
+    if phase not in {"forward", "inverse"}:
+        raise ValueError("notify batch phase is invalid")
+    if (phase == "forward") != (inverse_of is None):
+        raise ValueError("notify batch inverse identity is inconsistent")
+    if not isinstance(board, str) or not board or not isinstance(request_digest, str) or not request_digest:
+        raise ValueError("notify batch board or request digest is invalid")
+    materialized = list(entries)
+    seen: set[tuple[Any, Any, Any, Any]] = set()
+    encoded_entries: list[tuple[int, str, Optional[str], str]] = []
+    for ordinal, entry in enumerate(materialized):
+        action = entry.get("action")
+        pre_image = entry.get("pre_image")
+        post_image = entry.get("post_image")
+        if action not in {"create", "transfer", "repair"}:
+            raise ValueError("notify batch action is invalid")
+        _validate_notify_batch_image(pre_image, label="notify batch pre-image")
+        _validate_notify_batch_image(post_image, label="notify batch post-image")
+        if post_image is None:
+            raise ValueError("notify batch post-image is required")
+        key = tuple(post_image[field] for field in ("task_id", "platform", "chat_id", "thread_id"))
+        if key in seen:
+            raise ValueError("notify batch has duplicate subscription keys")
+        seen.add(key)
+        encoded_entries.append((
+            ordinal,
+            action,
+            _canonical_notify_batch_json(dict(pre_image)) if pre_image is not None else None,
+            _canonical_notify_batch_json(dict(post_image)),
+        ))
+    result_json = _canonical_notify_batch_json(dict(result))
+    with write_txn(conn, allow_nested=True):
+        existing = get_notify_batch(conn, batch_id)
+        if existing is not None:
+            if existing["request_digest"] != request_digest:
+                raise RuntimeError("notify batch id was reused with a different request")
+            if existing["phase"] != phase or existing["inverse_of"] != inverse_of:
+                raise RuntimeError("notify batch id was reused with a different phase")
+            return existing
+        conn.execute(
+            "INSERT INTO kanban_notify_batches "
+            "(batch_id, schema_version, board, phase, inverse_of, state, request_digest, entry_count, result_json, committed_at) "
+            "VALUES (?, 1, ?, ?, ?, 'committed', ?, ?, ?, ?)",
+            (batch_id, board, phase, inverse_of, request_digest, len(encoded_entries), result_json,
+             int(time.time()) if committed_at is None else committed_at),
+        )
+        conn.executemany(
+            "INSERT INTO kanban_notify_batch_entries "
+            "(batch_id, ordinal, action, pre_image_json, post_image_json) VALUES (?, ?, ?, ?, ?)",
+            [(batch_id, *entry) for entry in encoded_entries],
+        )
+    inserted = get_notify_batch(conn, batch_id)
+    assert inserted is not None
+    return inserted
+
+
+def inverse_notify_batch(
+    conn: sqlite3.Connection,
+    *,
+    forward_batch_id: str,
+    inverse_batch_id: str,
+    board: str,
+    request_digest: str,
+) -> int:
+    """Atomically inverse one persisted forward batch, guarded by its images."""
+    with write_txn(conn, allow_nested=True):
+        forward = get_notify_batch(conn, forward_batch_id)
+        if forward is None or forward["phase"] != "forward":
+            raise RuntimeError("forward notify batch is missing or invalid")
+        existing_inverse = conn.execute(
+            "SELECT * FROM kanban_notify_batches WHERE inverse_of = ?", (forward_batch_id,)
+        ).fetchone()
+        if existing_inverse is not None:
+            existing = dict(existing_inverse)
+            if existing["batch_id"] != inverse_batch_id or existing["request_digest"] != request_digest:
+                raise RuntimeError("forward notify batch already has a different inverse")
+            return int(existing["entry_count"])
+        if forward["state"] == "reverted":
+            raise RuntimeError("forward notify batch is reverted without its inverse")
+        entries = list_notify_batch_entries(conn, forward_batch_id)
+        if len(entries) != int(forward["entry_count"]):
+            raise RuntimeError("forward notify batch entry count is inconsistent")
+        inverse_entries: list[dict[str, Any]] = []
+        for entry in reversed(entries):
+            pre_image = json.loads(entry["pre_image_json"]) if entry["pre_image_json"] is not None else None
+            post_image = json.loads(entry["post_image_json"])
+            key = {field: post_image[field] for field in ("task_id", "platform", "chat_id", "thread_id")}
+            current_rows = conn.execute(
+                "SELECT * FROM kanban_notify_subs WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (key["task_id"], key["platform"], key["chat_id"], key["thread_id"]),
+            ).fetchall()
+            observed = dict(current_rows[0]) if len(current_rows) == 1 else post_image
+            if not restore_notify_sub_state(conn, pre_image=pre_image, post_image=post_image):
+                raise RuntimeError(f"rollback conflict for {post_image['task_id']}")
+            # The inverse ledger retains the actual pre-inverse observation and
+            # the durable forward post-image as its non-null rollback identity.
+            inverse_entries.append({"action": entry["action"], "pre_image": observed, "post_image": post_image})
+        record_notify_batch(
+            conn, batch_id=inverse_batch_id, board=board, phase="inverse", inverse_of=forward_batch_id,
+            request_digest=request_digest, result={"restored": len(entries)}, entries=inverse_entries,
+        )
+        cur = conn.execute(
+            "UPDATE kanban_notify_batches SET state = 'reverted', reverted_at = ? "
+            "WHERE batch_id = ? AND state = 'committed'", (int(time.time()), forward_batch_id)
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("forward notify batch could not be marked reverted")
+        return len(entries)
 
 
 def _notify_profile_filter(
