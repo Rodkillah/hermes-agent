@@ -757,3 +757,82 @@ def test_external_cancellation_is_not_reported_as_shutdown(monkeypatch, tmp_path
     assert "external cancellation" in marked.call_args.args[2]
     assert "shutdown" not in marked.call_args.args[2].lower()
     assert "external cancellation" in finished.call_args.kwargs["error"]
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_outputs", "expected_deliveries"),
+    [("before_output", 0, 0), ("after_delivery", 1, 1)],
+)
+def test_grace_expiry_keeps_uncertain_cause_to_both_terminals(
+    monkeypatch, tmp_path, phase, expected_outputs, expected_deliveries
+):
+    """Fence release after grace must not relabel uncertainty as shutdown."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    home = tmp_path / phase
+    home.mkdir()
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+
+    outputs = []
+    deliveries = []
+    release = threading.Event()
+    locked = threading.Event()
+
+    with jobs.use_cron_store(home):
+        stored = jobs.create_job(prompt="sandbox", schedule="every 5m", name=phase)
+        assert jobs.claim_job_for_fire(stored["id"])
+        job = jobs.get_job(stored["id"])
+        execution = executions.create_execution(job["id"], source="direct")
+        job["execution_id"] = execution["id"]
+        job["deliver"] = "local"
+
+        def hold_fence():
+            with jobs.use_cron_store(home):
+                with jobs.fire_claim_fence(job["id"], expected_owner=job["fire_claim"]["by"]):
+                    locked.set()
+                    assert release.wait(timeout=1)
+
+        def run_job(_job, **kwargs):
+            if phase == "before_output":
+                holder = threading.Thread(target=hold_fence)
+                holder.start()
+                assert locked.wait(timeout=1)
+                assert kwargs["cancel_event"].wait(timeout=1)
+                release.set()
+                holder.join(timeout=1)
+                assert not holder.is_alive()
+            return True, "sandbox-output", "sandbox-response", None
+
+        def deliver(_job, _content, **_kwargs):
+            deliveries.append(True)
+            if phase == "after_delivery":
+                holder = threading.Thread(target=hold_fence)
+                holder.start()
+                assert locked.wait(timeout=1)
+                # The heartbeat thread reaches bounded grace while this real
+                # fence is held; release without changing the owner.
+                time.sleep(0.08)
+                release.set()
+                holder.join(timeout=1)
+                assert not holder.is_alive()
+
+        monkeypatch.setattr(scheduler, "run_job", run_job)
+        monkeypatch.setattr(scheduler, "_deliver_result", deliver)
+        monkeypatch.setattr(
+            scheduler,
+            "save_job_output",
+            lambda *_args: outputs.append(True) or "output.md",
+        )
+        assert scheduler.run_one_job(job) is True
+        final = executions.get_execution(execution["id"])
+
+    assert final["status"] == "failed"
+    assert "shutdown" not in (final["error"] or "").lower()
+    assert len(outputs) == expected_outputs
+    assert len(deliveries) == expected_deliveries
