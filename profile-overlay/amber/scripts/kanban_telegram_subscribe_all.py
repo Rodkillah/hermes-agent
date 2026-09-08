@@ -124,6 +124,17 @@ def _write_private_json(path: Path, payload: Mapping[str, Any], *, exclusive: bo
         if fd >= 0:
             os.close(fd)
     try:
+        # The byte write used the verified parent, but pathname publication
+        # happens afterwards.  Refuse if that parent was replaced in between:
+        # otherwise link()/replace() can publish a durable record below an
+        # attacker-controlled symlink after the database transaction started.
+        parent_final = path.parent.lstat()
+        if (
+            stat.S_ISLNK(parent_final.st_mode)
+            or parent_final.st_dev != parent_before.st_dev
+            or parent_final.st_ino != parent_before.st_ino
+        ):
+            raise RuntimeError("journal parent changed before private publication")
         if exclusive:
             # link() is an exclusive publish: unlike rename(), it never
             # replaces a prepared/committed record created by another writer.
@@ -188,6 +199,18 @@ def _read_regular_json(path: Path, *, label: str) -> tuple[dict[str, Any], bytes
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise RuntimeError(f"{label} is unsafe")
     raw = path.read_bytes()
+    # ``Path.read_bytes`` opens by pathname.  Verify that the exact regular
+    # leaf observed above still occupies that name before accepting its bytes;
+    # a rename-to-symlink race is an unsafe marker, never a valid recovery
+    # record.  The private journal root is additionally serialized by LOCK_PATH.
+    after = path.lstat()
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_dev != info.st_dev
+        or after.st_ino != info.st_ino
+    ):
+        raise RuntimeError(f"{label} changed while being read")
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

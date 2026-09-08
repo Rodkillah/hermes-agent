@@ -301,6 +301,9 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        # Guarded compare-and-mutate callers may require this real fence;
+        # ordinary scheduler writes keep the historical degraded behaviour.
+        _jobs_lock_state.cross_process_locked = False
         # Stamp of jobs.json as of this section's load_jobs() (#80703's
         # fast-path, credit @JoaoMarcos44): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed since this
@@ -332,6 +335,7 @@ def _jobs_lock():
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            _jobs_lock_state.cross_process_locked = True
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
@@ -352,6 +356,7 @@ def _jobs_lock():
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    _jobs_lock_state.cross_process_locked = True
             except (OSError, IOError) as e:
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
@@ -373,6 +378,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.cross_process_locked = False
 
 
 @contextlib.contextmanager
@@ -2660,8 +2666,18 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed."""
+def update_job(
+    job_id: str,
+    updates: Dict[str, Any],
+    *,
+    expected: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update a job by ID, optionally guarded by an exact current-field image.
+
+    Guarded calls compare and mutate within this function's same native
+    cross-process lock. They refuse if that fence degraded, while ordinary
+    scheduler writes retain the established availability-first fallback.
+    """
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -2672,10 +2688,18 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         )
 
     with _jobs_lock():
+        if expected is not None:
+            if not isinstance(expected, dict):
+                raise ValueError("expected cron fields must be a mapping")
+            if not _jobs_lock_state.cross_process_locked:
+                raise RuntimeError("guarded cron update requires cross-process jobs lock")
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            if expected is not None and any(job.get(key) != value for key, value in expected.items()):
+                return None
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).

@@ -290,6 +290,15 @@ def restore_file_from_private_preimage(
         shutil.copy2(staged_preimage, temporary)
         if file_state(temporary) != preimage:
             raise RuntimeError("private pre-image changed during guarded restore")
+        # ``link`` makes this inode visible under the target name.  The copied
+        # bytes and mode must reach stable storage first; syncing only the
+        # parent directory would make the name durable without its contents.
+        preimage_fd = os.open(temporary, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(preimage_fd)
+        finally:
+            os.close(preimage_fd)
+        _fsync_parent(temporary)
         if file_state(parked) != expected_postimage:
             raise RuntimeError("runtime file changed during guarded restore")
         try:
@@ -409,15 +418,13 @@ def run_file_job_restore(root: Path):
         assert activated and activated["enabled"] is True
         paused = cron_jobs.pause_job(observed["id"], reason="private rollback verifier")
         assert paused and paused["enabled"] is False and paused["state"] == "paused"
-        # The public API owns its lock, so make a harmless guarded probe first,
-        # then re-read every administrative field before the restoring update.
-        # A concurrent native update between pause and restore is a conflict,
-        # never a value to overwrite with the stale pre-image.
+        # Compare and restore under ONE native cross-process jobs lock. A lock
+        # timeout or concurrent native update is a conflict, never a stale
+        # overwrite of administrative cron state.
         post_admin = {key: paused.get(key) for key in admin}
-        probe = cron_jobs.update_job(observed["id"], {"next_run_at": post_admin["next_run_at"]})
-        if not probe or any(probe.get(key) != value for key, value in post_admin.items()):
+        restored = cron_jobs.update_job(observed["id"], admin, expected=post_admin)
+        if restored is None:
             raise RuntimeError("cron administrative state changed before guarded restore")
-        restored = cron_jobs.update_job(observed["id"], admin)
         assert restored and all(restored.get(key) == value for key, value in admin.items())
     finally:
         cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR = original_constants
