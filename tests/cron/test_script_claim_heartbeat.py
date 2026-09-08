@@ -715,3 +715,45 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
         success=False,
         error="Fire claim ownership lost before terminal completion.",
     )
+
+
+def test_external_cancellation_is_not_reported_as_shutdown(monkeypatch, tmp_path):
+    """A real transport cancel keeps provenance separate from owner loss."""
+    import cron.scheduler as scheduler
+
+    cancel = threading.Event()
+    marked = MagicMock()
+    finished = MagicMock()
+
+    def run_job(_job, *, cancel_event=None, **_kwargs):
+        assert cancel_event is not None
+        cancel_event.set()
+        return True, "output", "response", None
+
+    job = {
+        "id": "external-cancel",
+        "execution_id": "external-cancel-execution",
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
+    }
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: {})
+    monkeypatch.setattr(scheduler, "run_job", run_job)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "output.md")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", marked)
+    monkeypatch.setattr(scheduler, "finish_execution", finished)
+
+    with patch("agent.secret_scope.set_secret_scope", return_value=None), \
+         patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
+         patch("agent.secret_scope.reset_secret_scope"), \
+         patch("tools.terminal_scope.install_profile_terminal_scope", return_value=None), \
+         patch("tools.terminal_scope.reset_terminal_scope"):
+        assert scheduler.run_one_job(job, cancel_event=cancel) is True
+
+    assert marked.call_args.args[1] is False
+    assert "external cancellation" in marked.call_args.args[2]
+    assert "shutdown" not in marked.call_args.args[2].lower()
+    assert "external cancellation" in finished.call_args.kwargs["error"]

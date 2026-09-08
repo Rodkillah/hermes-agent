@@ -860,6 +860,27 @@ class _CombinedCancelEvent:
             event.set()
 
 
+class _FireClaimSignal(threading.Event):
+    """Cancellation-compatible fire-claim signal with loss provenance.
+
+    A heartbeat grace expiry means the result is uncertain; it is not proof
+    that a replacement owner exists. Keeping that provenance beside the
+    event prevents terminal bookkeeping from relabelling uncertainty as a
+    shutdown or confirmed owner loss after a contended fence is released.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reason: Optional[str] = None
+        self._reason_lock = threading.Lock()
+
+    def set_reason(self, reason: str) -> None:
+        with self._reason_lock:
+            if self.reason is None:
+                self.reason = reason
+        super().set()
+
+
 def get_running_job_ids() -> "frozenset[str]":
     """Thread-safe snapshot of cron job IDs currently executing.
 
@@ -7311,7 +7332,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
-    lost_ownership = threading.Event()
+    lost_ownership = _FireClaimSignal()
     heartbeat_context = contextvars.copy_context()
 
     def _finish_unstarted(error: str) -> None:
@@ -7362,7 +7383,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
-                    lost_ownership.set()
+                    lost_ownership.set_reason("confirmed_lost")
                     logger.warning(
                         "Job '%s': fire claim ownership lost; interrupting stale run",
                         job_id,
@@ -7378,7 +7399,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                     time.monotonic() - last_confirmed
                     >= _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS
                 ):
-                    lost_ownership.set()
+                    lost_ownership.set_reason("uncertain")
                     logger.warning(
                         "Job '%s': fire claim fence remained contended for "
                         "%.1fs; interrupting uncertain run",
@@ -7396,7 +7417,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                     time.monotonic() - last_confirmed
                     >= _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS
                 ):
-                    lost_ownership.set()
+                    lost_ownership.set_reason("uncertain")
                     logger.warning(
                         "Job '%s': fire_claim could not be renewed within %.1fs; "
                         "interrupting uncertain run",
@@ -7505,23 +7526,29 @@ def run_one_job(
             fire_owner or None,
             profile_home,
         )
-    try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
-                job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
-                ),
-                execution_token=execution_token,
-            ),
+    heartbeat_signal = []
+
+    def _run_body_with_signal(signal):
+        heartbeat_signal.append(signal)
+        combined_cancel = (
+            _CombinedCancelEvent(signal, cancel_event)
+            if cancel_event is not None
+            else signal
         )
+        return _run_one_job_body(
+            job,
+            adapters=adapters,
+            loop=loop,
+            verbose=verbose,
+            extra_prompt=extra_prompt,
+            fire_claim_lost=combined_cancel,
+            fire_claim_signal=signal,
+            cancel_event=cancel_event,
+            execution_token=execution_token,
+        )
+
+    try:
+        return _run_with_fire_claim_heartbeat(job, _run_body_with_signal)
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])
@@ -7539,6 +7566,8 @@ def _run_one_job_body(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
+    fire_claim_signal: Optional[_FireClaimSignal] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
     claim = job.get("fire_claim")
@@ -7553,7 +7582,9 @@ def _run_one_job_body(
         return fire_claim_fence(job["id"], expected_owner=fire_owner)
 
     def _fire_claim_ownership_lost() -> bool:
-        if fire_claim_lost is not None and fire_claim_lost.is_set():
+        if fire_claim_signal is not None and fire_claim_signal.is_set():
+            return True
+        if fire_claim_lost is not None and fire_claim_signal is None and fire_claim_lost.is_set():
             return True
         if fire_owner is None:
             return False
@@ -7573,7 +7604,10 @@ def _run_one_job_body(
             )
             return False
         if fire_claim_lost is not None:
-            fire_claim_lost.set()
+            if fire_claim_signal is not None:
+                fire_claim_signal.set_reason("confirmed_lost")
+            else:
+                fire_claim_lost.set()
         return True
 
     execution_id = job.get("execution_id")
@@ -7687,43 +7721,41 @@ def _run_one_job_body(
             raise
         # The outer finally resets the scope after delivery and bookkeeping.
 
-        if _fire_claim_ownership_lost():
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
-            # Distinguish a real ownership loss (TTL expiry / replacement
-            # claim) from a transport-level cancel (dashboard drain): in the
-            # latter case WE still own the claim, and silently discarding
-            # would leave fire_claim lingering until TTL and last_status
-            # stale. Probe ownership once; if still ours, record the
-            # interruption through the owner-fenced terminal write.
+        if _fire_claim_ownership_lost() or (
+            cancel_event is not None and cancel_event.is_set()
+        ):
+            signal_reason = fire_claim_signal.reason if fire_claim_signal else None
             if fire_owner is not None:
                 try:
                     still_owns_fire_claim = heartbeat_fire_claim(
                         job["id"], expected_owner=fire_owner,
                     )
                 except FireClaimFenceContention:
-                    finish_execution(
-                        execution_id,
-                        success=False,
-                        error=(
-                            "Fire claim ownership could not be verified after "
-                            "bounded heartbeat grace; result was discarded."
-                        ),
-                    )
-                    return True
+                    still_owns_fire_claim = None
+                except Exception:
+                    still_owns_fire_claim = None
             else:
                 still_owns_fire_claim = False
-            if still_owns_fire_claim:
+            if still_owns_fire_claim is True and signal_reason == "uncertain":
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error=(
+                        "Fire claim ownership uncertain after bounded heartbeat "
+                        "grace; result was discarded without delivery."
+                    ),
+                )
+            elif still_owns_fire_claim is True and cancel_event is not None and cancel_event.is_set():
                 mark_job_run(
                     job["id"],
                     False,
-                    "Interrupted by shutdown before terminal completion.",
+                    "Interrupted by external cancellation before terminal completion.",
                     expected_fire_owner=fire_owner,
                 )
                 finish_execution(
                     execution_id,
                     success=False,
-                    error="Interrupted by shutdown before terminal completion.",
+                    error="Interrupted by external cancellation before terminal completion.",
                 )
             else:
                 finish_execution(
@@ -7898,38 +7930,51 @@ def _run_one_job_body(
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
 
-        if side_effect_ownership_lost or _fire_claim_ownership_lost():
-            # Same transport-cancel distinction as the pre-side-effect path:
-            # if WE still own the claim, record the interruption instead of
-            # discarding silently (lingering claim + stale last_status).
+        if side_effect_ownership_lost or _fire_claim_ownership_lost() or (
+            cancel_event is not None and cancel_event.is_set()
+        ):
+            signal_reason = fire_claim_signal.reason if fire_claim_signal else None
             if fire_owner is not None:
                 try:
                     still_owns_fire_claim = heartbeat_fire_claim(
                         job["id"], expected_owner=fire_owner,
                     )
                 except FireClaimFenceContention:
-                    finish_execution(
-                        execution_id,
-                        success=False,
-                        error=(
-                            "Fire claim ownership could not be verified after "
-                            "bounded heartbeat grace; result was discarded."
-                        ),
-                    )
-                    return True
+                    still_owns_fire_claim = None
+                except Exception:
+                    still_owns_fire_claim = None
             else:
                 still_owns_fire_claim = False
-            if still_owns_fire_claim:
+            if still_owns_fire_claim is True and (
+                signal_reason == "uncertain" or side_effect_ownership_lost
+            ):
                 mark_job_run(
                     job["id"],
                     False,
-                    "Interrupted by shutdown before terminal completion.",
+                    "Fire claim ownership uncertain after bounded heartbeat grace; "
+                    "result was not re-emitted.",
                     expected_fire_owner=fire_owner,
                 )
                 finish_execution(
                     execution_id,
                     success=False,
-                    error="Interrupted by shutdown before terminal completion.",
+                    error=(
+                        "Fire claim ownership uncertain after bounded heartbeat "
+                        "grace; result was not re-emitted."
+                    ),
+                    delivery_outcome="uncertain",
+                )
+            elif still_owns_fire_claim is True and cancel_event is not None and cancel_event.is_set():
+                mark_job_run(
+                    job["id"],
+                    False,
+                    "Interrupted by external cancellation before terminal completion.",
+                    expected_fire_owner=fire_owner,
+                )
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error="Interrupted by external cancellation before terminal completion.",
                 )
             else:
                 finish_execution(
