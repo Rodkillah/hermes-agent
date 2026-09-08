@@ -146,6 +146,9 @@ def _write_private_json_at(
     exclusive: bool,
     anchor_fd: int | None = None,
     anchor_name: str | None = None,
+    domain_parent_fd: int | None = None,
+    domain_name: str | None = None,
+    domain_fd: int | None = None,
 ) -> None:
     """Durably publish one JSON record through anchored directory handles."""
     data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -167,28 +170,51 @@ def _write_private_json_at(
     finally:
         if fd >= 0:
             os.close(fd)
-    try:
+    def attached() -> bool:
         if anchor_fd is not None and anchor_name is not None and not _same_directory_entry(
             anchor_fd, anchor_name, parent_fd
         ):
-            raise RuntimeError("journal batch detached before private publication")
+            return False
+        return not (
+            domain_parent_fd is not None
+            and domain_name is not None
+            and domain_fd is not None
+            and not _same_directory_entry(domain_parent_fd, domain_name, domain_fd)
+        )
+
+    published_identity: tuple[int, int] | None = None
+    detached_after_publish = False
+    try:
+        if not attached():
+            raise RuntimeError("journal recovery domain detached before private publication")
         if exclusive:
             os.link(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
             os.unlink(temporary, dir_fd=parent_fd)
         else:
             os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.chmod(name, 0o600, dir_fd=parent_fd, follow_symlinks=False)
-        if anchor_fd is not None and anchor_name is not None and not _same_directory_entry(
-            anchor_fd, anchor_name, parent_fd
-        ):
-            # The record may have been written through the still-open original
-            # descriptor after its batch was renamed.  Remove it there before
-            # refusing the SQLite transaction; never leave recovery material
-            # outside JOURNAL_ROOT.
-            os.unlink(name, dir_fd=parent_fd)
-            raise RuntimeError("journal batch detached during private publication")
+        published = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(published.st_mode):
+            raise RuntimeError("journal marker publication is unsafe")
+        published_identity = (published.st_dev, published.st_ino)
         os.fsync(parent_fd)
+        # A held directory descriptor prevents symlink redirection. A
+        # same-UID rename can nevertheless detach the recovery root after the
+        # final publication syscall; detect it after the durability boundary,
+        # remove only our inode through the old handle, and let the SQLite
+        # transaction roll back before COMMIT.
+        if not attached():
+            detached_after_publish = True
+            raise RuntimeError("journal recovery domain detached during private publication")
     except Exception:
+        if detached_after_publish and published_identity is not None:
+            try:
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == published_identity:
+                    os.unlink(name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+            except (FileNotFoundError, OSError):
+                pass
         try:
             os.unlink(temporary, dir_fd=parent_fd)
         except FileNotFoundError:
@@ -238,8 +264,12 @@ def _read_regular_json_at(parent_fd: int, name: str, *, label: str) -> tuple[dic
     """Read a marker by descriptor, never resolving its parent again."""
     try:
         fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=parent_fd)
-    except (FileNotFoundError, OSError) as exc:
+    except FileNotFoundError as exc:
         raise RuntimeError(f"{label} is missing") from exc
+    except OSError as exc:
+        # ELOOP, permission failures and special-file open failures are unsafe
+        # recovery evidence, never an absent batch.
+        raise RuntimeError(f"{label} cannot be opened safely") from exc
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -317,11 +347,26 @@ class BatchJournal:
     """Crash-recoverable private journal for one mutative reconciliation batch."""
 
     def __init__(self, root: Path, *, phase: str = "forward"):
-        _private_directory(root)
-        self.root = root
-        self.root_fd = _open_safe_directory(root)
+        self.root = root.absolute()
+        _private_directory(self.root)
+        self.root_parent = self.root.parent
+        self.root_parent_fd = _open_safe_directory(self.root_parent)
+        self.root_name = self.root.name
+        try:
+            self.root_fd = os.open(
+                self.root_name,
+                os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW,
+                dir_fd=self.root_parent_fd,
+            )
+        except Exception:
+            os.close(self.root_parent_fd)
+            raise
+        if not _same_directory_entry(self.root_parent_fd, self.root_name, self.root_fd):
+            os.close(self.root_fd)
+            os.close(self.root_parent_fd)
+            raise RuntimeError("journal recovery root detached during open")
         self.batch_id = uuid.uuid4().hex
-        self.path = root / self.batch_id
+        self.path = self.root / self.batch_id
         try:
             os.mkdir(self.batch_id, 0o700, dir_fd=self.root_fd)
             self.batch_fd = os.open(
@@ -331,6 +376,7 @@ class BatchJournal:
             )
         except Exception:
             os.close(self.root_fd)
+            os.close(self.root_parent_fd)
             raise
         os.fsync(self.root_fd)
         self.phase = phase
@@ -338,6 +384,8 @@ class BatchJournal:
         self.committed_path = self.path / "committed.json"
 
     def _assert_attached(self) -> None:
+        if not _same_directory_entry(self.root_parent_fd, self.root_name, self.root_fd):
+            raise RuntimeError("journal recovery root detached from parent")
         if not _same_directory_entry(self.root_fd, self.batch_id, self.batch_fd):
             raise RuntimeError("journal batch detached from root")
 
@@ -345,8 +393,10 @@ class BatchJournal:
         self._assert_attached()
         try:
             fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=self.batch_fd)
-        except OSError as exc:
+        except FileNotFoundError as exc:
             raise RuntimeError(f"{label} is missing") from exc
+        except OSError as exc:
+            raise RuntimeError(f"{label} cannot be opened safely") from exc
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
@@ -372,6 +422,9 @@ class BatchJournal:
             exclusive=True,
             anchor_fd=self.root_fd,
             anchor_name=self.batch_id,
+            domain_parent_fd=self.root_parent_fd,
+            domain_name=self.root_name,
+            domain_fd=self.root_fd,
         )
 
     def mark_committed(self) -> None:
@@ -389,6 +442,9 @@ class BatchJournal:
             exclusive=True,
             anchor_fd=self.root_fd,
             anchor_name=self.batch_id,
+            domain_parent_fd=self.root_parent_fd,
+            domain_name=self.root_name,
+            domain_fd=self.root_fd,
         )
 
     @staticmethod

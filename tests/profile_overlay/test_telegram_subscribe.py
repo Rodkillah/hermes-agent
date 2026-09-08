@@ -595,7 +595,8 @@ def test_recovery_reads_marker_via_anchored_nofollow_descriptor(monkeypatch, db,
             return original_open(path, flags, *args, **kwargs)
 
         monkeypatch.setattr(mod.os, "open", open_at)
-        mod.BatchJournal.recover_pending(conn, root)
+        with pytest.raises(RuntimeError, match="cannot be opened safely"):
+            mod.BatchJournal.recover_pending(conn, root)
         assert injected
         assert kb.list_notify_subs(conn, forge)[0]["notifier_profile"] == "forge"
     finally:

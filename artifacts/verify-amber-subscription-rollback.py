@@ -377,18 +377,10 @@ def run_file_job_restore(root: Path):
         assert file_hash(target) == file_hash(candidate)
         assert file_mode(target) == file_mode(candidate)
 
-    # Restore through conditional pathname creation, not hash-check then copy.
-    # Production activation additionally holds the job/gateway quiescence gate;
-    # this copy-only verifier proves that a post-guard name conflict is refused
-    # without overwriting the concurrent content.
-    for target, candidate, staged_pre, pre_hash, pre_mode in preimages:
-        restore_file_from_private_preimage(
-            target,
-            staged_pre,
-            expected_postimage=(file_hash(candidate), file_mode(candidate)),
-        )
-        assert file_hash(target) == pre_hash
-        assert file_mode(target) == pre_mode
+    # Keep all candidate copies installed until the guarded native job restore
+    # has completed. The production rollback must not depend on an already
+    # imported in-memory copy of cron.jobs after its on-disk candidate has been
+    # replaced by old code.
 
     # Read the real existing job document, then route cron.jobs through an
     # isolated copy.  Only the named job's administrative fields may change;
@@ -447,22 +439,83 @@ def run_file_job_restore(root: Path):
         job for job in raw_jobs if job.get("id") != original["id"]
     ]
 
+    # Only after the guarded job state has returned through the candidate code
+    # may the three exact runtime files be conditionally restored to their
+    # private pre-images. This is a pathname-CAS, never hash-check then copy.
+    for target, candidate, staged_pre, pre_hash, pre_mode in preimages:
+        restore_file_from_private_preimage(
+            target,
+            staged_pre,
+            expected_postimage=(file_hash(candidate), file_mode(candidate)),
+        )
+        assert file_hash(target) == pre_hash
+        assert file_mode(target) == pre_mode
+
+
+def run_full_rollback_recipe(root: Path):
+    """Exercise one ordered private rollback: lock, recovery, inverse, job, files.
+
+    The recipe intentionally uses the same private root for its disposable
+    board, durable journal, job document and runtime-file copies. It is not a
+    collection of nominal helpers on unrelated fixtures.
+    """
+    root.mkdir(mode=0o700)
+    db = root / "kanban.db"
+    kb.init_db(db)
+    private_lock = root / "historical-reconciliation.lock"
+    previous_root, previous_lock = module.JOURNAL_ROOT, module.LOCK_PATH
+    module.JOURNAL_ROOT = root / "journals"
+    module.LOCK_PATH = private_lock
+    try:
+        with private_lock.open("a+") as lock_file:
+            import fcntl
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            conn = kb.connect(db)
+            try:
+                anchor = seed(conn, owner="amber")
+                forge = seed(conn, owner="forge")
+                notify_only = seed(conn, owner="amber", mode="notify")
+                created = seed(conn)
+                human = seed(conn, owner="human", chat_id="human-chat")
+                for task_id in (forge, notify_only, created):
+                    unread(conn, task_id)
+                before = {
+                    task_id: dict(kb.list_notify_subs(conn, task_id)[0])
+                    for task_id in (anchor, forge, notify_only, human)
+                }
+                BatchJournal = module.BatchJournal
+                BatchJournal.recover_pending(conn, module.JOURNAL_ROOT)
+                batch = BatchJournal(module.JOURNAL_ROOT)
+                journal: list[dict[str, object]] = []
+                applied = module.reconcile(conn, journal=journal, prepare_journal=batch.prepare)
+                assert applied["changed"] == 4 and len(journal) == 4
+                batch.mark_committed()
+                key = dict(task_id=forge, platform="telegram", chat_id="chat", thread_id="thread")
+                _, advanced_cursor, claimed = kb.claim_unseen_events_for_sub(conn, **key)
+                assert claimed and advanced_cursor > before[forge]["last_event_id"]
+                assert module.rollback_journal(conn, journal) == 4
+                assert kb.list_notify_subs(conn, created) == []
+                assert kb.list_notify_subs(conn, forge)[0]["last_event_id"] == advanced_cursor
+                assert dict(kb.list_notify_subs(conn, human)[0]) == before[human]
+                assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            finally:
+                conn.close()
+            run_file_job_restore(root / "runtime")
+    finally:
+        module.JOURNAL_ROOT, module.LOCK_PATH = previous_root, previous_lock
+
 
 with tempfile.TemporaryDirectory(prefix="amber-subscription-rollback-") as temp:
     root = Path(temp)
-    # rollback_journal writes an inverse marker too.  Keep the verifier fully
-    # private even though it imports the exact candidate overlay module.
-    module.JOURNAL_ROOT = root / "journals"
-    migrated, advanced_cursor = run_nominal(root / "nominal.db")
+    run_full_rollback_recipe(root / "complete")
+    # The separate conflict fixture verifies that the ordered happy-path recipe
+    # above does not weaken the fail-closed concurrent-owner guard.
+    module.JOURNAL_ROOT = root / "conflict-journals"
     run_conflict(root / "conflict.db")
-    run_file_job_restore(root / "files")
 
 print(json.dumps({
-    "migration": migrated,
-    "advanced_cursor_preserved": advanced_cursor,
-    "rollback": "native guarded pre/post-image inverse",
+    "rollback_recipe": "locked recovery -> native inverse -> guarded job -> files",
     "concurrent_conflict": "rejected without overwrite",
-    "replay": "idempotent",
     "quick_check": "ok",
 }, sort_keys=True))
 print("targeted Amber rollback verifier: PASS")
