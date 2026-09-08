@@ -6,8 +6,8 @@ Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
 - Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
-- Implémentation exacte de ce rework: `ae6d32788d9a132bc3a8b327765eb3576a1d8dfc` (parent `14f860d24a0580239c326be3dd15724f8732b020`).
-- Fichiers de ce rework: `artifacts/verify-amber-subscription-rollback.py`, `cron/jobs.py`, `hermes_cli/kanban_db.py`.
+- Implémentation exacte de ce rework: `e3f8421026` (parent `4c69a96943372ec34526130dfd631ab4ba4dcd44`).
+- Fichiers de ce rework: `artifacts/verify-amber-subscription-rollback.py`, `artifacts/amber-subscription-rollback-manifest.md`.
 - Le worktree candidat doit être relu propre et le SHA final exact doit être gelé avant revue; aucun autre SHA ne vaut candidat.
 
 ## Autorité et atomicité
@@ -29,9 +29,9 @@ Publication: manifeste temporaire écrit et fsyncé, répertoire fsyncé, rempla
 
 - `python -m pytest -q tests/profile_overlay/test_telegram_subscribe.py tests/profile_overlay/test_telegram_subscription_batches.py` → 21 passed, rc 0.
 - `python -m pytest -q tests/hermes_cli/test_kanban_notify.py tests/hermes_cli/test_kanban_notify_owner_transfer.py tests/hermes_cli/test_kanban_review_lifecycle_complete.py tests/hermes_cli/test_kanban_db_init.py tests/cron/test_jobs_crossprocess_lock.py` → 65 passed, rc 0.
-- Revue indépendante confinée, `test_review_round10.py test_review_round11.py test_review_round12_supplement.py test_review_round13_contract.py` → 64 passed, 2 failures, rc 1. Les deux échecs sont les anciens seams qui injectent un SIGKILL en interceptant `Path.open/write_text` sur le chemin primaire; ils n'observent plus l'implémentation atomique par fichier temporaire + `os.replace`. Les nouveaux contrôles métier R13 sont 8/8 verts; la réexécution de ces deux seams doit être adaptée à la frontière atomique, sans réintroduire une écriture primaire tronquante.
+- Contrat indépendant R14 (`test_review_round14_contract.py`) → 11 passed, rc 0. Il couvre le refus sans effet d'un paquet absent/malformé/incomplet ou en conflit, l'usage exclusif des post-images durables, l'ordre inverse → CAS job → fichiers, le replay sans second effet et la récupération `.previous`.
 - `env -u HERMES_KANBAN_TASK -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD python artifacts/verify-amber-subscription-rollback.py` → `targeted Amber rollback verifier: PASS`, `quick_check=ok`, conflit concurrent refusé sans overwrite, rc 0.
-- `python3 -m py_compile artifacts/verify-amber-subscription-rollback.py cron/jobs.py hermes_cli/kanban_db.py` → rc 0; `git diff --check` → rc 0 avant commit.
+- `python3 -m py_compile artifacts/verify-amber-subscription-rollback.py cron/jobs.py hermes_cli/kanban_db.py` → rc 0; `git diff --check HEAD^ HEAD` → rc 0.
 
 ## Préconditions de gate (non réalisées)
 
