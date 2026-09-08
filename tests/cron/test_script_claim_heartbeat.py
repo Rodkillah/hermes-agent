@@ -775,7 +775,7 @@ def test_grace_expiry_keeps_uncertain_cause_to_both_terminals(
     home.mkdir()
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
-    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.15)
     monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
 
@@ -817,7 +817,7 @@ def test_grace_expiry_keeps_uncertain_cause_to_both_terminals(
                 assert locked.wait(timeout=1)
                 # The heartbeat thread reaches bounded grace while this real
                 # fence is held; release without changing the owner.
-                time.sleep(0.08)
+                time.sleep(0.25)
                 release.set()
                 holder.join(timeout=1)
                 assert not holder.is_alive()
@@ -836,3 +836,62 @@ def test_grace_expiry_keeps_uncertain_cause_to_both_terminals(
     assert "shutdown" not in (final["error"] or "").lower()
     assert len(outputs) == expected_outputs
     assert len(deliveries) == expected_deliveries
+
+
+def test_external_cancel_after_save_prevents_delivery_and_finalizes_job(
+    monkeypatch, tmp_path
+):
+    """A transport cancel raised after save must block delivery and clear the claim."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    home = tmp_path / "cancel-after-save"
+    home.mkdir()
+    cancel = threading.Event()
+    delivered = []
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: {})
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda *_args, **_kwargs: (True, "output", "response", None),
+    )
+
+    def save_output(*_args, **_kwargs):
+        cancel.set()
+        return "output.md"
+
+    monkeypatch.setattr(scheduler, "save_job_output", save_output)
+    monkeypatch.setattr(
+        scheduler, "_deliver_result", lambda *_args, **_kwargs: delivered.append(True)
+    )
+
+    with jobs.use_cron_store(home):
+        job = jobs.create_job(prompt="x", schedule="every 5m", name="cancel-after-save")
+        assert jobs.claim_job_for_fire(job["id"])
+        claimed = jobs.get_job(job["id"])
+        execution = executions.create_execution(claimed["id"], source="direct")
+        claimed["execution_id"] = execution["id"]
+        claimed["deliver"] = "local"
+        with (
+            patch("agent.secret_scope.set_secret_scope", return_value=None),
+            patch("agent.secret_scope.build_profile_secret_scope", return_value=None),
+            patch("agent.secret_scope.reset_secret_scope"),
+            patch("tools.terminal_scope.install_profile_terminal_scope", return_value=None),
+            patch("tools.terminal_scope.reset_terminal_scope"),
+        ):
+            assert scheduler.run_one_job(claimed, cancel_event=cancel) is True
+        final_job = jobs.get_job(claimed["id"])
+        final_execution = executions.get_execution(execution["id"])
+
+    assert delivered == []
+    assert final_job["last_status"] == "error"
+    assert final_job["fire_claim"] is None
+    assert "external cancellation" in final_job["last_error"]
+    assert final_execution["status"] == "failed"
+    assert "external cancellation" in final_execution["error"]

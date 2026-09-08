@@ -723,6 +723,7 @@ from cron.jobs import (
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
+    mark_job_run_owner_fenced,
     save_job_output,
     use_cron_store,
 )
@@ -7721,6 +7722,8 @@ def _run_one_job_body(
         if _fire_claim_ownership_lost() or (
             cancel_event is not None and cancel_event.is_set()
         ):
+            for _deferred_agent in _deferred_agents:
+                _teardown_cron_agent(_deferred_agent, job["id"])
             signal_reason = fire_claim_signal.reason if fire_claim_signal else None
             if fire_owner is not None:
                 try:
@@ -7733,16 +7736,28 @@ def _run_one_job_body(
                     still_owns_fire_claim = None
             else:
                 still_owns_fire_claim = False
-            if still_owns_fire_claim is True and signal_reason == "uncertain":
+            if signal_reason == "uncertain" and still_owns_fire_claim is not False:
+                uncertain_error = (
+                    "Fire claim ownership uncertain after bounded heartbeat "
+                    "grace; result was discarded without delivery."
+                )
+                mark_job_run_owner_fenced(
+                    job["id"],
+                    False,
+                    uncertain_error,
+                    expected_fire_owner=fire_owner,
+                )
                 finish_execution(
                     execution_id,
                     success=False,
-                    error=(
-                        "Fire claim ownership uncertain after bounded heartbeat "
-                        "grace; result was discarded without delivery."
-                    ),
+                    error=uncertain_error,
+                    delivery_outcome="uncertain",
                 )
-            elif still_owns_fire_claim is True and cancel_event is not None and cancel_event.is_set():
+            elif (
+                cancel_event is not None
+                and cancel_event.is_set()
+                and still_owns_fire_claim is not False
+            ):
                 mark_job_run(
                     job["id"],
                     False,
@@ -7754,11 +7769,28 @@ def _run_one_job_body(
                     success=False,
                     error="Interrupted by external cancellation before terminal completion.",
                 )
-            else:
+            elif still_owns_fire_claim is False or signal_reason == "confirmed_lost":
                 finish_execution(
                     execution_id,
                     success=False,
                     error="Fire claim ownership lost; stale result was discarded.",
+                )
+            else:
+                uncertain_error = (
+                    "Fire claim ownership could not be validated at terminal "
+                    "completion; result was discarded without delivery."
+                )
+                mark_job_run_owner_fenced(
+                    job["id"],
+                    False,
+                    uncertain_error,
+                    expected_fire_owner=fire_owner,
+                )
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error=uncertain_error,
+                    delivery_outcome="uncertain",
                 )
             return True
 
@@ -7885,7 +7917,10 @@ def _run_one_job_body(
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
-            if should_deliver and _fire_claim_ownership_lost():
+            if should_deliver and (
+                _fire_claim_ownership_lost()
+                or (cancel_event is not None and cancel_event.is_set())
+            ):
                 should_deliver = False
                 logger.warning(
                     "Job '%s': skipping delivery after fire claim ownership loss",
@@ -7942,26 +7977,12 @@ def _run_one_job_body(
                     still_owns_fire_claim = None
             else:
                 still_owns_fire_claim = False
-            if still_owns_fire_claim is True and (
-                signal_reason == "uncertain" or side_effect_ownership_lost
+            if (
+                cancel_event is not None
+                and cancel_event.is_set()
+                and not side_effect_ownership_lost
+                and still_owns_fire_claim is not False
             ):
-                mark_job_run(
-                    job["id"],
-                    False,
-                    "Fire claim ownership uncertain after bounded heartbeat grace; "
-                    "result was not re-emitted.",
-                    expected_fire_owner=fire_owner,
-                )
-                finish_execution(
-                    execution_id,
-                    success=False,
-                    error=(
-                        "Fire claim ownership uncertain after bounded heartbeat "
-                        "grace; result was not re-emitted."
-                    ),
-                    delivery_outcome="uncertain",
-                )
-            elif still_owns_fire_claim is True and cancel_event is not None and cancel_event.is_set():
                 mark_job_run(
                     job["id"],
                     False,
@@ -7972,6 +7993,36 @@ def _run_one_job_body(
                     execution_id,
                     success=False,
                     error="Interrupted by external cancellation before terminal completion.",
+                )
+            elif (
+                signal_reason == "confirmed_lost"
+                or still_owns_fire_claim is False
+            ):
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error="Fire claim ownership lost; stale result was discarded.",
+                )
+            elif (
+                signal_reason == "uncertain"
+                or side_effect_ownership_lost
+                or still_owns_fire_claim is None
+            ):
+                uncertain_error = (
+                    "Fire claim ownership uncertain after bounded heartbeat grace; "
+                    "result was not re-emitted."
+                )
+                mark_job_run_owner_fenced(
+                    job["id"],
+                    False,
+                    uncertain_error,
+                    expected_fire_owner=fire_owner,
+                )
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error=uncertain_error,
+                    delivery_outcome="uncertain",
                 )
             else:
                 finish_execution(
