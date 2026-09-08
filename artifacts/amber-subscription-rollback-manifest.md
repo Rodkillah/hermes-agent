@@ -6,7 +6,7 @@ Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
 - Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
-- Implémentation exacte de ce rework: `e3f8421026` (parent `4c69a96943372ec34526130dfd631ab4ba4dcd44`).
+- Implémentation exacte de ce rework: `8e7b4a854d` (parent `cf3e9c95de`). Le candidat final est le HEAD de cette branche au gel de revue ; aucun autre SHA ne vaut candidat.
 - Fichiers de ce rework: `artifacts/verify-amber-subscription-rollback.py`, `artifacts/amber-subscription-rollback-manifest.md`.
 - Le worktree candidat doit être relu propre et le SHA final exact doit être gelé avant revue; aucun autre SHA ne vaut candidat.
 
