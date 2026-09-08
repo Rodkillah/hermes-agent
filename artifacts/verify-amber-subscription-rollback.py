@@ -17,6 +17,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py"
+
+# The package is deliberately narrow: it is a rollback receipt for exactly the
+# three files and five administrative fields that this candidate owns.  Keep
+# these contracts explicit so a partial/duplicate manifest cannot be mistaken
+# for a complete rollback package.
+_ROLLBACK_TARGETS = frozenset({
+    "live/hermes_cli/kanban_db.py",
+    "live/cron/jobs.py",
+    "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py",
+})
+_JOB_ADMIN_FIELDS = (
+    "enabled",
+    "state",
+    "paused_at",
+    "paused_reason",
+    "next_run_at",
+)
+_JOB_ADMIN_FIELD_SET = frozenset(_JOB_ADMIN_FIELDS)
+_FILE_IMAGE_FIELDS = frozenset({
+    "target",
+    "preimage",
+    "candidate_image",
+    "pre_hash",
+    "pre_mode",
+    "post_hash",
+    "post_mode",
+})
+
 os.environ["HERMES_AGENT_RUNTIME"] = str(ROOT)
 sys.path.insert(0, str(ROOT))
 
@@ -537,32 +565,111 @@ def _read_job_admin(path: Path, job_id: str) -> dict[str, object]:
     return {key: job.get(key) for key in ("enabled", "state", "paused_at", "paused_reason", "next_run_at")}
 
 
+def _validate_job_admin_image(image: object, label: str) -> dict[str, object]:
+    """Validate the complete, typed administrative image of the native job."""
+    if not isinstance(image, dict) or set(image) != _JOB_ADMIN_FIELD_SET:
+        raise RuntimeError(f"rollback package {label} has incomplete job fields")
+    if type(image["enabled"]) is not bool:
+        raise RuntimeError(f"rollback package {label}.enabled has the wrong type")
+    if not isinstance(image["state"], str):
+        raise RuntimeError(f"rollback package {label}.state has the wrong type")
+    for field in ("paused_at", "paused_reason", "next_run_at"):
+        value = image[field]
+        if value is not None and not isinstance(value, str):
+            raise RuntimeError(f"rollback package {label}.{field} has the wrong type")
+    return image
+
+
+def _validate_file_image_entry(item: object) -> tuple[Path, Path, Path, tuple[str, int], tuple[str, int]]:
+    """Validate one immutable file image entry and return its typed paths/states."""
+    if not isinstance(item, dict) or not _FILE_IMAGE_FIELDS <= set(item):
+        raise RuntimeError("rollback package file entry is incomplete")
+    try:
+        target_rel = Path(item["target"])
+        pre_rel = Path(item["preimage"])
+        post_rel = Path(item["candidate_image"])
+        pre_hash = item["pre_hash"]
+        post_hash = item["post_hash"]
+        pre_mode = item["pre_mode"]
+        post_mode = item["post_mode"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("rollback package file entry is incomplete") from exc
+    if any(path.is_absolute() or ".." in path.parts for path in (target_rel, pre_rel, post_rel)):
+        raise RuntimeError("rollback package file entry escapes its root")
+    if not all(isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+               for value in (pre_hash, post_hash)):
+        raise RuntimeError("rollback package file hash is not a typed SHA-256")
+    if any(type(value) is not int or not 0 <= value <= 0o777 for value in (pre_mode, post_mode)):
+        raise RuntimeError("rollback package file mode is not a typed mode")
+    return target_rel, pre_rel, post_rel, (pre_hash, pre_mode), (post_hash, post_mode)
+
+
+def _marker_state(target: Path, marker: Path, expected_pre: tuple[str, int], expected_post: tuple[str, int]) -> str:
+    """Classify a durable file marker without changing anything on disk."""
+    try:
+        state = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("restore marker is not an object")
+        parked_name = state["parked"]
+        marker_post = tuple(state["postimage"])
+        marker_pre = tuple(state["preimage"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("rollback file restore marker is malformed") from exc
+    if (
+        not isinstance(parked_name, str)
+        or Path(parked_name).name != parked_name
+        or marker_post != expected_post
+        or marker_pre != expected_pre
+        or len(marker_post) != 2
+        or len(marker_pre) != 2
+        or type(marker_post[0]) is not str
+        or type(marker_post[1]) is not int
+        or type(marker_pre[0]) is not str
+        or type(marker_pre[1]) is not int
+    ):
+        raise RuntimeError(f"rollback file restore marker is invalid: {target.name}")
+    parked = target.with_name(parked_name)
+    target_present = os.path.lexists(target)
+    parked_present = os.path.lexists(parked)
+    target_state = file_state(target) if target_present else None
+    parked_state = file_state(parked) if parked_present else None
+    # These are exactly the four durable boundaries produced by the helper:
+    # marker-only, parked, linked, and completed cleanup.  Every other pair is
+    # ambiguous and must remain fail-closed.
+    if target_state == expected_post and not parked_present:
+        return "not-started"
+    if target_state is None and parked_state == expected_post:
+        return "parked"
+    if target_state == expected_pre and parked_state == expected_post:
+        return "linked"
+    if target_state == expected_pre and not parked_present:
+        return "completed-cleanup"
+    raise RuntimeError(f"rollback file restore marker has ambiguous state: {target.name}")
+
+
 def _validate_existing_file_job_package(root: Path) -> dict[str, object]:
     """Validate the complete durable package before any inverse effect.
 
     Consumption is intentionally distinct from preparation.  Every manifest
-    image, the private job document, and every current target must be known
-    before the SQLite inverse is allowed to run.  A target carrying a durable
-    restore marker is checked but recovered later, after the inverse/job order
-    boundary; this keeps crash recovery fail-closed without inventing a new
-    effect ordering.
+    image, the private job document, and every current target is known before
+    the SQLite inverse is allowed to run.  Marker states are classified without
+    mutation; recovery remains in the ordered inverse -> job -> files phase.
     """
     root = Path(root)
     if not root.is_dir():
         raise RuntimeError("existing rollback package directory is missing")
-    marker_path = _package_marker(root)
-    package = _load_manifest(marker_path)
+    package = _load_manifest(_package_marker(root))
     if package.get("schema_version") != 1 or package.get("state") not in {"prepared", "completed"}:
         raise RuntimeError("rollback package manifest is not consumable")
     files = package.get("files")
-    if not isinstance(files, list) or not files:
-        raise RuntimeError("rollback package manifest has no file images")
+    if not isinstance(files, list) or len(files) != len(_ROLLBACK_TARGETS):
+        raise RuntimeError("rollback package must contain exactly three file images")
     if not isinstance(package.get("job_id"), str):
         raise RuntimeError("rollback package has no job identity")
-    job_preimage = package.get("job_preimage")
-    job_postimage = package.get("job_postimage")
-    if not isinstance(job_preimage, dict) or not isinstance(job_postimage, dict):
-        raise RuntimeError("rollback package has no durable job pre/post-images")
+    job_preimage = _validate_job_admin_image(package.get("job_preimage"), "job_preimage")
+    job_postimage = _validate_job_admin_image(package.get("job_postimage"), "job_postimage")
+    if set(job_preimage) != set(job_postimage):
+        raise RuntimeError("rollback package job images have different fields")
 
     private_jobs = root / "private-cron" / "jobs.json"
     if not private_jobs.is_file():
@@ -577,67 +684,48 @@ def _validate_existing_file_job_package(root: Path) -> dict[str, object]:
     job = next((item for item in raw_jobs if isinstance(item, dict) and item.get("id") == package["job_id"]), None)
     if not isinstance(job, dict):
         raise RuntimeError("rollback package job is missing")
-    job_fields = tuple(job_preimage)
-    current_admin = {key: job.get(key) for key in job_fields}
-    expected_pre = {key: job_preimage.get(key) for key in job_fields}
-    expected_post = {key: job_postimage.get(key) for key in job_fields}
+    current_admin = {key: job.get(key) for key in _JOB_ADMIN_FIELDS}
+    expected_pre = {key: job_preimage[key] for key in _JOB_ADMIN_FIELDS}
+    expected_post = {key: job_postimage[key] for key in _JOB_ADMIN_FIELDS}
     if current_admin not in (expected_pre, expected_post):
         raise RuntimeError("rollback package job conflict")
 
+    seen_targets: set[str] = set()
+    seen_preimages: set[str] = set()
+    seen_postimages: set[str] = set()
     for item in files:
-        if not isinstance(item, dict):
-            raise RuntimeError("rollback package file entry is malformed")
-        try:
-            target_rel = Path(item["target"])
-            pre_rel = Path(item["preimage"])
-            post_rel = Path(item["candidate_image"])
-            expected_pre_file = (item["pre_hash"], int(item["pre_mode"]))
-            expected_post_file = (item["post_hash"], int(item["post_mode"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("rollback package file entry is incomplete") from exc
-        if any(path.is_absolute() or ".." in path.parts for path in (target_rel, pre_rel, post_rel)):
-            raise RuntimeError("rollback package file entry escapes its root")
+        target_rel, pre_rel, post_rel, expected_pre_file, expected_post_file = _validate_file_image_entry(item)
+        target_key, pre_key, post_key = str(target_rel), str(pre_rel), str(post_rel)
+        if target_key not in _ROLLBACK_TARGETS:
+            raise RuntimeError(f"rollback package target is not one of the three owned files: {target_key}")
+        if target_key in seen_targets or pre_key in seen_preimages or post_key in seen_postimages:
+            raise RuntimeError("rollback package contains duplicate file images")
+        seen_targets.add(target_key)
+        seen_preimages.add(pre_key)
+        seen_postimages.add(post_key)
         target = root / target_rel
         preimage = root / pre_rel
         postimage = root / post_rel
         try:
             pre_state = file_state(preimage)
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"rollback package pre-image is missing: {preimage.name}") from exc
-        try:
             post_state = file_state(postimage)
         except FileNotFoundError as exc:
-            raise RuntimeError(f"rollback package post-image is missing: {postimage.name}") from exc
+            raise RuntimeError(f"rollback package image is missing: {exc.filename}") from exc
         if pre_state != expected_pre_file:
             raise RuntimeError(f"rollback package pre-image changed: {preimage.name}")
         if post_state != expected_post_file:
             raise RuntimeError(f"rollback package post-image changed: {postimage.name}")
         restore_marker = restore_marker_path(target)
         if restore_marker.is_file():
-            try:
-                state = json.loads(restore_marker.read_text(encoding="utf-8"))
-                if not isinstance(state, dict):
-                    raise ValueError("restore marker is not an object")
-                parked_name = state["parked"]
-                parked = target.with_name(parked_name)
-                marker_post = tuple(state["postimage"])
-                marker_pre = tuple(state["preimage"])
-            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-                raise RuntimeError("rollback file restore marker is malformed") from exc
-            if (
-                not isinstance(parked_name, str)
-                or parked.name != parked_name
-                or marker_post != expected_post_file
-                or marker_pre != expected_pre_file
-                or file_state(parked) != expected_post_file
-            ):
-                raise RuntimeError(f"rollback file restore marker is invalid: {target.name}")
-        else:
-            if not target.is_file():
-                raise RuntimeError(f"rollback package target is missing: {target.name}")
+            _marker_state(target, restore_marker, expected_pre_file, expected_post_file)
+        elif os.path.lexists(target):
             current = file_state(target)
             if current not in (expected_pre_file, expected_post_file):
                 raise RuntimeError(f"rollback package file conflict: {target.name}")
+        else:
+            raise RuntimeError(f"rollback package target is missing: {target.name}")
+    if seen_targets != _ROLLBACK_TARGETS:
+        raise RuntimeError("rollback package does not cover exactly the three owned files")
     return package
 
 
@@ -649,26 +737,24 @@ def _resume_existing_file_job_package(root: Path) -> None:
     reopening the live jobs document or recopying any runtime file.
     """
     marker_path = _package_marker(root)
-    package = _load_manifest(marker_path)
-    if package.get("schema_version") != 1 or not package.get("files"):
-        raise RuntimeError("rollback package manifest is malformed")
+    package = _validate_existing_file_job_package(root)
     if package.get("state") == "completed":
         private_jobs = root / "private-cron" / "jobs.json"
-        if private_jobs.is_file():
-            observed = _read_job_admin(private_jobs, str(package["job_id"]))
-            if observed != package["job_preimage"]:
-                raise RuntimeError("completed rollback package job was changed")
+        observed = _read_job_admin(private_jobs, str(package["job_id"]))
+        if observed != package["job_preimage"]:
+            raise RuntimeError("completed rollback package job was changed")
         for item in package["files"]:
             preimage = root / item["preimage"]
             target = root / item["target"]
-            expected = (item.get("pre_hash"), int(item.get("pre_mode")))
-            if not preimage.is_file() or file_state(preimage) != expected or not target.is_file() or file_state(target) != expected:
+            expected = (item["pre_hash"], item["pre_mode"])
+            if file_state(preimage) != expected or file_state(target) != expected:
                 raise RuntimeError(f"completed rollback package file was changed: {target.name}")
         return
     if package.get("state") != "prepared":
         raise RuntimeError("rollback package manifest is not consumable")
-    if not isinstance(package.get("job_preimage"), dict) or not isinstance(package.get("job_postimage"), dict):
-        raise RuntimeError("rollback package has no durable job pre/post-images")
+    # The validator above has already required the complete typed job images.
+    job_preimage = package["job_preimage"]
+    job_postimage = package["job_postimage"]
 
     # Validate every durable pre-image before touching the job or any target.
     # Never hash a staged file and write that newly observed hash back into the
