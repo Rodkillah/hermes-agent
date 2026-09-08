@@ -2698,8 +2698,14 @@ def update_job(
             if job["id"] != job_id:
                 continue
 
-            if expected is not None and any(job.get(key) != value for key, value in expected.items()):
-                return None
+            if expected is not None:
+                # A guarded update is a compare-and-swap, not a permissive
+                # JSON equality check.  Presence and scalar type are part of
+                # the image: ``False`` must not match ``0`` and an absent
+                # nullable field must not match an explicit ``None``.
+                for key, value in expected.items():
+                    if key not in job or type(job[key]) is not type(value) or job[key] != value:
+                        return None
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).

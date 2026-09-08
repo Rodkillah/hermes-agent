@@ -753,8 +753,12 @@ def _resume_existing_file_job_package(root: Path) -> None:
     package = _validate_existing_file_job_package(root)
     if package.get("state") == "completed":
         private_jobs = root / "private-cron" / "jobs.json"
-        observed = _read_job_admin(private_jobs, str(package["job_id"]))
-        if observed != package["job_preimage"]:
+        observed = _validate_job_admin_image(
+            _read_job_admin(private_jobs, str(package["job_id"])),
+            "completed observed job",
+        )
+        expected_pre = _validate_job_admin_image(package["job_preimage"], "job_preimage")
+        if observed != expected_pre:
             raise RuntimeError("completed rollback package job was changed")
         for item in package["files"]:
             preimage = root / item["preimage"]
@@ -791,15 +795,20 @@ def _resume_existing_file_job_package(root: Path) -> None:
     cron_jobs.OUTPUT_DIR = private_cron / "output"
     try:
         job_id = str(package["job_id"])
-        observed = cron_jobs.get_job(job_id)
+        observed = _read_job_admin(private_jobs, job_id)
         if not observed:
             raise RuntimeError("rollback package job is missing")
-        job_preimage = package["job_preimage"]
-        job_postimage = package["job_postimage"]
-        job_fields = tuple(job_preimage)
-        current_admin = {key: observed.get(key) for key in job_fields}
-        expected_post = {key: job_postimage.get(key) for key in job_fields}
-        expected_pre = {key: job_preimage.get(key) for key in job_fields}
+        job_preimage = _validate_job_admin_image(package["job_preimage"], "job_preimage")
+        job_postimage = _validate_job_admin_image(package["job_postimage"], "job_postimage")
+        # Read the private document directly: get_job() normalizes display
+        # fields and would turn an invalid stored observation into an approved
+        # image before the native CAS gets to inspect it.
+        current_admin = _validate_job_admin_image(
+            _read_job_admin(private_jobs, job_id),
+            "observed job",
+        )
+        expected_post = dict(job_postimage)
+        expected_pre = dict(job_preimage)
         if current_admin == expected_pre:
             pass
         elif current_admin == expected_post:
