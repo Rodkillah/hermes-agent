@@ -161,6 +161,94 @@ def file_state(path: Path) -> tuple[str, int]:
     return file_hash(path), file_mode(path)
 
 
+def _fsync_parent(path: Path) -> None:
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_restore_marker(marker: Path, payload: dict[str, object]) -> None:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write creating file restore marker")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_parent(marker)
+
+
+def restore_marker_path(target: Path) -> Path:
+    return Path(target).with_name(f".{Path(target).name}.restore-state.json")
+
+
+def recover_file_restore(target: Path) -> str:
+    """Safely recover an interrupted conditional restore from its durable marker.
+
+    A crash after parking but before link restores the verified post-image, not
+    a guessed pre-image.  A newly-created target is a concurrent owner and is
+    never overwritten; the marker and parked file remain for investigation.
+    """
+    target = Path(target)
+    marker = restore_marker_path(target)
+    if not marker.exists():
+        return "none"
+    if not stat.S_ISREG(marker.lstat().st_mode):
+        raise RuntimeError("invalid file restore marker")
+    state = json.loads(marker.read_text(encoding="utf-8"))
+    parked_name = state.get("parked")
+    expected_post = state.get("postimage")
+    expected_pre = state.get("preimage")
+    if (
+        not isinstance(parked_name, str)
+        or Path(parked_name).name != parked_name
+        or not isinstance(expected_post, list)
+        or not isinstance(expected_pre, list)
+        or len(expected_post) != len(expected_pre) != 2
+    ):
+        raise RuntimeError("invalid file restore marker payload")
+    parked = target.with_name(parked_name)
+    postimage = tuple(expected_post)
+    preimage = tuple(expected_pre)
+    if not target.exists():
+        if not parked.exists() or not stat.S_ISREG(parked.lstat().st_mode):
+            raise RuntimeError("interrupted restore has no regular parked post-image")
+        parked_state = file_state(parked)
+        try:
+            os.link(parked, target)
+        except FileExistsError as exc:
+            raise RuntimeError("concurrent runtime file appeared during restore recovery") from exc
+        if file_state(target) != parked_state:
+            raise RuntimeError("recovered runtime file differs from parked post-image")
+        if parked_state == postimage:
+            marker.unlink()
+            _fsync_parent(marker)
+            return "restored-postimage"
+        # A race before parking changed the old target.  Preserve it under the
+        # canonical name and retain the marker/parked hardlink as evidence;
+        # do not mislabel it as a successful rollback.
+        return "restored-conflicting-parked"
+    current = file_state(target)
+    if current == preimage:
+        if parked.exists():
+            parked.unlink()
+        marker.unlink()
+        _fsync_parent(marker)
+        return "completed"
+    if current == postimage and not parked.exists():
+        marker.unlink()
+        _fsync_parent(marker)
+        return "not-started"
+    raise RuntimeError("concurrent runtime file prevents safe restore recovery")
+
+
 def restore_file_from_private_preimage(
     target: Path,
     staged_preimage: Path,
@@ -170,7 +258,7 @@ def restore_file_from_private_preimage(
     """Restore one file without overwriting a name claimed by a concurrent edit.
 
     The activation gate must first make the runtime quiescent.  This helper
-    additionally claims the target pathname by atomically parking the verified
+    additionally writes a durable recovery marker and claims the target pathname by atomically parking the verified
     post-image, then links a private fully-written pre-image into the now-empty
     pathname.  A writer that appears after the guard can create that pathname;
     link then fails with EEXIST and its content is preserved rather than copied
@@ -179,13 +267,22 @@ def restore_file_from_private_preimage(
     target = Path(target)
     staged_preimage = Path(staged_preimage)
     preimage = file_state(staged_preimage)
+    marker = restore_marker_path(target)
+    if marker.exists():
+        recover_file_restore(target)
+        raise RuntimeError("recovered incomplete guarded restore; retry explicitly")
     if file_state(target) != expected_postimage:
         raise RuntimeError("runtime file changed before guarded restore")
 
     parked = target.with_name(f".{target.name}.postimage-{uuid.uuid4().hex}")
     temporary = target.with_name(f".{target.name}.restore-{uuid.uuid4().hex}")
-    os.replace(target, parked)
     try:
+        _write_restore_marker(marker, {
+            "parked": parked.name,
+            "postimage": list(expected_postimage),
+            "preimage": list(preimage),
+        })
+        os.replace(target, parked)
         # Recheck after the atomic pathname claim: a write racing the original
         # target is never mistaken for the candidate being rolled back.
         if file_state(parked) != expected_postimage:
@@ -204,16 +301,18 @@ def restore_file_from_private_preimage(
         if file_state(target) != preimage:
             raise RuntimeError("guarded restore did not produce the pre-image")
     except Exception:
-        # Recreate the parked post-image only if no concurrent editor owns the
-        # pathname.  Never overwrite a new target while handling a conflict.
-        if not target.exists():
-            try:
-                os.link(parked, target)
-            except FileExistsError:
-                pass
+        # Recovery also refuses a concurrent target instead of overwriting it.
+        # A SIGKILL cannot execute this path; the durable marker then lets the
+        # next guarded invocation restore only the verified post-image.
+        try:
+            recover_file_restore(target)
+        except Exception:
+            pass
         raise
     else:
         parked.unlink()
+        marker.unlink()
+        _fsync_parent(marker)
     finally:
         if temporary.exists():
             temporary.unlink()

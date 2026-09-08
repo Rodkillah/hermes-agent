@@ -174,7 +174,7 @@ def test_guarded_file_restore_refuses_post_guard_concurrent_runtime_edit(monkeyp
     injected = []
 
     def link(source, destination, *args, **kwargs):
-        if Path(source) == next(target.parent.glob(".kanban_db.py.restore-*")) and Path(destination) == target:
+        if Path(source).name.startswith(".kanban_db.py.restore-") and Path(source).name != ".kanban_db.py.restore-state.json" and Path(destination) == target:
             target.write_bytes(concurrent)
             target.chmod(0o600)
             injected.append(target)
@@ -186,6 +186,72 @@ def test_guarded_file_restore_refuses_post_guard_concurrent_runtime_edit(monkeyp
     assert injected
     assert target.read_bytes() == concurrent
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_guarded_file_restore_refuses_race_between_last_check_and_parking(monkeypatch, tmp_path):
+    namespace = runpy.run_path(str(ROOT / "artifacts/verify-amber-subscription-rollback.py"))
+    restore = namespace["restore_file_from_private_preimage"]
+    target = tmp_path / "live" / "kanban_db.py"
+    target.parent.mkdir()
+    target.write_bytes(b"candidate post-image\n")
+    target.chmod(0o644)
+    staged = tmp_path / "preimages" / "kanban_db.py"
+    staged.parent.mkdir()
+    staged.write_bytes(b"pre-activation image\n")
+    staged.chmod(0o640)
+    expected = (namespace["file_hash"](target), namespace["file_mode"](target))
+    concurrent = b"synthetic pre-parking concurrent edit\n"
+    original_replace = namespace["os"].replace
+    injected = []
+
+    def replace(source, destination, *args, **kwargs):
+        if Path(source) == target:
+            target.write_bytes(concurrent)
+            target.chmod(0o600)
+            injected.append(target)
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(namespace["os"], "replace", replace)
+    with pytest.raises(RuntimeError, match="changed during guarded restore"):
+        restore(target, staged, expected_postimage=expected)
+    assert injected
+    assert target.read_bytes() == concurrent
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert namespace["restore_marker_path"](target).exists()
+
+
+def test_guarded_file_restore_recovers_interruption_between_parking_and_link(monkeypatch, tmp_path):
+    namespace = runpy.run_path(str(ROOT / "artifacts/verify-amber-subscription-rollback.py"))
+    restore = namespace["restore_file_from_private_preimage"]
+    recover = namespace["recover_file_restore"]
+    marker_path = namespace["restore_marker_path"]
+    target = tmp_path / "live" / "kanban_db.py"
+    target.parent.mkdir()
+    candidate = b"candidate post-image\n"
+    target.write_bytes(candidate)
+    target.chmod(0o644)
+    staged = tmp_path / "preimages" / "kanban_db.py"
+    staged.parent.mkdir()
+    staged.write_bytes(b"pre-activation image\n")
+    staged.chmod(0o640)
+    expected = (namespace["file_hash"](target), namespace["file_mode"](target))
+    original_replace = namespace["os"].replace
+
+    def interrupt_after_park(source, destination, *args, **kwargs):
+        result = original_replace(source, destination, *args, **kwargs)
+        if Path(source) == target:
+            raise KeyboardInterrupt("synthetic interruption after parking")
+        return result
+
+    monkeypatch.setattr(namespace["os"], "replace", interrupt_after_park)
+    with pytest.raises(KeyboardInterrupt, match="after parking"):
+        restore(target, staged, expected_postimage=expected)
+    assert not target.exists()
+    assert marker_path(target).exists()
+    assert recover(target) == "restored-postimage"
+    assert target.read_bytes() == candidate
+    assert target.stat().st_mode & 0o777 == 0o644
+    assert not marker_path(target).exists()
 
 
 def test_explicit_db_scope_ignores_poisoned_kanban_environment(monkeypatch, db, tmp_path, capsys):
