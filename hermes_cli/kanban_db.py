@@ -12487,6 +12487,96 @@ def transfer_notify_sub_owner(
         return cur.rowcount == 1
 
 
+def restore_notify_sub_state(
+    conn: sqlite3.Connection,
+    *,
+    pre_image: Optional[Mapping[str, Any]],
+    post_image: Mapping[str, Any],
+) -> bool:
+    """Restore one subscription's owner/mode or remove a guarded new row.
+
+    This is the native inverse for a bounded subscription batch.  The caller
+    supplies exact pre/post images captured by the forward operation.  Stable
+    routing identity, metadata, and creation time must still match the
+    post-image; only ``last_event_id`` may advance while the inverse waits.
+    Therefore a human takeover, mode change, replacement, or other concurrent
+    edit returns ``False`` without overwriting it.  Existing rows restore only
+    owner and delivery mode, preserving an advanced cursor and every other
+    column.  A row created by the batch is deleted only while its post-image
+    remains intact; an already absent created row is an idempotent success.
+    """
+    key_fields = ("task_id", "platform", "chat_id", "thread_id")
+    stable_fields = (
+        "user_id", "user_id_alt", "chat_type", "delivery_metadata", "created_at",
+    )
+    required = (*key_fields, "notifier_profile", "delivery_mode")
+    if any(field not in post_image for field in required):
+        raise ValueError("post_image is missing subscription identity")
+    if pre_image is not None and any(field not in pre_image for field in required):
+        raise ValueError("pre_image is missing subscription identity")
+
+    def _metadata(value: Any) -> dict[str, Any]:
+        return _decode_notify_delivery_metadata(value)
+
+    key = tuple(post_image[field] if field != "thread_id" else post_image[field] or "" for field in key_fields)
+    with write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ?",
+            key,
+        ).fetchone()
+        if row is None:
+            return pre_image is None
+        current = dict(row)
+        current["delivery_metadata"] = _metadata(current.get("delivery_metadata"))
+        def _stable_matches(image: Mapping[str, Any]) -> bool:
+            for field in stable_fields:
+                expected = image.get(field)
+                actual = current.get(field)
+                if field == "delivery_metadata":
+                    expected, actual = _metadata(expected), _metadata(actual)
+                if actual != expected:
+                    return False
+            return True
+
+        # A repeated inverse is a no-op when the row is already at its exact
+        # pre-image (apart from an allowed cursor advance).
+        if (
+            pre_image is not None
+            and current.get("notifier_profile") == pre_image.get("notifier_profile")
+            and current.get("delivery_mode") == pre_image.get("delivery_mode")
+            and _stable_matches(pre_image)
+        ):
+            return True
+        if not _stable_matches(post_image):
+            return False
+        if current.get("notifier_profile") != post_image.get("notifier_profile"):
+            return False
+        if current.get("delivery_mode") != post_image.get("delivery_mode"):
+            return False
+        if pre_image is None:
+            cur = conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+                "AND chat_id = ? AND thread_id = ? AND notifier_profile IS ? "
+                "AND delivery_mode IS ? AND user_id IS ? AND user_id_alt IS ? "
+                "AND chat_type IS ? AND delivery_metadata = ? AND created_at IS ?",
+                (*key, post_image["notifier_profile"], post_image["delivery_mode"],
+                 post_image.get("user_id"), post_image.get("user_id_alt"),
+                 post_image.get("chat_type"),
+                 _encode_notify_delivery_metadata(_metadata(post_image.get("delivery_metadata"))),
+                 post_image.get("created_at")),
+            )
+            return cur.rowcount == 1
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET notifier_profile = ?, delivery_mode = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND notifier_profile IS ? AND delivery_mode IS ?",
+            (pre_image.get("notifier_profile"), pre_image.get("delivery_mode"),
+             *key, post_image["notifier_profile"], post_image["delivery_mode"]),
+        )
+        return cur.rowcount == 1
+
+
 def _notify_profile_filter(
     notifier_profiles: Optional[Iterable[str]],
     *,

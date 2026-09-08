@@ -15,7 +15,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Optional
 
 # Do not let the caller's cwd or HERMES_KANBAN_* scope choose the runtime.
 # The installed overlay runs against the explicitly pinned runtime tree.
@@ -96,22 +96,30 @@ def plan(
         and row.get("chat_type") == "dm"
         and row.get("chat_id")
     ]
-    signatures = {
-        (
-            str(row["chat_id"]),
-            _thread(row),
-            row.get("user_id"),
-            row.get("user_id_alt"),
-            row.get("chat_type") or "dm",
-        )
+    # Destination identity and origin completeness are separate concerns.
+    # Legacy rows may have NULL origin IDs while newer rows carry the same
+    # known origin; that is compatible and must not block the transfer.
+    destinations = {
+        (str(row["chat_id"]), _thread(row), row.get("chat_type") or "dm")
         for row in candidates
     }
-    if len(signatures) != 1:
+    if len(destinations) != 1:
         raise RuntimeError("Missing or ambiguous existing Amber/Forge Telegram DM target")
-    chat_id, thread_id, _, _, _ = next(iter(signatures))
-    anchor = next(
-        row for row in candidates if _destination(row) == (chat_id, thread_id)
+    chat_id, thread_id, chat_type = next(iter(destinations))
+    known_user_ids = sorted({str(row["user_id"]) for row in candidates if row.get("user_id")})
+    known_alt_ids = sorted({str(row["user_id_alt"]) for row in candidates if row.get("user_id_alt")})
+    if len(known_user_ids) > 1 or len(known_alt_ids) > 1:
+        raise RuntimeError("Conflicting existing Telegram DM origin")
+    anchor = min(
+        (row for row in candidates if _destination(row) == (chat_id, thread_id)),
+        key=lambda row: (bool(row.get("user_id")), bool(row.get("user_id_alt")), str(row.get("task_id"))),
     )
+    # The anchor remains an existing row.  IDs selected for future rows are
+    # deterministic and never enrich or rewrite any existing subscription.
+    anchor = dict(anchor)
+    anchor["chat_type"] = chat_type
+    anchor["user_id"] = known_user_ids[0] if known_user_ids else None
+    anchor["user_id_alt"] = known_alt_ids[0] if known_alt_ids else None
 
     targets: dict[str, list[dict[str, Any]]] = {}
     for row in subscriptions:
@@ -202,8 +210,32 @@ def _ensure_amber_notify_wake(
         raise RuntimeError(f"Amber subscription read-back failed for {task_id}")
 
 
+def rollback_journal(conn: sqlite3.Connection, journal: Iterable[Mapping[str, Any]]) -> int:
+    """Reverse one committed journal without overwriting concurrent changes."""
+    entries = list(journal)
+    restored = 0
+    with kb.write_txn(conn):
+        for entry in reversed(entries):
+            pre_image = entry.get("pre_image")
+            post_image = entry.get("post_image")
+            if not isinstance(post_image, dict):
+                raise RuntimeError("rollback journal entry has no post-image")
+            if not kb.restore_notify_sub_state(
+                conn, pre_image=pre_image if isinstance(pre_image, dict) else None,
+                post_image=post_image,
+            ):
+                key = ":".join(str(post_image.get(field, "")) for field in ("task_id", "chat_id", "thread_id"))
+                raise RuntimeError(f"rollback conflict for {key}")
+            restored += 1
+    return restored
+
+
 def reconcile(
-    conn: sqlite3.Connection, *, dry_run: bool = False, limit: int = MAX_BATCH_SIZE
+    conn: sqlite3.Connection,
+    *,
+    dry_run: bool = False,
+    limit: int = MAX_BATCH_SIZE,
+    journal: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, int]:
     tasks = kb.list_tasks(conn, include_archived=False, limit=None)
     subscriptions = kb.list_notify_subs(conn)
@@ -224,11 +256,23 @@ def reconcile(
     if dry_run:
         return result
 
+    pending_journal: list[dict[str, Any]] = []
     # One outer transaction is deliberate: if any CAS/read-back fails, every
     # transfer, mode repair, and new row in this batch is rolled back.
     with kb.write_txn(conn):
         for task_id, action in actions:
+            before_rows = targets.get(task_id, [])
+            pre_image = dict(before_rows[0]) if before_rows else None
             _ensure_amber_notify_wake(conn, task_id, anchor, action)
+            after_rows = _fetch_target(conn, task_id, anchor)
+            if len(after_rows) != 1:
+                raise RuntimeError(f"Journal read-back failed for {task_id}")
+            pending_journal.append({
+                "task_id": task_id,
+                "action": action,
+                "pre_image": pre_image,
+                "post_image": dict(after_rows[0]),
+            })
             result["changed"] += 1
         after = kb.list_notify_subs(conn)
         remaining = 0
@@ -245,6 +289,8 @@ def reconcile(
         expected = result["missing"] - result["changed"]
         if remaining != expected:
             raise RuntimeError("Amber subscription coverage read-back failed")
+    if journal is not None:
+        journal.extend(pending_journal)
     return result
 
 
@@ -259,6 +305,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=bounded_limit, default=MAX_BATCH_SIZE)
+    parser.add_argument(
+        "--journal",
+        type=Path,
+        help="write the committed batch's exact pre/post-images to this JSON path",
+    )
     args = parser.parse_args(argv)
     if not DB_PATH.is_file():
         print("kanban_subscription_error: canonical board missing; refusing fallback", file=sys.stderr)
@@ -277,8 +328,17 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 # Explicit db_path and board make inherited HERMES_KANBAN_*
                 # variables irrelevant; no CLI fallback is possible here.
+                committed_journal: list[dict[str, Any]] = []
                 with kb.connect(DB_PATH, board=BOARD) as conn:
-                    result = reconcile(conn, dry_run=False, limit=args.limit)
+                    result = reconcile(
+                        conn, dry_run=False, limit=args.limit, journal=committed_journal
+                    )
+                if args.journal is not None:
+                    args.journal.parent.mkdir(parents=True, exist_ok=True)
+                    args.journal.write_text(
+                        json.dumps(committed_journal, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
         print(json.dumps(result, sort_keys=True))
         return 0
     except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as error:

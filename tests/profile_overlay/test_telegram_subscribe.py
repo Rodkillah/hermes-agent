@@ -206,3 +206,47 @@ def test_two_real_processes_are_serialized_by_existing_lock(monkeypatch, db, tmp
     finally:
         conn.close()
     assert sum(row["notifier_profile"] == "amber" for row in rows) == 2
+
+
+def test_compatible_missing_origin_ids_use_deterministic_anchor_without_rewriting_existing(monkeypatch, db):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        known = seed_task(kb, conn, owner="amber")
+        legacy = seed_task(kb, conn, owner="forge")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET user_id = NULL, user_id_alt = NULL "
+                "WHERE task_id = ?", (legacy,)
+            )
+        before = dict(kb.list_notify_subs(conn, legacy)[0])
+        result = mod.reconcile(conn)
+        rows = {task: kb.list_notify_subs(conn, task)[0] for task in (known, legacy)}
+    finally:
+        conn.close()
+    assert result["changed"] == 1
+    assert rows[legacy]["notifier_profile"] == "amber"
+    assert rows[legacy]["user_id"] is None
+    assert rows[legacy]["user_id_alt"] is None
+    assert rows[legacy]["delivery_metadata"] == before["delivery_metadata"]
+
+
+def test_conflicting_nonempty_origins_fail_closed_without_delta(monkeypatch, db):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        first = seed_task(kb, conn, owner="amber")
+        second = seed_task(kb, conn, owner="forge")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET user_id = 'different' WHERE task_id = ?",
+                (second,),
+            )
+        before = [dict(row) for row in kb.list_notify_subs(conn)]
+        with pytest.raises(RuntimeError, match="Conflicting existing Telegram DM origin"):
+            mod.reconcile(conn)
+        assert [dict(row) for row in kb.list_notify_subs(conn)] == before
+    finally:
+        conn.close()
