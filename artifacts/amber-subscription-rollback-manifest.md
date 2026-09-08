@@ -5,7 +5,8 @@ Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 ## Identité contrôlée
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
-- Candidat: `ad5c7d632c88a6f501e3c6d78f54587c77dc7fdd`; parent de rework: `c28f7fced3b190fe882135d6ee1c67918049579e`.
+- Tête candidate: branche `ironrod/forge-amber-subscription-transfer-20260907` (le commit documentaire courant ne change que ce manifeste).
+- Implémentation: `ad5c7d632c88a6f501e3c6d78f54587c77dc7fdd`; parent de rework: `c28f7fced3b190fe882135d6ee1c67918049579e`.
 - Fichiers concernés dans ce delta: `hermes_cli/kanban_db.py`, `artifacts/verify-amber-subscription-rollback.py`, `artifacts/amber-subscription-rollback-manifest.md`.
 
 ## Autorité et atomicité
