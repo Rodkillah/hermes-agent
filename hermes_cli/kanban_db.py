@@ -3042,7 +3042,45 @@ _NOTIFY_BATCH_SCHEMA_STATEMENTS = (
 
 
 def _notify_batch_schema_constraints(conn: sqlite3.Connection) -> None:
-    """Reject same-named proof tables whose real constraints were weakened."""
+    """Validate the ledger's actual SQLite contract, not SQL substrings alone."""
+    expected_info = {
+        "kanban_notify_batches": [
+            ("batch_id", "TEXT", 0, 1), ("schema_version", "INTEGER", 1, 0),
+            ("board", "TEXT", 1, 0), ("phase", "TEXT", 1, 0),
+            ("inverse_of", "TEXT", 0, 0), ("state", "TEXT", 1, 0),
+            ("request_digest", "TEXT", 1, 0), ("entry_count", "INTEGER", 1, 0),
+            ("result_json", "TEXT", 1, 0), ("committed_at", "INTEGER", 1, 0),
+            ("reverted_at", "INTEGER", 0, 0),
+        ],
+        "kanban_notify_batch_entries": [
+            ("batch_id", "TEXT", 1, 1), ("ordinal", "INTEGER", 1, 2),
+            ("action", "TEXT", 1, 0), ("pre_image_json", "TEXT", 0, 0),
+            ("post_image_json", "TEXT", 1, 0),
+        ],
+    }
+    for table, expected in expected_info.items():
+        actual = [
+            (row["name"], (row["type"] or "").upper(), int(row["notnull"]), int(row["pk"]))
+            for row in conn.execute(f"PRAGMA table_info({table})")
+        ]
+        if actual != expected:
+            raise RuntimeError(f"notify batch ledger schema is incompatible for {table}")
+
+    foreign_keys = conn.execute("PRAGMA foreign_key_list(kanban_notify_batch_entries)").fetchall()
+    if not any(
+        row["table"] == "kanban_notify_batches"
+        and row["from"] == "batch_id"
+        and row["to"] == "batch_id"
+        and str(row["on_delete"]).upper() == "NO ACTION"
+        for row in foreign_keys
+    ):
+        raise RuntimeError("notify batch ledger schema is incompatible: missing entry foreign key")
+    index_names = {
+        row["name"] for row in conn.execute("PRAGMA index_list(kanban_notify_batches)")
+    }
+    if "idx_notify_batches_inverse" not in index_names:
+        raise RuntimeError("notify batch ledger schema is incompatible: missing inverse index")
+
     sql_by_table = {
         row["name"]: " ".join((row["sql"] or "").lower().split())
         for row in conn.execute(
@@ -3052,15 +3090,19 @@ def _notify_batch_schema_constraints(conn: sqlite3.Connection) -> None:
     }
     required_fragments = {
         "kanban_notify_batches": (
-            "primary key", "check (schema_version = 1)",
-            "check (phase in ('forward', 'inverse'))", "unique references",
-            "check (state in ('committed', 'reverted'))", "check (entry_count >= 0)",
+            "check (schema_version = 1)",
+            "check (phase in ('forward', 'inverse'))",
+            "inverse_of text unique references kanban_notify_batches(batch_id)",
+            "check (state in ('committed', 'reverted'))",
+            "check (entry_count >= 0)",
+            "check ( (phase = 'forward' and inverse_of is null",
         ),
         "kanban_notify_batch_entries": (
-            "references kanban_notify_batches(batch_id)", "check (ordinal >= 0)",
+            "check (ordinal >= 0)",
             "check (action in ('create', 'transfer', 'repair'))",
-            "primary key (batch_id, ordinal)", "json_valid(pre_image_json)",
-            "json_valid(post_image_json)",
+            "primary key (batch_id, ordinal)",
+            "check (pre_image_json is null or json_valid(pre_image_json))",
+            "check (json_valid(post_image_json))",
         ),
     }
     for table, fragments in required_fragments.items():
@@ -12906,6 +12948,14 @@ def _validate_notify_batch_image(image: Optional[Mapping[str, Any]], *, label: s
         raise ValueError(f"{label} has an invalid subscription generation")
     if not isinstance(image["created_at"], int) or not isinstance(image["last_event_id"], int):
         raise ValueError(f"{label} has an invalid timestamp or cursor")
+    metadata = image["delivery_metadata"]
+    if metadata is not None:
+        if not isinstance(metadata, str):
+            raise ValueError(f"{label} has non-SQLite delivery metadata")
+        try:
+            json.loads(metadata)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} has invalid JSON delivery metadata") from exc
 
 
 def get_notify_batch(conn: sqlite3.Connection, batch_id: str) -> Optional[dict[str, Any]]:
@@ -12950,6 +13000,7 @@ def record_notify_batch(
     materialized = list(entries)
     seen: set[tuple[Any, Any, Any, Any]] = set()
     encoded_entries: list[tuple[int, str, Optional[str], str]] = []
+    identityless_create_entries = 0
     for ordinal, entry in enumerate(materialized):
         action = entry.get("action")
         pre_image = entry.get("pre_image")
@@ -12965,19 +13016,44 @@ def record_notify_batch(
             post_key = tuple(post_image[field] for field in ("task_id", "platform", "chat_id", "thread_id"))
             if pre_key != post_key:
                 raise ValueError("notify batch image subscription keys do not match")
+            if pre_image["subscription_generation"] != post_image["subscription_generation"]:
+                raise ValueError("notify batch images describe different subscription generations")
+        if action == "create":
+            if phase == "forward" and (pre_image is not None or post_image is None):
+                raise ValueError("forward create must describe an absent pre-image")
+            if phase == "inverse" and not (
+                (pre_image is not None and post_image is None)
+                or (pre_image is None and post_image is None)
+            ):
+                raise ValueError("inverse create has invalid absence images")
+        elif pre_image is None or post_image is None:
+            raise ValueError("transfer or repair requires two subscription images")
         identity = post_image if post_image is not None else pre_image
         if identity is None:
-            raise ValueError("notify batch entry has no subscription identity")
-        key = tuple(identity[field] for field in ("task_id", "platform", "chat_id", "thread_id"))
-        if key in seen:
-            raise ValueError("notify batch has duplicate subscription keys")
-        seen.add(key)
+            if phase != "inverse" or action != "create":
+                raise ValueError("notify batch entry has no subscription identity")
+            identityless_create_entries += 1
+        else:
+            key = tuple(identity[field] for field in ("task_id", "platform", "chat_id", "thread_id"))
+            if key in seen:
+                raise ValueError("notify batch has duplicate subscription keys")
+            seen.add(key)
         encoded_entries.append((
             ordinal,
             action,
             _canonical_notify_batch_json(dict(pre_image)) if pre_image is not None else None,
             _canonical_notify_batch_json(dict(post_image)) if post_image is not None else "null",
         ))
+    if identityless_create_entries:
+        forward_entries = list_notify_batch_entries(conn, inverse_of) if inverse_of else []
+        allowed = sum(
+            1 for entry in forward_entries
+            if entry["action"] == "create"
+            and entry["pre_image_json"] is None
+            and entry["post_image_json"] != "null"
+        )
+        if identityless_create_entries != allowed:
+            raise ValueError("inverse absent-create entry does not match its forward batch")
     result_json = _canonical_notify_batch_json(dict(result))
     with write_txn(conn, allow_nested=True):
         existing = get_notify_batch(conn, batch_id)

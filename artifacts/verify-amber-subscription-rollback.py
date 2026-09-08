@@ -371,6 +371,17 @@ def _prepare_and_restore_file_job_package(root: Path):
         shutil.copy2(target, staged_pre)
         preimages.append((target, candidate, staged_pre, file_hash(target), file_mode(target)))
 
+    # Commit the immutable file pre-images into the package receipt before any
+    # candidate bytes or job state are installed.  A later process must reject
+    # a changed staging file, never discover a new baseline.
+    marker_path = _package_marker(root)
+    package = json.loads(marker_path.read_text(encoding="utf-8"))
+    for item, (_target, _candidate, staged_pre, pre_hash, pre_mode) in zip(package["files"], preimages):
+        item["pre_hash"] = pre_hash
+        item["pre_mode"] = pre_mode
+    marker_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _fsync_parent(marker_path)
+
     # Install and prove the exact candidate bytes on copies only.
     for target, candidate, _staged_pre, _pre_hash, _pre_mode in preimages:
         shutil.copy2(candidate, target)
@@ -422,6 +433,11 @@ def _prepare_and_restore_file_job_package(root: Path):
         # timeout or concurrent native update is a conflict, never a stale
         # overwrite of administrative cron state.
         post_admin = {key: paused.get(key) for key in admin}
+        package = json.loads(marker_path.read_text(encoding="utf-8"))
+        package["job_postimage"] = post_admin
+        package["job_preimage"] = admin
+        marker_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _fsync_parent(marker_path)
         restored = cron_jobs.update_job(observed["id"], admin, expected=post_admin)
         if restored is None:
             raise RuntimeError("cron administrative state changed before guarded restore")
@@ -466,24 +482,46 @@ def _read_job_admin(path: Path, job_id: str) -> dict[str, object]:
 
 
 def _resume_existing_file_job_package(root: Path) -> None:
-    """Consume an already-prepared package without reading live sources."""
+    """Consume a durable package without reading or rebuilding live sources.
+
+    The manifest is a receipt as well as an input.  It is retained after a
+    successful consume so an exact replay can prove completion without
+    reopening the live jobs document or recopying any runtime file.
+    """
     marker_path = _package_marker(root)
     package = json.loads(marker_path.read_text(encoding="utf-8"))
     if package.get("schema_version") != 1 or not package.get("files"):
         raise RuntimeError("rollback package manifest is malformed")
-    package_changed = False
+    if package.get("state") == "completed":
+        private_jobs = root / "private-cron" / "jobs.json"
+        if private_jobs.is_file():
+            observed = _read_job_admin(private_jobs, str(package["job_id"]))
+            if observed != package["job_preimage"]:
+                raise RuntimeError("completed rollback package job was changed")
+        for item in package["files"]:
+            preimage = root / item["preimage"]
+            target = root / item["target"]
+            expected = (item.get("pre_hash"), int(item.get("pre_mode")))
+            if not preimage.is_file() or file_state(preimage) != expected or not target.is_file() or file_state(target) != expected:
+                raise RuntimeError(f"completed rollback package file was changed: {target.name}")
+        return
+    if package.get("state") != "prepared":
+        raise RuntimeError("rollback package manifest is not consumable")
+    if not isinstance(package.get("job_preimage"), dict) or not isinstance(package.get("job_postimage"), dict):
+        raise RuntimeError("rollback package has no durable job pre/post-images")
+
+    # Validate every durable pre-image before touching the job or any target.
+    # Never hash a staged file and write that newly observed hash back into the
+    # manifest: that would silently re-baseline an intervention between runs.
     for item in package["files"]:
         preimage = root / item["preimage"]
         if not preimage.is_file():
             raise RuntimeError(f"rollback package pre-image is missing: {preimage.name}")
-        if "pre_hash" not in item or "pre_mode" not in item:
-            item["pre_hash"] = file_hash(preimage)
-            item["pre_mode"] = file_mode(preimage)
-            package_changed = True
-    if package_changed:
-        marker_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    from cron import jobs as cron_jobs
+        expected_pre = (item.get("pre_hash"), item.get("pre_mode"))
+        if expected_pre[0] != file_hash(preimage) or int(expected_pre[1]) != file_mode(preimage):
+            raise RuntimeError(f"rollback package pre-image changed: {preimage.name}")
 
+    from cron import jobs as cron_jobs
     private_cron = root / "private-cron"
     private_jobs = private_cron / "jobs.json"
     if not private_jobs.is_file():
@@ -497,27 +535,46 @@ def _resume_existing_file_job_package(root: Path) -> None:
         observed = cron_jobs.get_job(job_id)
         if not observed:
             raise RuntimeError("rollback package job is missing")
-        current_admin = {key: observed.get(key) for key in package["job_admin"]}
-        expected_admin = dict(package["job_admin"])
-        if current_admin != expected_admin:
-            restored = cron_jobs.update_job(job_id, expected_admin, expected=current_admin)
+        job_preimage = package["job_preimage"]
+        job_postimage = package["job_postimage"]
+        job_fields = tuple(job_preimage)
+        current_admin = {key: observed.get(key) for key in job_fields}
+        expected_post = {key: job_postimage.get(key) for key in job_fields}
+        expected_pre = {key: job_preimage.get(key) for key in job_fields}
+        if current_admin == expected_pre:
+            pass
+        elif current_admin == expected_post:
+            restored = cron_jobs.update_job(job_id, expected_pre, expected=expected_post)
             if restored is None:
                 raise RuntimeError("rollback package job changed concurrently")
+        else:
+            raise RuntimeError("rollback package job conflict")
 
         for item in package["files"]:
             target = root / item["target"]
             preimage = root / item["preimage"]
-            expected_pre = (item["pre_hash"], int(item["pre_mode"]))
-            expected_post = (item["post_hash"], int(item["post_mode"]))
-            if target.is_file() and file_hash(target) == expected_pre[0] and file_mode(target) == expected_pre[1]:
+            expected_pre_file = (item["pre_hash"], int(item["pre_mode"]))
+            expected_post_file = (item["post_hash"], int(item["post_mode"]))
+            # A SIGKILL can leave the target name absent while the helper's
+            # durable marker and parked post-image are intact.  Recover that
+            # marker before classifying the target; otherwise the recovery
+            # evidence is mistaken for a third-party conflict.
+            if restore_marker_path(target).exists():
+                recover_file_restore(target)
+            current = file_state(target) if target.exists() else None
+            if current == expected_pre_file:
                 continue
-            if not target.is_file() or (file_hash(target), file_mode(target)) != expected_post:
+            if current != expected_post_file:
                 raise RuntimeError(f"rollback package file conflict: {target.name}")
-            restore_file_from_private_preimage(target, preimage, expected_postimage=expected_post)
-            if (file_hash(target), file_mode(target)) != expected_pre:
+            restore_file_from_private_preimage(target, preimage, expected_postimage=expected_post_file)
+            if file_state(target) != expected_pre_file:
                 raise RuntimeError(f"rollback package file restore failed: {target.name}")
     finally:
         cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR = original_constants
+    package["state"] = "completed"
+    package["completed"] = True
+    marker_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _fsync_parent(marker_path)
 
 
 def run_file_job_restore(root: Path):
@@ -539,8 +596,10 @@ def run_file_job_restore(root: Path):
     )
     package = {
         "schema_version": 1,
+        "state": "prepared",
         "job_id": job_id,
-        "job_admin": job_admin,
+        "job_preimage": job_admin,
+        "job_postimage": None,
         "files": [],
     }
     for target, candidate in candidates:
@@ -560,7 +619,11 @@ def run_file_job_restore(root: Path):
         # the next process; never discard them after an interruption.
         raise
     else:
-        marker.unlink()
+        package = json.loads(marker.read_text(encoding="utf-8"))
+        package["state"] = "completed"
+        package["completed"] = True
+        marker.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _fsync_parent(marker)
 
 
 def run_existing_rollback_package(
