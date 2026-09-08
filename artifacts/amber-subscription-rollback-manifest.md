@@ -5,7 +5,7 @@ Status: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 ## Identité contrôlée
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
-- Correctif R5 : SHA code à figer après les preuves confinées (consigné dans le handoff Kanban, sans activation).
+- Correctif R5 (code/tests/verifier) : `3113f5da8c08abac487fac756807d4b143a6a224` ; manifeste/handoff de revue dans le commit suivant, sans activation.
 - Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
 - Fichiers concernés: `hermes_cli/kanban_db.py`, `profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py`, et le vérificateur/test associés.
 
