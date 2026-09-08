@@ -327,7 +327,7 @@ def restore_file_from_private_preimage(
             temporary.unlink()
 
 
-def run_file_job_restore(root: Path):
+def _prepare_and_restore_file_job_package(root: Path):
     """Exercise exact candidate files and the existing job via native APIs.
 
     This is deliberately copy-only: it reads the active Amber jobs document
@@ -450,6 +450,117 @@ def run_file_job_restore(root: Path):
         )
         assert file_hash(target) == pre_hash
         assert file_mode(target) == pre_mode
+
+
+def _package_marker(root: Path) -> Path:
+    return root / "package-manifest.json"
+
+
+def _read_job_admin(path: Path, job_id: str) -> dict[str, object]:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    jobs = document.get("jobs", document) if isinstance(document, dict) else document
+    job = next((item for item in jobs if item.get("id") == job_id), None)
+    if not isinstance(job, dict):
+        raise RuntimeError(f"rollback package job is missing: {job_id}")
+    return {key: job.get(key) for key in ("enabled", "state", "paused_at", "paused_reason", "next_run_at")}
+
+
+def _resume_existing_file_job_package(root: Path) -> None:
+    """Consume an already-prepared package without reading live sources."""
+    marker_path = _package_marker(root)
+    package = json.loads(marker_path.read_text(encoding="utf-8"))
+    if package.get("schema_version") != 1 or not package.get("files"):
+        raise RuntimeError("rollback package manifest is malformed")
+    package_changed = False
+    for item in package["files"]:
+        preimage = root / item["preimage"]
+        if not preimage.is_file():
+            raise RuntimeError(f"rollback package pre-image is missing: {preimage.name}")
+        if "pre_hash" not in item or "pre_mode" not in item:
+            item["pre_hash"] = file_hash(preimage)
+            item["pre_mode"] = file_mode(preimage)
+            package_changed = True
+    if package_changed:
+        marker_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    from cron import jobs as cron_jobs
+
+    private_cron = root / "private-cron"
+    private_jobs = private_cron / "jobs.json"
+    if not private_jobs.is_file():
+        raise RuntimeError("rollback package job document is missing")
+    original_constants = cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR
+    cron_jobs.CRON_DIR = private_cron
+    cron_jobs.JOBS_FILE = private_jobs
+    cron_jobs.OUTPUT_DIR = private_cron / "output"
+    try:
+        job_id = str(package["job_id"])
+        observed = cron_jobs.get_job(job_id)
+        if not observed:
+            raise RuntimeError("rollback package job is missing")
+        current_admin = {key: observed.get(key) for key in package["job_admin"]}
+        expected_admin = dict(package["job_admin"])
+        if current_admin != expected_admin:
+            restored = cron_jobs.update_job(job_id, expected_admin, expected=current_admin)
+            if restored is None:
+                raise RuntimeError("rollback package job changed concurrently")
+
+        for item in package["files"]:
+            target = root / item["target"]
+            preimage = root / item["preimage"]
+            expected_pre = (item["pre_hash"], int(item["pre_mode"]))
+            expected_post = (item["post_hash"], int(item["post_mode"]))
+            if target.is_file() and file_hash(target) == expected_pre[0] and file_mode(target) == expected_pre[1]:
+                continue
+            if not target.is_file() or (file_hash(target), file_mode(target)) != expected_post:
+                raise RuntimeError(f"rollback package file conflict: {target.name}")
+            restore_file_from_private_preimage(target, preimage, expected_postimage=expected_post)
+            if (file_hash(target), file_mode(target)) != expected_pre:
+                raise RuntimeError(f"rollback package file restore failed: {target.name}")
+    finally:
+        cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR = original_constants
+
+
+def run_file_job_restore(root: Path):
+    """Prepare once, then consume the durable SQLite+job+three-file package."""
+    marker = _package_marker(root)
+    if marker.is_file():
+        _resume_existing_file_job_package(root)
+        return
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    live_jobs = Path(os.environ.get("AMBER_PROFILE_JOBS_FILE", "/home/rodrigue/.hermes/profiles/amber/cron/jobs.json"))
+    if not live_jobs.is_file():
+        raise RuntimeError("Amber jobs document is missing during package preparation")
+    job_id = "85fcd56ee535"
+    job_admin = _read_job_admin(live_jobs, job_id)
+    candidates = (
+        (root / "live/hermes_cli/kanban_db.py", ROOT / "hermes_cli/kanban_db.py"),
+        (root / "live/cron/jobs.py", ROOT / "cron/jobs.py"),
+        (root / "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py", SCRIPT),
+    )
+    package = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "job_admin": job_admin,
+        "files": [],
+    }
+    for target, candidate in candidates:
+        staged = root / "preimages" / target.name
+        package["files"].append({
+            "target": str(target.relative_to(root)),
+            "candidate": str(candidate),
+            "preimage": str(staged.relative_to(root)),
+            "post_hash": file_hash(candidate),
+            "post_mode": file_mode(candidate),
+        })
+    marker.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        _prepare_and_restore_file_job_package(root)
+    except Exception:
+        # The marker and staged pre-images are the durable recovery input for
+        # the next process; never discard them after an interruption.
+        raise
+    else:
+        marker.unlink()
 
 
 def run_existing_rollback_package(

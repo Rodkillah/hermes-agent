@@ -1,32 +1,42 @@
-# Candidat Amber subscription reconciliation — manifest rollback R8
+# Candidat Amber subscription reconciliation — manifeste SQLite et reprise bornée
 
-Status: candidat source-only. Aucun board live, gateway, job, abonnement, runtime ou Brain n'a été muté. Le job `85fcd56ee535` reste disabled/paused jusqu'à revue indépendante et gate Amber.
+Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtime ou Brain n'a été muté. Le job `85fcd56ee535` reste disabled/paused jusqu'à revue indépendante et gate Amber.
 
 ## Identité contrôlée
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
-- Candidat R8 (code, vérificateur et manifeste) : à figer avec le SHA unique de la livraison source, sans activation.
-- Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
+- Candidat: SHA exact consigné après le commit source final sur la branche `ironrod/forge-amber-subscription-transfer-20260907`.
 - Fichiers concernés: `hermes_cli/kanban_db.py`, `cron/jobs.py`, `profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py`, `artifacts/verify-amber-subscription-rollback.py`, et les tests associés.
 
-## Protocole de sûreté
+## Autorité et atomicité
 
-1. `kanban_notify_subs.subscription_generation` est une identité d'incarnation native: token SQLite de 32 hex, unique, immuable et généré sur toute insertion. Une suppression/recréation de la même clé reçoit nécessairement une nouvelle génération. La migration additive remplit les lignes legacy NULL; aucun appel public ne choisit le token.
-2. Chaque passe mutative relit le plan et les pré-images sous la transaction externe. Les images complètes contiennent la génération et les vrais NULL. L'inverse restaure uniquement owner/mode, accepte uniquement une avance de curseur, et refuse génération/champ stable/cursor incompatibles. Les anciens journaux sans génération sont refusés.
-3. Le job crée automatiquement un journal privé par batch sous `~/.hermes/profiles/amber/kanban-subscription-journals/iron-rod/<batch-id>/`: répertoire 0700, `prepared.json` 0600 fsync avant commit SQLite, puis marqueur `committed.json` fsync. Les écritures gardent des handles no-follow pour le parent, la racine et le batch, puis revalident leurs entrées après le fsync réel; si la racine ou le batch a été détaché, elles retirent seulement l'inode publié par cette passe et la transaction SQLite échoue avant COMMIT. Les lectures distinguent une absence ENOENT d'un ELOOP, refus de permission ou fichier spécial : ces derniers bloquent recovery et toute nouvelle passe. Une interruption avant marqueur est relue conservativement avant toute nouvelle passe: post-images compatibles => marqueur récupéré; pré-images compatibles => aborted; tout état mixte est refusé sans mutation. Un no-op ne modifie pas de journal antérieur. `--journal` reste un export de compatibilité append-only, jamais l'autorité de récupération.
+1. `kanban_notify_batches` et `kanban_notify_batch_entries` sont l'autorité durable dans le même `kanban.db` que `kanban_notify_subs`. Leur installation, index et triggers se fait dans une transaction `BEGIN IMMEDIATE`; une migration interrompue ne laisse pas de demi-ledger.
+2. Le schéma réel est validé: colonnes, `NOT NULL`, clés primaires, FK, `UNIQUE`, `CHECK`, JSON valides et triggers d'immuabilité. Un schéma homonyme affaibli est refusé; aucun import automatique de vieux JSON.
+3. Forward et inverse co-committent les abonnements et leurs images complètes. Les images doivent partager la clé `(task_id, platform, chat_id, thread_id)`. L'inverse vérifie le board du forward, restaure via les gardes natives et journalise l'observation réellement présente après restauration; une absence finale est représentée par JSON `null`.
+4. Les générations d'abonnement, origines, métadonnées, `created_at` et curseurs sont conservés. Les curseurs ne régressent pas, les conflits humains annulent l'inverse sans écrasement, et le replay lit le ledger SQLite par `batch_id`/digest.
 
-## Preuve copies privées
+## Paquet durable de rollback
 
-`artifacts/verify-amber-subscription-rollback.py` utilise des DB, journaux, verrou historique, document de job et fichiers runtime jetables sous une même racine privée. Il exécute dans cet ordre réel : verrou exclusif, recovery des batches, apply journalisé, inverse native, restauration administrative guarded du seul job par l'API cron pendant que `cron/jobs.py` candidat est encore sur disque, puis restauration conditionnelle des trois fichiers exacts (`hermes_cli/kanban_db.py`, `cron/jobs.py`, `profiles/amber/scripts/kanban_telegram_subscribe_all.py`). Les pré-images/modes/hash sont contrôlés sur copies; une création concurrente post-garde est conservée sans écrasement. Aucun restore global de DB/jobs ni document de job n'est produit.
+`artifacts/verify-amber-subscription-rollback.py` sépare la préparation et la consommation. La préparation privée lit une fois les trois sources et le job, conserve les trois pré-images/hash/modes et le document de job sous une racine jetable. Elle crée un `package-manifest.json` d'état de reprise avant l'exécution mutative.
+
+L'entrée opérationnelle consomme ensuite ce paquet existant: DB + `forward_batch_id` explicite, document de job privé et trois fichiers privés. Elle ne reseed pas, ne recopie pas de source live, ne réinstalle pas de fixture et ne reconstruit pas les pré-images après interruption. Un fichier déjà revenu à sa pré-image est acquitté; un post-image candidat est restauré par CAS; tout état inattendu est un conflit. Le job est restauré par l'API cron avec `expected` guarded. Une interruption au job ou sur chacun des trois fichiers est rejouable dans un processus neuf sur les mêmes copies.
+
+Ordre exercé: verrou historique → lecture/recovery du ledger SQLite → inverse native → restauration guarded du job → restauration conditionnelle des trois fichiers. Le replay d'un batch déjà `reverted` n'applique aucun second inverse.
+
+## Exports et classification post-COMMIT
+
+Les JSON sont des exports facultatifs non autoritatifs, générés après COMMIT. Le code ne lit plus un export existant sous le verrou; `lstat` refuse FIFO/symlink/non-fichier et une panne d'export conserve le batch SQLite `committed` avec avertissement.
+
+Si une exception survient après un COMMIT possible, le script rouvre la DB de confiance, relit le `batch_id` et classe l'état durable; DB illisible ou incohérente = `unknown` fail-closed, jamais retry implicite ni succès déduit d'un export.
 
 ## Préconditions de gate (non réalisées)
 
-1. Revue Architect verte du SHA exact, puis retrait de l'override Terra pour le reviewer.
-2. Vérifier le job identique (`85fcd56ee535`, no_agent, 1 min, disabled/paused), WIP effectif, fichiers et hash/modes avant tout apply.
-3. Backup SQLite ciblé avec `VACUUM INTO` et `quick_check`; journal privé disponible et chemin contrôlé. Sauvegarder les trois fichiers ciblés avec hash/mode et pré-image sur le même système de fichiers.
-4. Quiescence prouvée avant tout fichier : job désactivé/pausé, aucun run en vol, gateway arrêtée selon gate Amber, puis relire hash/mode. Toute divergence ou création post-garde refuse le retour et conserve le conflit; ne jamais appliquer le retour à un chemin déjà recréé.
-5. Activation native réversible du seul job existant après gate Amber; premier canari limité: événement -> session Amber -> action native, avec probes et lecture de retour.
+1. Revue Architect verte du SHA exact, puis gate Amber explicite.
+2. Vérifier le job identique (`85fcd56ee535`, `no_agent`, 1 min, disabled/paused), WIP effectif, fichiers et hash/modes avant tout apply.
+3. Backup SQLite ciblé avec `VACUUM INTO` et `quick_check`; sauvegarder les trois fichiers ciblés avec hash/mode et pré-images sur le même système de fichiers.
+4. Quiescence prouvée avant tout fichier: job désactivé/pausé, aucun run en vol, gateway arrêtée selon gate Amber, puis relire hash/mode. Toute divergence ou création post-garde refuse le retour.
+5. Activation native réversible du seul job existant après gate Amber; canari borné événement → session Amber → action native, avec probes et lecture de retour.
 
 ## Retour sûr
 
-Avant un retour old-code: pause native du job, quiescence gateway prouvée et absence de run/descripteur en vol; sous le verrou historique, résoudre les journaux avec ce code et appliquer l'inverse native sur leurs pré/post-images. Restaurer ensuite l'administration du seul job par l'API cron guarded tant que le nouveau `cron/jobs.py` reste disponible, puis les trois fichiers ciblés par la revendication conditionnelle décrite ci-dessus. Conserver le schéma additif, index et triggers lors du retour au code base: l'ancien code continue de lire les colonnes additionnelles. Ne pas restaurer globalement `kanban.db` ni `jobs.json`; préserver claims, historique et autres jobs.
+Le rollback candidat est un revert Git du SHA exact vers son parent, après revue. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.

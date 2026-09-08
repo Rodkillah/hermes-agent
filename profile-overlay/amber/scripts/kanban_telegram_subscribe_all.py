@@ -528,12 +528,15 @@ def _validate_export_path(path: Path) -> None:
     if parent.exists() and not parent.is_dir():
         raise RuntimeError("journal parent is not a directory")
     parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and (path.is_symlink() or not path.is_file()):
+    # The export is replaceable compatibility output, never recovery input.
+    # Do not follow or read an existing pathname while the reconciliation lock
+    # is held: a FIFO would block the durable SQLite result indefinitely.
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(current.st_mode):
         raise RuntimeError("journal export path is unsafe")
-    if path.exists():
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(parsed, list):
-            raise RuntimeError("journal export is not a list")
 
 
 def _append_export(path: Path, entries: list[dict[str, Any]], *, batch_id: str) -> None:
@@ -923,6 +926,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--batch-id", help="stable opaque ID for one idempotent forward batch")
     args = parser.parse_args(argv)
+    batch_id: str | None = None
     if not DB_PATH.is_file():
         print("kanban_subscription_error: canonical board missing; refusing fallback", file=sys.stderr)
         return 1
@@ -961,6 +965,30 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True))
         return 0
     except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as error:
+        # ``write_txn`` can surface an exception after SQLite has committed
+        # (for example a post-COMMIT invariant check).  Reopen the configured
+        # trusted DB and classify the durable batch before reporting failure;
+        # never retry or infer state from the compatibility export.  An unreadable
+        # DB remains explicitly unknown and fail-closed.
+        if not args.dry_run and batch_id:
+            try:
+                with kb.connect(DB_PATH, board=BOARD) as probe:
+                    durable = kb.get_notify_batch(probe, batch_id)
+                if durable is not None:
+                    stored = json.loads(durable["result_json"])
+                    print(json.dumps({
+                        "batch_id": batch_id,
+                        "state": durable["state"],
+                        "result": stored,
+                        "warning": "post_commit_exception_reclassified",
+                    }, sort_keys=True), file=sys.stderr)
+                    return 1
+            except Exception as probe_error:
+                print(
+                    f"kanban_subscription_unknown: durable batch {batch_id} "
+                    f"could not be read after error: {probe_error}",
+                    file=sys.stderr,
+                )
         print(f"kanban_subscription_error: {error}", file=sys.stderr)
         return 1
 
