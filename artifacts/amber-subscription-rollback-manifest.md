@@ -6,7 +6,7 @@ Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
 - Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
-- Implémentation exacte de ce rework: `8e7b4a854d` (parent `cf3e9c95de`). Le candidat final est le HEAD de cette branche au gel de revue ; aucun autre SHA ne vaut candidat.
+- Implémentation exacte de ce rework: `7af432a6e94316bd8072e78c6be30cd852d2c440` (parent `642a4d464b49cb23f3d312ff438ffaf9c4afbe6b`). Le candidat final est le HEAD de cette branche au gel de revue ; aucun autre SHA ne vaut candidat.
 - Fichiers de ce rework: `artifacts/verify-amber-subscription-rollback.py`, `artifacts/amber-subscription-rollback-manifest.md`.
 - Le worktree candidat doit être relu propre et le SHA final exact doit être gelé avant revue; aucun autre SHA ne vaut candidat.
 
@@ -32,7 +32,8 @@ Publication: manifeste temporaire écrit et fsyncé, répertoire fsyncé, rempla
 - Contrat indépendant R14 (`test_review_round14_contract.py`) → 11 passed, rc 0. Il couvre le refus sans effet d'un paquet absent/malformé/incomplet ou en conflit, l'usage exclusif des post-images durables, l'ordre inverse → CAS job → fichiers, le replay sans second effet et la récupération `.previous`.
 - Rejeu indépendant R10→R14 sous sandbox isolé avec adaptateurs de fixtures explicites R14 (aucune désélection) → 77 passed, rc 0. Les deux anciens contrôles de préparation implicite ont été réalignés sur le contrat strict « prepare puis consume »; le contrôle de refus d'un paquet absent est conservé.
 - `env -u HERMES_KANBAN_TASK -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD python artifacts/verify-amber-subscription-rollback.py` → `targeted Amber rollback verifier: PASS`, `quick_check=ok`, conflit concurrent refusé sans overwrite, rc 0.
-- `python3 -m py_compile artifacts/verify-amber-subscription-rollback.py cron/jobs.py hermes_cli/kanban_db.py` → rc 0; `git diff --check HEAD^ HEAD` → rc 0.
+- Contrat indépendant R16 (`test_review_round16_contract.py`) → 7 passed, rc 0. Il couvre le refus sans effet d'un marqueur non régulier, d'une identité de job hors périmètre ou dupliquée, et d'un état administratif observé incomplet ou mal typé.
+- `python3 -m py_compile artifacts/verify-amber-subscription-rollback.py cron/jobs.py hermes_cli/kanban_db.py` → rc 0; `git diff --check bba2fe5e..HEAD` → rc 0.
 
 ## Préconditions de gate (non réalisées)
 
@@ -44,4 +45,4 @@ Publication: manifeste temporaire écrit et fsyncé, répertoire fsyncé, rempla
 
 ## Retour sûr
 
-Le rollback source-only du candidat exact est le revert du commit d'implémentation `8e7b4a854d` vers son parent `cf3e9c95de`, puis, si nécessaire, des commits documentaires ultérieurs dans l'ordre inverse. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.
+Le rollback source-only du candidat exact est le revert du commit `7af432a6e94316bd8072e78c6be30cd852d2c440` vers `642a4d464b49cb23f3d312ff438ffaf9c4afbe6b`, puis, si nécessaire, des commits antérieurs dans l'ordre inverse. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.
