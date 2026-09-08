@@ -2923,35 +2923,38 @@ def _ensure_notify_subscription_generation(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if exists is None:
         return
+    # ALTER TABLE is transactional in SQLite, but only when the transaction
+    # starts *before* ALTER.  Starting it after the additive column left a
+    # kill window with a durable NULL-generation column.
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
-    if "subscription_generation" not in columns:
-        _add_column_if_missing(
-            conn,
-            "kanban_notify_subs",
-            "subscription_generation",
-            "subscription_generation TEXT DEFAULT NULL CHECK ("
-            "subscription_generation IS NULL OR (length(subscription_generation) = 32 "
-            "AND subscription_generation NOT GLOB '*[^0-9a-f]*'))",
-        )
-    has_null = conn.execute(
-        "SELECT 1 FROM kanban_notify_subs WHERE subscription_generation IS NULL LIMIT 1"
-    ).fetchone() is not None
-    trigger_names = {
-        row["name"]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='trigger' "
-            "AND name IN ('trg_notify_sub_generation_insert', "
-            "'trg_notify_sub_generation_required', "
-            "'trg_notify_sub_generation_immutable')"
-        )
-    }
-    if not has_null and len(trigger_names) == 3:
-        return
-    # One immediate transaction keeps legacy fill, uniqueness and trigger
-    # installation indivisible.  The random token is generated in SQLite, so
-    # no public API can forge an incarnation used by guarded rollback.
+    if conn.in_transaction:
+        raise RuntimeError("notify subscription generation migration requires a fresh transaction")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if "subscription_generation" not in columns:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "subscription_generation",
+                "subscription_generation TEXT DEFAULT NULL CHECK ("
+                "subscription_generation IS NULL OR (length(subscription_generation) = 32 "
+                "AND subscription_generation NOT GLOB '*[^0-9a-f]*'))",
+            )
+        has_null = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE subscription_generation IS NULL LIMIT 1"
+        ).fetchone() is not None
+        trigger_names = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name IN ('trg_notify_sub_generation_insert', "
+                "'trg_notify_sub_generation_required', "
+                "'trg_notify_sub_generation_immutable')"
+            )
+        }
+        if not has_null and len(trigger_names) == 3:
+            conn.execute("COMMIT")
+            return
         if has_null:
             conn.execute(
                 "UPDATE kanban_notify_subs SET subscription_generation = lower(hex(randomblob(16))) "
@@ -12611,11 +12614,35 @@ def restore_notify_sub_state(
         "user_id", "user_id_alt", "chat_type", "delivery_metadata", "created_at",
         "subscription_generation",
     )
-    required = (*key_fields, identity_field, "notifier_profile", "delivery_mode")
-    if any(field not in post_image for field in required):
-        raise ValueError("post_image is missing subscription identity")
-    if pre_image is not None and any(field not in pre_image for field in required):
-        raise ValueError("pre_image is missing subscription identity")
+    image_fields = (
+        *key_fields, "user_id", "user_id_alt", "chat_type", "notifier_profile",
+        "delivery_mode", "delivery_metadata", "created_at", "last_event_id",
+        identity_field,
+    )
+
+    def _validate_image(image: Mapping[str, Any], label: str) -> None:
+        if not isinstance(image, Mapping) or any(field not in image for field in image_fields):
+            raise ValueError(f"{label} is missing a complete subscription image")
+        generation = image[identity_field]
+        if not isinstance(generation, str) or len(generation) != 32 or any(
+            char not in "0123456789abcdef" for char in generation
+        ):
+            raise ValueError(f"{label} has an invalid subscription generation")
+        if not all(isinstance(image[field], str) and image[field] for field in key_fields[:3]):
+            raise ValueError(f"{label} has an invalid subscription key")
+        if image["thread_id"] is None:
+            raise ValueError(f"{label} has a null thread id")
+        if not isinstance(image["created_at"], int) or not isinstance(image["last_event_id"], int):
+            raise ValueError(f"{label} has an invalid cursor or creation time")
+        if not isinstance(image["notifier_profile"], str) or not isinstance(image["delivery_mode"], str):
+            raise ValueError(f"{label} has an invalid owner or delivery mode")
+
+    _validate_image(post_image, "post_image")
+    if pre_image is not None:
+        _validate_image(pre_image, "pre_image")
+        for field in (*key_fields, identity_field, *stable_fields):
+            if pre_image[field] != post_image[field]:
+                raise ValueError("pre_image and post_image do not describe one subscription incarnation")
 
     key = tuple(post_image[field] if field != "thread_id" else post_image[field] or "" for field in key_fields)
     with write_txn(conn, allow_nested=True):
@@ -12829,7 +12856,8 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
-    with write_txn(conn):
+    # Rollback composes the guarded delete with its outer all-or-nothing batch.
+    with write_txn(conn, allow_nested=True):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ?",

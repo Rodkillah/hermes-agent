@@ -91,8 +91,28 @@ def _write_private_json(path: Path, payload: Mapping[str, Any], *, exclusive: bo
     if exclusive and path.exists():
         raise FileExistsError(path)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # O_NOFOLLOW protects the leaf; capture and re-check the parent as well so
+    # a directory swap cannot redirect a prepared/committed marker mid-write.
+    parent_before = path.parent.lstat()
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
     try:
+        parent_after = path.parent.lstat()
+        if (
+            stat.S_ISLNK(parent_after.st_mode)
+            or parent_after.st_dev != parent_before.st_dev
+            or parent_after.st_ino != parent_before.st_ino
+        ):
+            os.close(fd)
+            fd = -1
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise RuntimeError("journal parent changed during private write")
         offset = 0
         while offset < len(data):
             written = os.write(fd, data[offset:])
@@ -101,7 +121,8 @@ def _write_private_json(path: Path, payload: Mapping[str, Any], *, exclusive: bo
             offset += written
         os.fsync(fd)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
     try:
         if exclusive:
             # link() is an exclusive publish: unlike rename(), it never
@@ -135,6 +156,98 @@ def _image_matches(current: Optional[dict[str, Any]], image: Optional[Mapping[st
     return True
 
 
+_IMAGE_FIELDS = (
+    "task_id", "platform", "chat_id", "thread_id", "user_id", "user_id_alt",
+    "chat_type", "notifier_profile", "delivery_mode", "delivery_metadata",
+    "subscription_generation", "created_at", "last_event_id",
+)
+
+
+def _validate_image(image: Any, *, label: str) -> dict[str, Any]:
+    """Reject partial or ambiguous recovery images before touching SQLite."""
+    if not isinstance(image, dict) or any(field not in image for field in _IMAGE_FIELDS):
+        raise RuntimeError(f"{label} is not a complete subscription image")
+    generation = image["subscription_generation"]
+    if not isinstance(generation, str) or len(generation) != 32 or any(
+        char not in "0123456789abcdef" for char in generation
+    ):
+        raise RuntimeError(f"{label} has invalid subscription generation")
+    if not all(isinstance(image[field], str) and image[field] for field in ("task_id", "platform", "chat_id")):
+        raise RuntimeError(f"{label} has invalid subscription key")
+    if image["thread_id"] is None or not isinstance(image["created_at"], int) or not isinstance(image["last_event_id"], int):
+        raise RuntimeError(f"{label} has invalid subscription cursor")
+    return image
+
+
+def _read_regular_json(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
+    """Read one marker without following a link or accepting a special file."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{label} is missing") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"{label} is unsafe")
+    raw = path.read_bytes()
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{label} is malformed") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} is malformed")
+    return value, raw
+
+
+def _load_batch_record(candidate: Path) -> tuple[dict[str, Any], bool]:
+    """Validate a whole durable record before treating it as resolved."""
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise RuntimeError("unsafe journal batch entry")
+    prepared = candidate / "prepared.json"
+    committed = candidate / "committed.json"
+    aborted = candidate / "aborted.json"
+    if not prepared.exists():
+        if committed.exists() or aborted.exists():
+            raise RuntimeError("journal marker has no prepared record")
+        return {}, False
+    payload, raw = _read_regular_json(prepared, label="journal preparation")
+    if payload.get("schema_version") != 1 or payload.get("batch_id") != candidate.name:
+        raise RuntimeError("journal preparation identity is malformed")
+    if payload.get("phase") not in {"forward", "inverse"}:
+        raise RuntimeError("journal preparation phase is malformed")
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise RuntimeError("journal preparation entries are malformed")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise RuntimeError("journal entry is malformed")
+        post = _validate_image(entry.get("post_image"), label=f"journal post-image {index}")
+        pre = entry.get("pre_image")
+        if pre is not None:
+            pre = _validate_image(pre, label=f"journal pre-image {index}")
+            for field in _IMAGE_FIELDS:
+                if field in {"notifier_profile", "delivery_mode", "last_event_id"}:
+                    continue
+                if pre[field] != post[field]:
+                    raise RuntimeError("journal images identify different subscription incarnations")
+    resolved = False
+    if committed.exists():
+        marker, _ = _read_regular_json(committed, label="journal committed marker")
+        if (
+            marker.get("schema_version") != 1
+            or marker.get("batch_id") != candidate.name
+            or marker.get("prepared_sha256") != hashlib.sha256(raw).hexdigest()
+        ):
+            raise RuntimeError("journal committed marker does not match preparation")
+        resolved = True
+    if aborted.exists():
+        marker, _ = _read_regular_json(aborted, label="journal aborted marker")
+        if marker.get("batch_id") != candidate.name:
+            raise RuntimeError("journal aborted marker does not match preparation")
+        if resolved:
+            raise RuntimeError("journal has conflicting terminal markers")
+        resolved = True
+    return payload, resolved
+
+
 class BatchJournal:
     """Crash-recoverable private journal for one mutative reconciliation batch."""
 
@@ -165,12 +278,16 @@ class BatchJournal:
         )
 
     def mark_committed(self) -> None:
-        if not self.prepared_path.is_file():
-            raise RuntimeError("journal preparation is missing")
-        digest = hashlib.sha256(self.prepared_path.read_bytes()).hexdigest()
+        payload, raw = _read_regular_json(self.prepared_path, label="journal preparation")
+        if payload.get("batch_id") != self.batch_id:
+            raise RuntimeError("journal preparation identity is malformed")
         _write_private_json(
             self.committed_path,
-            {"schema_version": 1, "batch_id": self.batch_id, "prepared_sha256": digest},
+            {
+                "schema_version": 1,
+                "batch_id": self.batch_id,
+                "prepared_sha256": hashlib.sha256(raw).hexdigest(),
+            },
             exclusive=True,
         )
 
@@ -182,37 +299,33 @@ class BatchJournal:
         _private_directory(root)
         with kb.write_txn(conn):
             for candidate in sorted(root.iterdir()):
-                if candidate.is_symlink() or not candidate.is_dir():
-                    raise RuntimeError("unsafe journal batch entry")
-                prepared = candidate / "prepared.json"
-                committed = candidate / "committed.json"
-                if committed.exists() or (candidate / "aborted.json").exists() or not prepared.exists():
+                data, resolved = _load_batch_record(candidate)
+                if not data or resolved:
                     continue
-                data = json.loads(prepared.read_text(encoding="utf-8"))
-                entries = data.get("entries")
-                if not isinstance(entries, list) or not entries:
-                    raise RuntimeError("journal preparation is malformed")
+                entries = data["entries"]
                 post = pre = True
                 for entry in entries:
-                    if not isinstance(entry, dict):
-                        raise RuntimeError("journal entry is malformed")
-                    image = entry.get("post_image")
-                    if not isinstance(image, dict):
-                        raise RuntimeError("journal post-image is missing")
+                    image = entry["post_image"]
                     rows = _fetch_target_raw(conn, image)
                     current = rows[0] if len(rows) == 1 else None
                     post = post and _image_matches(current, image)
                     pre = pre and _image_matches(current, entry.get("pre_image"))
-                phase = data.get("phase", "forward")
+                phase = data["phase"]
                 applied = post if phase == "forward" else pre
                 unapplied = pre if phase == "forward" else post
+                prepared = candidate / "prepared.json"
+                committed = candidate / "committed.json"
                 if applied:
                     journal = BatchJournal.__new__(BatchJournal)
                     journal.path, journal.prepared_path, journal.committed_path = candidate, prepared, committed
-                    journal.batch_id = str(data.get("batch_id") or candidate.name)
+                    journal.batch_id = str(data["batch_id"])
                     journal.mark_committed()
                 elif unapplied:
-                    _write_private_json(candidate / "aborted.json", {"batch_id": data.get("batch_id")}, exclusive=True)
+                    _write_private_json(
+                        candidate / "aborted.json",
+                        {"schema_version": 1, "batch_id": data["batch_id"]},
+                        exclusive=True,
+                    )
                 else:
                     raise RuntimeError("journal recovery is ambiguous; refusing a new batch")
 

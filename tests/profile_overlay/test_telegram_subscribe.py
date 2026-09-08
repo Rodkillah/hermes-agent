@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -153,6 +154,38 @@ def test_one_failure_rolls_back_entire_batch_without_rewinding_or_deleting_data(
     assert rows[second]["notifier_profile"] == "forge"
     assert rows[first]["last_event_id"] == 0
     assert rows[second]["last_event_id"] == 0
+
+
+def test_guarded_file_restore_refuses_post_guard_concurrent_runtime_edit(monkeypatch, tmp_path):
+    """The real restore primitive must not reduce to hash-check then copy."""
+    namespace = runpy.run_path(str(ROOT / "artifacts/verify-amber-subscription-rollback.py"))
+    restore = namespace["restore_file_from_private_preimage"]
+    target = tmp_path / "live" / "kanban_db.py"
+    target.parent.mkdir()
+    target.write_bytes(b"candidate post-image\n")
+    target.chmod(0o644)
+    staged = tmp_path / "preimages" / "kanban_db.py"
+    staged.parent.mkdir()
+    staged.write_bytes(b"pre-activation image\n")
+    staged.chmod(0o640)
+    expected = (namespace["file_hash"](target), namespace["file_mode"](target))
+    concurrent = b"synthetic concurrent runtime edit\n"
+    original_link = namespace["os"].link
+    injected = []
+
+    def link(source, destination, *args, **kwargs):
+        if Path(source) == next(target.parent.glob(".kanban_db.py.restore-*")) and Path(destination) == target:
+            target.write_bytes(concurrent)
+            target.chmod(0o600)
+            injected.append(target)
+        return original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(namespace["os"], "link", link)
+    with pytest.raises(RuntimeError, match="changed during guarded restore"):
+        restore(target, staged, expected_postimage=expected)
+    assert injected
+    assert target.read_bytes() == concurrent
+    assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_explicit_db_scope_ignores_poisoned_kanban_environment(monkeypatch, db, tmp_path, capsys):

@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,6 +154,71 @@ def file_mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+def file_state(path: Path) -> tuple[str, int]:
+    """Return the exact regular-file content and mode, rejecting link targets."""
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise RuntimeError(f"rollback file is not a regular file: {path}")
+    return file_hash(path), file_mode(path)
+
+
+def restore_file_from_private_preimage(
+    target: Path,
+    staged_preimage: Path,
+    *,
+    expected_postimage: tuple[str, int],
+) -> None:
+    """Restore one file without overwriting a name claimed by a concurrent edit.
+
+    The activation gate must first make the runtime quiescent.  This helper
+    additionally claims the target pathname by atomically parking the verified
+    post-image, then links a private fully-written pre-image into the now-empty
+    pathname.  A writer that appears after the guard can create that pathname;
+    link then fails with EEXIST and its content is preserved rather than copied
+    over.  The parked candidate remains as conflict evidence for the operator.
+    """
+    target = Path(target)
+    staged_preimage = Path(staged_preimage)
+    preimage = file_state(staged_preimage)
+    if file_state(target) != expected_postimage:
+        raise RuntimeError("runtime file changed before guarded restore")
+
+    parked = target.with_name(f".{target.name}.postimage-{uuid.uuid4().hex}")
+    temporary = target.with_name(f".{target.name}.restore-{uuid.uuid4().hex}")
+    os.replace(target, parked)
+    try:
+        # Recheck after the atomic pathname claim: a write racing the original
+        # target is never mistaken for the candidate being rolled back.
+        if file_state(parked) != expected_postimage:
+            raise RuntimeError("runtime file changed during guarded restore")
+        shutil.copy2(staged_preimage, temporary)
+        if file_state(temporary) != preimage:
+            raise RuntimeError("private pre-image changed during guarded restore")
+        if file_state(parked) != expected_postimage:
+            raise RuntimeError("runtime file changed during guarded restore")
+        try:
+            # link(2) is conditional creation: unlike replace/copy it never
+            # overwrites a target created by a post-guard concurrent editor.
+            os.link(temporary, target)
+        except FileExistsError as exc:
+            raise RuntimeError("runtime file changed during guarded restore") from exc
+        if file_state(target) != preimage:
+            raise RuntimeError("guarded restore did not produce the pre-image")
+    except Exception:
+        # Recreate the parked post-image only if no concurrent editor owns the
+        # pathname.  Never overwrite a new target while handling a conflict.
+        if not target.exists():
+            try:
+                os.link(parked, target)
+            except FileExistsError:
+                pass
+        raise
+    else:
+        parked.unlink()
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def run_file_job_restore(root: Path):
     """Exercise exact candidate files and the existing job via native APIs.
 
@@ -168,27 +234,45 @@ def run_file_job_restore(root: Path):
     for target in (target_db, target_script):
         target.parent.mkdir(parents=True, exist_ok=True)
 
-    # The current candidate bytes are the real files to install.  The base
-    # runtime contains kanban_db.py but did not contain this new overlay
-    # script, so restoration must preserve that exact absence.
-    base_db = subprocess.check_output(
-        ["git", "show", f"{base}:hermes_cli/kanban_db.py"], cwd=ROOT
-    )
-    target_db.write_bytes(base_db)
-    target_db.chmod(0o640)
-    pre_db = {"hash": file_hash(target_db), "mode": file_mode(target_db)}
-    assert not target_script.exists()
+    # Snapshot the actual two runtime targets into a private staging area.  The
+    # overlay script is already installed on the host, so treating it as an
+    # assumed absence would turn a rollback into an unintended deletion.
+    runtime_db = Path(os.environ.get(
+        "AMBER_RUNTIME_KANBAN_DB", "/mnt/usb-ext4/hermes-agent-runtime/hermes_cli/kanban_db.py"
+    ))
+    runtime_script = Path(os.environ.get(
+        "AMBER_RUNTIME_RECONCILER", "/home/rodrigue/.hermes/profiles/amber/scripts/kanban_telegram_subscribe_all.py"
+    ))
+    targets = ((runtime_db, target_db, ROOT / "hermes_cli/kanban_db.py"), (runtime_script, target_script, SCRIPT))
+    preimages = []
+    for source, target, candidate in targets:
+        if not source.is_file():
+            raise AssertionError(f"runtime rollback target is missing: {source}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        staged_pre = root / "preimages" / target.name
+        staged_pre.parent.mkdir(mode=0o700, exist_ok=True)
+        shutil.copy2(target, staged_pre)
+        preimages.append((target, candidate, staged_pre, file_hash(target), file_mode(target)))
 
-    shutil.copy2(ROOT / "hermes_cli/kanban_db.py", target_db)
-    shutil.copy2(SCRIPT, target_script)
-    assert file_hash(target_db) == file_hash(ROOT / "hermes_cli/kanban_db.py")
-    assert file_hash(target_script) == file_hash(SCRIPT)
-    target_db.write_bytes(base_db)
-    target_db.chmod(pre_db["mode"])
-    target_script.unlink()
-    assert file_hash(target_db) == pre_db["hash"]
-    assert file_mode(target_db) == pre_db["mode"]
-    assert not target_script.exists()
+    # Install and prove the exact candidate bytes on copies only.
+    for target, candidate, _staged_pre, _pre_hash, _pre_mode in preimages:
+        shutil.copy2(candidate, target)
+        assert file_hash(target) == file_hash(candidate)
+        assert file_mode(target) == file_mode(candidate)
+
+    # Restore through conditional pathname creation, not hash-check then copy.
+    # Production activation additionally holds the job/gateway quiescence gate;
+    # this copy-only verifier proves that a post-guard name conflict is refused
+    # without overwriting the concurrent content.
+    for target, candidate, staged_pre, pre_hash, pre_mode in preimages:
+        restore_file_from_private_preimage(
+            target,
+            staged_pre,
+            expected_postimage=(file_hash(candidate), file_mode(candidate)),
+        )
+        assert file_hash(target) == pre_hash
+        assert file_mode(target) == pre_mode
 
     # Read the real existing job document, then route cron.jobs through an
     # isolated copy.  Only the named job's administrative fields may change;
@@ -226,6 +310,14 @@ def run_file_job_restore(root: Path):
         assert activated and activated["enabled"] is True
         paused = cron_jobs.pause_job(observed["id"], reason="private rollback verifier")
         assert paused and paused["enabled"] is False and paused["state"] == "paused"
+        # The public API owns its lock, so make a harmless guarded probe first,
+        # then re-read every administrative field before the restoring update.
+        # A concurrent native update between pause and restore is a conflict,
+        # never a value to overwrite with the stale pre-image.
+        post_admin = {key: paused.get(key) for key in admin}
+        probe = cron_jobs.update_job(observed["id"], {"next_run_at": post_admin["next_run_at"]})
+        if not probe or any(probe.get(key) != value for key, value in post_admin.items()):
+            raise RuntimeError("cron administrative state changed before guarded restore")
         restored = cron_jobs.update_job(observed["id"], admin)
         assert restored and all(restored.get(key) == value for key, value in admin.items())
     finally:

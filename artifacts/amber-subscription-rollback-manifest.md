@@ -1,11 +1,11 @@
-# Candidat Amber subscription reconciliation — manifest rollback R3
+# Candidat Amber subscription reconciliation — manifest rollback R5
 
 Status: candidat source-only. Aucun board live, gateway, job, abonnement, runtime ou Brain n'a été muté. Le job `85fcd56ee535` reste disabled/paused jusqu'à revue indépendante et gate Amber.
 
 ## Identité contrôlée
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
-- Correctif R3: `e3f840f2265bb4d1eadc9d5a01cfcecff8d4125c`.
+- Correctif R5 : SHA code à figer après les preuves confinées (consigné dans le handoff Kanban, sans activation).
 - Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
 - Fichiers concernés: `hermes_cli/kanban_db.py`, `profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py`, et le vérificateur/test associés.
 
@@ -17,15 +17,16 @@ Status: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 
 ## Preuve copies privées
 
-`artifacts/verify-amber-subscription-rollback.py` utilise des DB et journaux jetables, et lit seulement le document de job Amber pour en faire une copie privée. Il installe/retire les octets réels du candidat `kanban_db.py` et du script overlay contre la pré-image runtime connue, puis utilise `cron.jobs.update_job`/`pause_job` uniquement avec `JOBS_FILE` redirigé vers la copie. Il vérifie le retour des champs administrés du job ciblé et l'absence de changement sur les autres jobs. Aucun secret ni document de job n'est imprimé.
+`artifacts/verify-amber-subscription-rollback.py` utilise des DB et journaux jetables, et lit seulement le document de job Amber pour en faire une copie privée. Il capture les pré-images et modes des deux cibles réellement installées (`hermes_cli/kanban_db.py` et `profiles/amber/scripts/kanban_telegram_subscribe_all.py`) dans une zone privée, installe les octets exacts du candidat sur copies puis restaure par revendication conditionnelle du chemin : post-image vérifiée et parquée atomiquement, pré-image entièrement écrite dans un temporaire privé, puis `link(2)` vers le nom devenu vacant. Une création concurrente post-garde fait échouer `link` et est conservée, sans écrasement ; le post-image parqué demeure comme preuve de conflit. Le test injecte aussi un changement de mode concurrent et vérifie sa conservation. Le protocole live exige en plus la quiescence explicite de gateway/job (aucun run en vol ni descripteur préexistant) : le mécanisme de nom protège un éditeur qui arrive après la garde, il ne transforme pas un FD déjà ouvert en CAS. Le vérificateur utilise ensuite `cron.jobs.update_job`/`pause_job` uniquement avec `JOBS_FILE` redirigé vers la copie, et refuse le changement concurrent des champs administrés. Il vérifie retour exact des fichiers/modes et du job ciblé, sans modification des autres jobs. Aucun secret ni document de job n'est imprimé.
 
 ## Préconditions de gate (non réalisées)
 
 1. Revue Architect verte du SHA exact, puis retrait de l'override Terra pour le reviewer.
 2. Vérifier le job identique (`85fcd56ee535`, no_agent, 1 min, disabled/paused), WIP effectif, fichiers et hash/modes avant tout apply.
-3. Backup SQLite ciblé avec `VACUUM INTO` et `quick_check`; journal privé disponible et chemin contrôlé.
-4. Activation native réversible du seul job existant après gate Amber; premier canari limité: événement -> session Amber -> action native, avec probes et lecture de retour.
+3. Backup SQLite ciblé avec `VACUUM INTO` et `quick_check`; journal privé disponible et chemin contrôlé. Sauvegarder aussi les deux fichiers ciblés avec hash/mode et pré-image sur le même système de fichiers.
+4. Quiescence prouvée avant tout fichier : job désactivé/pausé, aucun run en vol, gateway arrêtée selon gate Amber, puis relire hash/mode. Toute divergence ou création post-garde refuse le retour et conserve le conflit; ne jamais appliquer le retour à un chemin déjà recréé.
+5. Activation native réversible du seul job existant après gate Amber; premier canari limité: événement -> session Amber -> action native, avec probes et lecture de retour.
 
 ## Retour sûr
 
-Avant un retour old-code: pause native du job et absence de run en vol; résoudre les journaux avec ce code, appliquer l'inverse native sur leurs pré/post-images, puis restaurer les seuls fichiers ciblés avec hash/mode guards. Conserver le schéma additif, index et triggers lors du retour au code base: l'ancien code continue de lire les colonnes additionnelles. Ne pas restaurer globalement `kanban.db` ni `jobs.json`; préserver claims, historique et autres jobs.
+Avant un retour old-code: pause native du job, quiescence gateway prouvée et absence de run/descripteur en vol; résoudre les journaux avec ce code, appliquer l'inverse native sur leurs pré/post-images, puis restaurer les seuls fichiers ciblés par la revendication conditionnelle décrite ci-dessus. Conserver le schéma additif, index et triggers lors du retour au code base: l'ancien code continue de lire les colonnes additionnelles. Ne pas restaurer globalement `kanban.db` ni `jobs.json`; préserver claims, historique et autres jobs.
