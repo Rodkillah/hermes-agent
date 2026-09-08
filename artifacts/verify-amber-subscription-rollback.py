@@ -68,6 +68,12 @@ with tempfile.TemporaryDirectory(prefix="amber-subscription-rollback-") as temp:
         human = seed(conn, owner="human", chat_id="human-chat")
         before_forge = dict(kb.list_notify_subs(conn, forge)[0])
         before_notify = dict(kb.list_notify_subs(conn, notify_only)[0])
+        backup = Path(temp) / "before-rollback.db"
+        conn.execute("VACUUM INTO ?", (str(backup),))
+        with sqlite3.connect(f"file:{backup}?mode=ro", uri=True) as backup_conn:
+            assert backup_conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert backup_conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 5
+            assert backup_conn.execute("SELECT count(*) FROM kanban_notify_subs").fetchone()[0] == 4
 
         migrated = module.reconcile(conn)
         key = dict(task_id=forge, platform="telegram", chat_id="chat", thread_id="thread")
