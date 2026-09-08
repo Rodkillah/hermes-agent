@@ -8134,6 +8134,7 @@ def _run_one_job_body(
             and not delivery_attempted
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
+            and not (cancel_event is not None and cancel_event.is_set())
         ):
             normalized_deliver = _normalize_deliver_value(
                 _delivery_lane_value(job, for_failure=True)

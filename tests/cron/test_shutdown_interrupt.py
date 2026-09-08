@@ -506,6 +506,84 @@ class TestBaseExceptionThroughOwnerFencedFlow:
         assert mock_mark.call_args.kwargs["expected_fire_owner"] == "owner-be"
 
 
+class TestExceptionPathHonoursExternalCancellation:
+    """Failure notifications must not cross an explicit cancellation.
+
+    The exception handler is shared by failures from the worker itself and by
+    failures while persisting output.  Both cases must record the failed run
+    without emitting a second delivery; an ordinary failure remains alertable.
+    """
+
+    @pytest.mark.parametrize(
+        ("phase", "expected_deliveries"),
+        [
+            ("run_raises", 0),
+            ("save_raises", 0),
+            ("ordinary_failure_no_cancel", 1),
+        ],
+    )
+    def test_exception_delivery_respects_external_cancel(
+        self, tmp_path, phase, expected_deliveries
+    ):
+        import cron.executions as executions
+        import cron.jobs as jobs
+        import cron.scheduler as sched
+
+        store = tmp_path / phase
+        cancel = threading.Event()
+        delivered = []
+        teardown = []
+
+        with jobs.use_cron_store(store):
+            row = jobs.create_job(prompt="sandbox", schedule="every 1h", name=phase)
+            job = jobs.claim_job_for_fire(row["id"], return_job=True)
+            execution = executions.create_execution(job["id"], source="direct")
+            job["execution_id"] = execution["id"]
+            job["deliver"] = "local"
+
+            def run(_job, **kwargs):
+                kwargs["defer_agent_teardown"].append(object())
+                if phase == "run_raises":
+                    cancel.set()
+                    raise ValueError("sandbox run failed after explicit cancellation")
+                if phase == "ordinary_failure_no_cancel":
+                    raise ValueError("sandbox ordinary failure")
+                return True, "sandbox output", "sandbox response", None
+
+            original_save = sched.save_job_output
+
+            def save(*args, **kwargs):
+                if phase == "save_raises":
+                    cancel.set()
+                    raise OSError("sandbox save failed after explicit cancellation")
+                return original_save(*args, **kwargs)
+
+            def deliver(_job, _content, **_kwargs):
+                delivered.append(True)
+
+            with patch.object(sched, "_get_hermes_home", return_value=store), \
+                 patch.object(sched, "_launch_external_cron_worker", return_value=False), \
+                 patch.object(sched, "run_job", side_effect=run), \
+                 patch.object(sched, "save_job_output", side_effect=save), \
+                 patch.object(sched, "_deliver_result", side_effect=deliver), \
+                 patch.object(sched, "_summarize_cron_failure_for_delivery", return_value="sandbox failure"), \
+                 patch.object(
+                     sched,
+                     "_teardown_cron_agent",
+                     side_effect=lambda *_args: teardown.append(True),
+                 ):
+                assert sched.run_one_job(job, cancel_event=cancel) is False
+
+            final = executions.get_execution(execution["id"])
+            stored = jobs.get_job(job["id"])
+
+        assert len(delivered) == expected_deliveries
+        assert len(teardown) == 1
+        assert final["status"] == "failed"
+        assert stored["last_status"] == "error"
+        assert stored["fire_claim"] is None
+
+
 class TestCallerLossAfterClaimAcquisition:
     """cirwel's integration assertion on #70638: if the HTTP/CLI caller is
     lost AFTER the claim was acquired, the gateway owner must produce at
