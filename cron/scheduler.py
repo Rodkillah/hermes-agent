@@ -716,6 +716,7 @@ from cron.jobs import (
     advance_next_runs,
     claim_dispatch,
     claim_job_for_fire,
+    FireClaimFenceContention,
     fire_claim_fence,
     clear_run_claim,
     get_due_jobs,
@@ -7328,6 +7329,15 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
     try:
         owns_fire_claim = heartbeat_fire_claim(job_id, expected_owner=owner)
+    except FireClaimFenceContention:
+        logger.warning(
+            "Job '%s': fire claim fence was contended before execution",
+            job_id,
+        )
+        _finish_unstarted(
+            "Fire claim fence was contended; execution was not started."
+        )
+        return True
     except Exception:
         logger.warning(
             "Job '%s': initial fire_claim validation failed",
@@ -7359,6 +7369,23 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                     )
                     return
                 last_confirmed = time.monotonic()
+            except FireClaimFenceContention:
+                logger.debug(
+                    "Job '%s': fire claim heartbeat fence is contended",
+                    job_id,
+                )
+                if (
+                    time.monotonic() - last_confirmed
+                    >= _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS
+                ):
+                    lost_ownership.set()
+                    logger.warning(
+                        "Job '%s': fire claim fence remained contended for "
+                        "%.1fs; interrupting uncertain run",
+                        job_id,
+                        _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS,
+                    )
+                    return
             except Exception:
                 logger.debug(
                     "Job '%s': fire_claim heartbeat failed",
@@ -7533,6 +7560,11 @@ def _run_one_job_body(
         try:
             if heartbeat_fire_claim(job["id"], expected_owner=fire_owner):
                 return False
+        except FireClaimFenceContention:
+            # Contention says only that ownership could not be checked at this
+            # instant. The heartbeat monitor owns the bounded-grace decision;
+            # this probe must not turn a fence wait into a stale-owner verdict.
+            return False
         except Exception:
             logger.debug(
                 "Job '%s': fire_claim ownership validation failed",
@@ -7664,9 +7696,24 @@ def _run_one_job_body(
             # would leave fire_claim lingering until TTL and last_status
             # stale. Probe ownership once; if still ours, record the
             # interruption through the owner-fenced terminal write.
-            if fire_owner is not None and heartbeat_fire_claim(
-                job["id"], expected_owner=fire_owner,
-            ):
+            if fire_owner is not None:
+                try:
+                    still_owns_fire_claim = heartbeat_fire_claim(
+                        job["id"], expected_owner=fire_owner,
+                    )
+                except FireClaimFenceContention:
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        error=(
+                            "Fire claim ownership could not be verified after "
+                            "bounded heartbeat grace; result was discarded."
+                        ),
+                    )
+                    return True
+            else:
+                still_owns_fire_claim = False
+            if still_owns_fire_claim:
                 mark_job_run(
                     job["id"],
                     False,
@@ -7855,9 +7902,24 @@ def _run_one_job_body(
             # Same transport-cancel distinction as the pre-side-effect path:
             # if WE still own the claim, record the interruption instead of
             # discarding silently (lingering claim + stale last_status).
-            if fire_owner is not None and heartbeat_fire_claim(
-                job["id"], expected_owner=fire_owner,
-            ):
+            if fire_owner is not None:
+                try:
+                    still_owns_fire_claim = heartbeat_fire_claim(
+                        job["id"], expected_owner=fire_owner,
+                    )
+                except FireClaimFenceContention:
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        error=(
+                            "Fire claim ownership could not be verified after "
+                            "bounded heartbeat grace; result was discarded."
+                        ),
+                    )
+                    return True
+            else:
+                still_owns_fire_claim = False
+            if still_owns_fire_claim:
                 mark_job_run(
                     job["id"],
                     False,

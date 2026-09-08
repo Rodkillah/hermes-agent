@@ -316,6 +316,47 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         }
 
 
+def test_fire_claim_heartbeat_distinguishes_fence_contention_from_stale_owner(
+    tmp_path, monkeypatch
+):
+    """A busy fence is transient; a changed owner remains a hard refusal."""
+    import cron.jobs as jobs
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.01)
+
+    with jobs.use_cron_store(profile_home):
+        job = jobs.create_job(prompt="x", schedule="every 5m", name="fenced")
+        assert jobs.claim_job_for_fire(job["id"]) is True
+        claimed = jobs.get_job(job["id"])
+        owner = claimed["fire_claim"]["by"]
+
+        with jobs.fire_claim_fence(job["id"], expected_owner=owner) as owned:
+            assert owned is True
+            contention = []
+
+            def probe_from_other_thread():
+                with jobs.use_cron_store(profile_home):
+                    try:
+                        jobs.heartbeat_fire_claim(job["id"], expected_owner=owner)
+                    except Exception as exc:  # assertion below checks the exact type
+                        contention.append(exc)
+
+            probe = threading.Thread(target=probe_from_other_thread)
+            probe.start()
+            probe.join(timeout=1)
+            assert not probe.is_alive()
+            assert len(contention) == 1
+            assert isinstance(contention[0], jobs.FireClaimFenceContention)
+
+        with jobs._jobs_lock():
+            rows = jobs.load_jobs()
+            rows[0]["fire_claim"]["by"] = "replacement-owner"
+            jobs.save_jobs(rows)
+        assert jobs.heartbeat_fire_claim(job["id"], expected_owner=owner) is False
+
+
 def test_run_one_job_refreshes_fire_claim_in_profile_store(tmp_path, monkeypatch):
     """The shared execute/save/deliver body keeps its durable fire claim alive."""
     import cron.jobs as jobs
@@ -352,6 +393,62 @@ def test_run_one_job_refreshes_fire_claim_in_profile_store(tmp_path, monkeypatch
 
     assert refreshed["at"] != original_claim["at"]
     assert refreshed["by"] == original_claim["by"]
+
+
+def test_delivery_over_30_seconds_under_fence_keeps_owner_and_delivers_once(
+    tmp_path, monkeypatch
+):
+    """A real delivery fence may outlive the 30s lock timeout safely."""
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: profile_home)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: {})
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda *_args, **_kwargs: (True, "output", "response", None),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "output.md")
+
+    delivered = []
+    marked = []
+    finished = []
+
+    def slow_delivery(job, content, **_kwargs):
+        delivered.append((job["id"], content))
+        time.sleep(30.2)
+        return None
+
+    monkeypatch.setattr(scheduler, "_deliver_result", slow_delivery)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+
+    with jobs.use_cron_store(profile_home):
+        stored = jobs.create_job(prompt="x", schedule="every 5m", name="slow delivery")
+        assert jobs.claim_job_for_fire(stored["id"]) is True
+        job = jobs.get_job(stored["id"])
+        job["execution_id"] = "slow-execution"
+        job["deliver"] = "local"
+        assert scheduler.run_one_job(job) is True
+
+    assert delivered == [(job["id"], "response")]
+    assert marked and marked[0][0][1] is True
+    assert finished and finished[-1][1]["success"] is True
 
 
 def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
@@ -542,6 +639,38 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
     monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+
+    assert scheduler.run_one_job(job) is True
+    assert calls >= 3
+
+
+def test_fence_contention_uses_bounded_grace_before_cancelling(monkeypatch):
+    """Fence waits do not become lost-owner signals before the grace expires."""
+    import cron.scheduler as scheduler
+
+    calls = 0
+
+    def heartbeat(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return True
+        raise scheduler.FireClaimFenceContention("fence busy")
+
+    def run_body(_job, **kwargs):
+        lost = kwargs["fire_claim_lost"]
+        assert not lost.wait(timeout=0.02)
+        assert lost.wait(timeout=0.5)
+        return True
+
+    job = {
+        "id": "heartbeat-contention",
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
+    }
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
+    monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.05)
 
     assert scheduler.run_one_job(job) is True
     assert calls >= 3

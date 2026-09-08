@@ -107,6 +107,17 @@ _fire_fence_locks: Dict[str, threading.RLock] = {}
 _fire_fence_locks_guard = threading.Lock()
 _fire_fence_lock_state = threading.local()
 
+
+class FireClaimFenceContention(RuntimeError):
+    """The fire-fence could not be acquired before its bounded timeout.
+
+    This is deliberately distinct from a claim-owner mismatch. A live owner
+    may hold the fence while saving or delivering an effect; treating that
+    temporary contention as proof that ownership was lost can interrupt a
+    successful run after its output has already been produced.
+    """
+
+
 # Upper bound on waiting for the cross-process .jobs.lock flock (#60703).
 # Every cron function in the process funnels through _jobs_lock(), and the
 # flock is taken while holding the process-wide RLock — so an unbounded wait
@@ -3828,7 +3839,9 @@ def _sweep_completed_oneshots(
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
-            return False
+            raise FireClaimFenceContention(
+                f"Timed out waiting for fire claim fence for job {job_id}"
+            )
         return _heartbeat_fire_claim_locked(
             job_id,
             expected_owner=expected_owner,
