@@ -112,6 +112,30 @@ def _moa_reference_output_allowed(agent: Any) -> bool:
     )
 
 
+def _resolve_kanban_worker_guidance(valid_tool_names: set[str]) -> str:
+    """Return task lifecycle guidance only for a real dispatcher worker.
+
+    Orchestrator profiles may expose ``kanban_show`` in ordinary chat so they
+    can route board work.  Tool availability alone therefore does not mean the
+    current process owns a task.  Injecting worker guidance into those chats
+    falsely tells the model to call ``kanban_show()`` first, even when no
+    ``HERMES_KANBAN_TASK`` exists and the user explicitly requested direct
+    execution.
+
+    Requiring both the dispatcher task marker and the worker tool keeps the
+    prompt off ordinary orchestrator sessions and delegated children while
+    preserving the full lifecycle contract for real workers.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return ""
+    if "kanban_show" not in valid_tool_names:
+        return ""
+
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    return KANBAN_GUIDANCE
+
+
 def _relay_moa_reference_event(agent: Any, event: str, **kwargs: Any) -> None:
     """Relay MoA display events while preserving the ``-Q`` stdout contract."""
     if not _moa_reference_output_allowed(agent):
@@ -1643,15 +1667,14 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
+    # Kanban worker lifecycle guidance is session-static. Orchestrator profiles
+    # can expose kanban_show in ordinary chat, so tool presence alone is not a
+    # worker identity signal; the dispatcher task marker must also be present.
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+    agent._kanban_worker_guidance = _resolve_kanban_worker_guidance(
+        agent.valid_tool_names
     )
 
     # Check tool requirements
