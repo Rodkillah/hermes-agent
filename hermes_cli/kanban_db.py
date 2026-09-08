@@ -12706,7 +12706,6 @@ def list_notify_subs(
     *,
     notifier_profiles: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
-    include_identity: bool = False,
 ) -> list[dict]:
     """List subscriptions, optionally restricted to notifier profile owners.
 
@@ -12726,7 +12725,7 @@ def list_notify_subs(
     if owner_where:
         where.append(owner_where)
         params.extend(owner_params)
-    sql = "SELECT " + ("rowid AS _subscription_rowid, " if include_identity else "") + "* FROM kanban_notify_subs"
+    sql = "SELECT * FROM kanban_notify_subs"
     if where:
         sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
     rows = conn.execute(sql, params).fetchall()

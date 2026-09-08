@@ -1,39 +1,31 @@
-# Candidat bounded Amber subscription reconciliation — rollback manifest
+# Candidat Amber subscription reconciliation — manifest rollback R3
 
-Status: source-only candidate; no live board, gateway, job, subscription, Brain file, or runtime tree was changed. The existing job remains disabled until a fresh Architect GO and Amber activation gate.
+Status: candidat source-only. Aucun board live, gateway, job, abonnement, runtime ou Brain n'a été muté. Le job `85fcd56ee535` reste disabled/paused jusqu'à revue indépendante et gate Amber.
 
-## Exact candidate
+## Identité contrôlée
 
-- Prior reviewed candidate: `b7752bdfe62fd15a5fb9d8b64df0ac923935ce2e`.
-- Final candidate: `e247d38c99754c77c6c0f6bca8f3ed6ed18d8ef9`.
-- Branch: `ironrod/forge-amber-subscription-transfer-20260907`.
-- Existing job: `85fcd56ee535`, `forge-kanban-telegram-subscriptions`, `no_agent=true`, every 1 minute, script `kanban_telegram_subscribe_all.py`, observed `enabled=false`, state `paused`.
-- Runtime base remains `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`; no runtime promotion was performed.
+- Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
+- Correctif R3: `e3f840f2265bb4d1eadc9d5a01cfcecff8d4125c`.
+- Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
+- Fichiers concernés: `hermes_cli/kanban_db.py`, `profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py`, et le vérificateur/test associés.
 
-## Candidate changes and bounded effect
+## Protocole de sûreté
 
-- `hermes_cli/kanban_db.py`: native `restore_notify_sub_state` inverse. It restores only owner and delivery mode from exact pre/post images, preserves an advanced cursor, and refuses human takeover, replacement, metadata/identity change, or other concurrent modification without overwriting it. Rows created by the batch are removed only while their post-image is unchanged; a repeated reverse is idempotent.
-- `profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py`: distinguishes destination identity from origin completeness. NULL legacy origin IDs are compatible with one known non-empty origin; true destination/origin conflicts fail closed. Existing rows are not enriched. A deterministic known anchor is used only for new rows. `--journal PATH` writes the committed batch's exact pre/post-images after the outer transaction commits.
-- `tests/profile_overlay/test_telegram_subscribe.py`: existing 63 checks retained plus compatible-NULL and conflicting-origin fixtures.
-- `artifacts/verify-amber-subscription-rollback.py`: disposable DB verifier for transfer/repair/new-card coverage, unread cursor preservation, native guarded inverse, concurrent conflict rejection, idempotent reverse, quick-check, and exact file/job copy restoration with hashes and modes.
+1. `kanban_notify_subs.subscription_generation` est une identité d'incarnation native: token SQLite de 32 hex, unique, immuable et généré sur toute insertion. Une suppression/recréation de la même clé reçoit nécessairement une nouvelle génération. La migration additive remplit les lignes legacy NULL; aucun appel public ne choisit le token.
+2. Chaque passe mutative relit le plan et les pré-images sous la transaction externe. Les images complètes contiennent la génération et les vrais NULL. L'inverse restaure uniquement owner/mode, accepte uniquement une avance de curseur, et refuse génération/champ stable/cursor incompatibles. Les anciens journaux sans génération sont refusés.
+3. Le job crée automatiquement un journal privé par batch sous `~/.hermes/profiles/amber/kanban-subscription-journals/iron-rod/<batch-id>/`: répertoire 0700, `prepared.json` 0600 fsync avant commit SQLite, puis marqueur `committed.json` fsync. Une interruption avant marqueur est relue conservativement avant toute nouvelle passe: post-images compatibles => marqueur récupéré; pré-images compatibles => aborted; tout état mixte est refusé sans mutation. Un no-op ne modifie pas de journal antérieur. `--journal` reste un export de compatibilité append-only, jamais l'autorité de récupération.
 
-## Forward activation preconditions (not performed here)
+## Preuve copies privées
 
-1. Architect reviews this exact final SHA after the previous NO-GO; a source-only GO is not an activation order.
-2. Amber confirms effective WIP values; do not change configured ceilings.
-3. Confirm job `85fcd56ee535` still has the same script, `no_agent=true`, interval 1m, and `enabled=false`/`paused` before any activation.
-4. Capture the targeted live script/runtime/job pre-images, bytes, SHA-256, modes, ownership, and job JSON. Preserve unrelated pre-existing runtime changes.
-5. Create a dated read-only SQLite backup with `VACUUM INTO`; verify `PRAGMA quick_check`, task count, subscription count, and SHA-256. Never use `sqlite3 .backup` on the live board.
-6. Activate only the existing job through its native cron tool after both gates. Do not add a cron, watcher, webhook, or dispatcher.
-7. Bound the first run to `--limit 1 --journal <durable-gated-path>` and prove event → Amber session → native action, then inspect coverage/read-back and job state.
+`artifacts/verify-amber-subscription-rollback.py` utilise des DB jetables et lit seulement le document de job Amber pour en faire une copie privée. Il installe/retire les octets réels du candidat `kanban_db.py` et du script overlay contre la pré-image runtime connue, puis utilise `cron.jobs.update_job`/`pause_job` uniquement avec `JOBS_FILE` redirigé vers la copie. Il vérifie le retour des champs administrés du job ciblé et l'absence de changement sur les autres jobs. Aucun secret ni document de job n'est imprimé.
 
-## Native rollback procedure
+## Préconditions de gate (non réalisées)
 
-1. Stop/disable the same existing job through the native cron tool first. Preserve its exact pre-activation JSON and restore the prior enabled/paused state through the same native tool.
-2. Keep the committed journal produced by the actual run. Reverse entries in reverse order with `rollback_journal`, which calls the native `restore_notify_sub_state` API inside one outer transaction.
-3. For each journal entry with a pre-image, restore only `notifier_profile` and `delivery_mode` to that pre-image. Preserve `last_event_id`, events, origin IDs, metadata, `created_at`, and all rows outside the journal.
-4. For each entry with no pre-image, remove the exact `(task_id, platform, chat_id, thread_id)` row only if its post-image still matches. If a human took it over, changed it, or recreated it, abort the whole inverse with a conflict and make no overwrite.
-5. Re-read targeted rows, advanced cursors, independent human rows, subscription counts, and `PRAGMA quick_check`. A replay of the same inverse is a no-op for already restored rows and remains conflict-safe.
-6. If source removal is required, revert `e247d38c99754c77c6c0f6bca8f3ed6ed18d8ef9` in a controlled source worktree to `b7752bdfe62fd15a5fb9d8b64df0ac923935ce2e`, rebuild/retest, and separately restore the live targeted files from the captured pre-images. A Git revert alone is not a database/job rollback.
+1. Revue Architect verte du SHA exact, puis retrait de l'override Terra pour le reviewer.
+2. Vérifier le job identique (`85fcd56ee535`, no_agent, 1 min, disabled/paused), WIP effectif, fichiers et hash/modes avant tout apply.
+3. Backup SQLite ciblé avec `VACUUM INTO` et `quick_check`; journal privé disponible et chemin contrôlé.
+4. Activation native réversible du seul job existant après gate Amber; premier canari limité: événement -> session Amber -> action native, avec probes et lecture de retour.
 
-The verifier exercises the DB inverse, backup integrity, cursor preservation, conflict refusal, replay, and copy-only file/job restoration. It is not a live backup and does not authorize activation.
+## Retour sûr
+
+Avant un retour old-code: pause native du job et absence de run en vol; résoudre les journaux avec ce code, appliquer l'inverse native sur leurs pré/post-images, puis restaurer les seuls fichiers ciblés avec hash/mode guards. Conserver le schéma additif, index et triggers lors du retour au code base: l'ancien code continue de lire les colonnes additionnelles. Ne pas restaurer globalement `kanban.db` ni `jobs.json`; préserver claims, historique et autres jobs.
