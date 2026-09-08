@@ -3105,36 +3105,6 @@ def mark_job_run(
         )
 
 
-def mark_job_run_owner_fenced(
-    job_id: str,
-    success: bool,
-    error: Optional[str] = None,
-    delivery_error: Optional[str] = None,
-    status: Optional[str] = None,
-    *,
-    expected_fire_owner: Optional[str] = None,
-) -> bool:
-    """Finalize a run using the owner CAS when the fire fence is contended.
-
-    The ordinary ``mark_job_run`` path acquires the per-job fire fence before
-    mutating the job record. A heartbeat that timed out on that fence has
-    already failed closed, but it still needs to record an uncertain terminal
-    outcome while the claim owner is checked under the jobs lock. This path
-    skips only the contended fence acquisition; the expected-owner comparison
-    in ``_mark_job_run_locked`` remains the write fence and prevents a stale
-    runner from clearing a replacement claim.
-    """
-    with _jobs_lock():
-        return _mark_job_run_locked(
-            job_id,
-            success,
-            error,
-            delivery_error,
-            status=status,
-            expected_fire_owner=expected_fire_owner,
-        )
-
-
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
     """Set/clear a persisted alert-dedup marker; return the PRIOR value.
 

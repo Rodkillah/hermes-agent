@@ -723,7 +723,6 @@ from cron.jobs import (
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
-    mark_job_run_owner_fenced,
     save_job_output,
     use_cron_store,
 )
@@ -7741,7 +7740,7 @@ def _run_one_job_body(
                     "Fire claim ownership uncertain after bounded heartbeat "
                     "grace; result was discarded without delivery."
                 )
-                mark_job_run_owner_fenced(
+                mark_job_run(
                     job["id"],
                     False,
                     uncertain_error,
@@ -7780,7 +7779,7 @@ def _run_one_job_body(
                     "Fire claim ownership could not be validated at terminal "
                     "completion; result was discarded without delivery."
                 )
-                mark_job_run_owner_fenced(
+                mark_job_run(
                     job["id"],
                     False,
                     uncertain_error,
@@ -8012,7 +8011,7 @@ def _run_one_job_body(
                     "Fire claim ownership uncertain after bounded heartbeat grace; "
                     "result was not re-emitted."
                 )
-                mark_job_run_owner_fenced(
+                mark_job_run(
                     job["id"],
                     False,
                     uncertain_error,
