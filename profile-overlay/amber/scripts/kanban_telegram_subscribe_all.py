@@ -36,7 +36,10 @@ DB_PATH = Path("/home/rodrigue/.hermes/kanban/boards/iron-rod/kanban.db")
 # the existing job while this candidate is being exercised.
 LOCK_PATH = Path("/home/rodrigue/.hermes/kanban/.forge-telegram-subscriptions.lock")
 JOURNAL_ROOT = Path(
-    "/home/rodrigue/.hermes/profiles/amber/kanban-subscription-journals/iron-rod"
+    os.environ.get(
+        "HERMES_KANBAN_JOURNAL_ROOT",
+        "/home/rodrigue/.hermes/profiles/amber/kanban-subscription-journals/iron-rod",
+    )
 )
 ACTIVE_STATUSES = {
     "triage",
@@ -60,27 +63,61 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _private_directory(path: Path) -> None:
-    """Create a non-symlink private journal directory or fail closed."""
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise RuntimeError("journal path is not a real directory")
-    if info.st_mode & 0o077:
-        os.chmod(path, 0o700)
+    """Create a private directory only through verified real ancestors."""
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    parts = absolute.parts[1:]
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            # The previous component has already been lstat-verified, so this
+            # never follows an uninspected ancestor while creating a child.
+            current.mkdir(mode=0o700)
+            info = current.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError("journal path has a symlink or non-directory ancestor")
+        if index == len(parts) - 1 and info.st_mode & 0o077:
+            os.chmod(current, 0o700)
     _fsync_directory(path)
 
 
 def _write_private_json(path: Path, payload: Mapping[str, Any], *, exclusive: bool) -> None:
     data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC)
-    fd = os.open(path, flags, 0o600)
+    _private_directory(path.parent)
+    if path.exists() and (path.is_symlink() or not path.is_file()):
+        raise RuntimeError("journal file path is unsafe")
+    if exclusive and path.exists():
+        raise FileExistsError(path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.write(fd, data)
+        offset = 0
+        while offset < len(data):
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                raise OSError("journal write made no progress")
+            offset += written
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.chmod(path, 0o600)
-    _fsync_directory(path.parent)
+    try:
+        if exclusive:
+            # link() is an exclusive publish: unlike rename(), it never
+            # replaces a prepared/committed record created by another writer.
+            os.link(temporary, path)
+            os.unlink(temporary)
+        else:
+            os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        _fsync_directory(path.parent)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _image_matches(current: Optional[dict[str, Any]], image: Optional[Mapping[str, Any]]) -> bool:
@@ -101,16 +138,20 @@ def _image_matches(current: Optional[dict[str, Any]], image: Optional[Mapping[st
 class BatchJournal:
     """Crash-recoverable private journal for one mutative reconciliation batch."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, phase: str = "forward"):
         _private_directory(root)
         self.root = root
         self.batch_id = uuid.uuid4().hex
         self.path = root / self.batch_id
+        if self.path.exists():
+            raise RuntimeError("journal batch id collision")
         self.path.mkdir(mode=0o700)
+        _private_directory(self.path)
         if self.path.is_symlink() or not self.path.is_dir():
             raise RuntimeError("journal batch path is unsafe")
         os.chmod(self.path, 0o700)
         _fsync_directory(root)
+        self.phase = phase
         self.prepared_path = self.path / "prepared.json"
         self.committed_path = self.path / "committed.json"
 
@@ -119,7 +160,7 @@ class BatchJournal:
             return
         _write_private_json(
             self.prepared_path,
-            {"schema_version": 1, "batch_id": self.batch_id, "phase": "forward", "entries": entries},
+            {"schema_version": 1, "batch_id": self.batch_id, "phase": self.phase, "entries": entries},
             exclusive=True,
         )
 
@@ -139,40 +180,41 @@ class BatchJournal:
         if not root.exists():
             return
         _private_directory(root)
-        for candidate in sorted(root.iterdir()):
-            if candidate.is_symlink() or not candidate.is_dir():
-                raise RuntimeError("unsafe journal batch entry")
-            prepared = candidate / "prepared.json"
-            committed = candidate / "committed.json"
-            if committed.exists() or (candidate / "aborted.json").exists() or not prepared.exists():
-                continue
-            data = json.loads(prepared.read_text(encoding="utf-8"))
-            entries = data.get("entries")
-            if not isinstance(entries, list) or not entries:
-                raise RuntimeError("journal preparation is malformed")
-            post = pre = True
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    raise RuntimeError("journal entry is malformed")
-                image = entry.get("post_image")
-                if not isinstance(image, dict):
-                    raise RuntimeError("journal post-image is missing")
-                rows = kb.list_notify_subs(conn, str(image.get("task_id")))
-                current = next(
-                    (row for row in rows if _is_target(row, chat_id=str(image.get("chat_id")), thread_id=str(image.get("thread_id") or ""))),
-                    None,
-                )
-                post = post and _image_matches(current, image)
-                pre = pre and _image_matches(current, entry.get("pre_image"))
-            if post:
-                journal = BatchJournal.__new__(BatchJournal)
-                journal.path, journal.prepared_path, journal.committed_path = candidate, prepared, committed
-                journal.batch_id = str(data.get("batch_id") or candidate.name)
-                journal.mark_committed()
-            elif pre:
-                _write_private_json(candidate / "aborted.json", {"batch_id": data.get("batch_id")}, exclusive=True)
-            else:
-                raise RuntimeError("journal recovery is ambiguous; refusing a new batch")
+        with kb.write_txn(conn):
+            for candidate in sorted(root.iterdir()):
+                if candidate.is_symlink() or not candidate.is_dir():
+                    raise RuntimeError("unsafe journal batch entry")
+                prepared = candidate / "prepared.json"
+                committed = candidate / "committed.json"
+                if committed.exists() or (candidate / "aborted.json").exists() or not prepared.exists():
+                    continue
+                data = json.loads(prepared.read_text(encoding="utf-8"))
+                entries = data.get("entries")
+                if not isinstance(entries, list) or not entries:
+                    raise RuntimeError("journal preparation is malformed")
+                post = pre = True
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        raise RuntimeError("journal entry is malformed")
+                    image = entry.get("post_image")
+                    if not isinstance(image, dict):
+                        raise RuntimeError("journal post-image is missing")
+                    rows = _fetch_target_raw(conn, image)
+                    current = rows[0] if len(rows) == 1 else None
+                    post = post and _image_matches(current, image)
+                    pre = pre and _image_matches(current, entry.get("pre_image"))
+                phase = data.get("phase", "forward")
+                applied = post if phase == "forward" else pre
+                unapplied = pre if phase == "forward" else post
+                if applied:
+                    journal = BatchJournal.__new__(BatchJournal)
+                    journal.path, journal.prepared_path, journal.committed_path = candidate, prepared, committed
+                    journal.batch_id = str(data.get("batch_id") or candidate.name)
+                    journal.mark_committed()
+                elif unapplied:
+                    _write_private_json(candidate / "aborted.json", {"batch_id": data.get("batch_id")}, exclusive=True)
+                else:
+                    raise RuntimeError("journal recovery is ambiguous; refusing a new batch")
 
 
 def _validate_export_path(path: Path) -> None:
@@ -317,12 +359,35 @@ def plan(
 
 
 def _fetch_target(conn: sqlite3.Connection, task_id: str, anchor: dict[str, Any]) -> list[dict[str, Any]]:
-    return _rows_for_task(
-        kb.list_notify_subs(conn, task_id),
-        task_id,
-        chat_id=str(anchor["chat_id"]),
-        thread_id=_thread(anchor),
+    return _fetch_target_raw(
+        conn,
+        {
+            "task_id": task_id,
+            "platform": "telegram",
+            "chat_id": str(anchor["chat_id"]),
+            "thread_id": _thread(anchor),
+        },
     )
+
+
+def _fetch_target_raw(conn: sqlite3.Connection, key: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return storage-exact images for journal and guarded rollback use."""
+    # Keep the canonical subscription reader within the same transaction used
+    # for recovery. Its notifier projection is intentionally not used as the
+    # image below because it normalizes NULL metadata, but this call preserves
+    # its existing read instrumentation and transaction contract.
+    kb.list_notify_subs(conn, str(key.get("task_id")))
+    rows = conn.execute(
+        "SELECT * FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+        "AND chat_id = ? AND thread_id = ?",
+        (
+            str(key.get("task_id")),
+            str(key.get("platform", "telegram")),
+            str(key.get("chat_id")),
+            str(key.get("thread_id") or ""),
+        ),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _ensure_amber_notify_wake(
@@ -381,6 +446,13 @@ def _ensure_amber_notify_wake(
 def rollback_journal(conn: sqlite3.Connection, journal: Iterable[Mapping[str, Any]]) -> int:
     """Reverse one committed journal without overwriting concurrent changes."""
     entries = list(journal)
+    if not entries:
+        return 0
+    # The inverse itself is a durable operation.  Its prepared record is
+    # written before the database transaction, so a crash after its commit is
+    # classified conservatively by recover_pending on the next pass.
+    inverse = BatchJournal(JOURNAL_ROOT, phase="inverse")
+    inverse.prepare(entries)
     restored = 0
     with kb.write_txn(conn):
         for entry in reversed(entries):
@@ -395,6 +467,7 @@ def rollback_journal(conn: sqlite3.Connection, journal: Iterable[Mapping[str, An
                 key = ":".join(str(post_image.get(field, "")) for field in ("task_id", "chat_id", "thread_id"))
                 raise RuntimeError(f"rollback conflict for {key}")
             restored += 1
+    inverse.mark_committed()
     return restored
 
 

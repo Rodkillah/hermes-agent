@@ -17,7 +17,7 @@ Status: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 
 ## Preuve copies privées
 
-`artifacts/verify-amber-subscription-rollback.py` utilise des DB jetables et lit seulement le document de job Amber pour en faire une copie privée. Il installe/retire les octets réels du candidat `kanban_db.py` et du script overlay contre la pré-image runtime connue, puis utilise `cron.jobs.update_job`/`pause_job` uniquement avec `JOBS_FILE` redirigé vers la copie. Il vérifie le retour des champs administrés du job ciblé et l'absence de changement sur les autres jobs. Aucun secret ni document de job n'est imprimé.
+`artifacts/verify-amber-subscription-rollback.py` utilise des DB et journaux jetables, et lit seulement le document de job Amber pour en faire une copie privée. Il installe/retire les octets réels du candidat `kanban_db.py` et du script overlay contre la pré-image runtime connue, puis utilise `cron.jobs.update_job`/`pause_job` uniquement avec `JOBS_FILE` redirigé vers la copie. Il vérifie le retour des champs administrés du job ciblé et l'absence de changement sur les autres jobs. Aucun secret ni document de job n'est imprimé.
 
 ## Préconditions de gate (non réalisées)
 

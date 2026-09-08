@@ -15,6 +15,14 @@ ROOT = Path(__file__).parents[2]
 SCRIPT = ROOT / "profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py"
 
 
+@pytest.fixture(autouse=True)
+def private_journal_root(monkeypatch, tmp_path):
+    """Every module import, including rollback tests, must stay off Amber's profile."""
+    monkeypatch.setenv(
+        "HERMES_KANBAN_JOURNAL_ROOT", str(tmp_path / "private-journals")
+    )
+
+
 def load_script(monkeypatch):
     # Make the candidate hermes_cli the explicit runtime for this test; never
     # accidentally import the live runtime while testing the overlay.
@@ -158,6 +166,7 @@ def test_explicit_db_scope_ignores_poisoned_kanban_environment(monkeypatch, db, 
         conn.close()
     monkeypatch.setattr(mod, "DB_PATH", db)
     monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
+    monkeypatch.setattr(mod, "JOURNAL_ROOT", tmp_path / "private-journals")
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "poison.db"))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "wrong-board")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "wrong-task")
@@ -188,6 +197,7 @@ def test_two_real_processes_are_serialized_by_existing_lock(monkeypatch, db, tmp
         "m=importlib.util.module_from_spec(p); p.loader.exec_module(m); "
         f"m.DB_PATH=__import__('pathlib').Path({str(db)!r}); "
         f"m.LOCK_PATH=__import__('pathlib').Path({str(tmp_path / 'same.lock')!r}); "
+        f"m.JOURNAL_ROOT=__import__('pathlib').Path({str(tmp_path / 'private-journals')!r}); "
         "raise SystemExit(m.main([]))"
     )
     env = os.environ.copy()

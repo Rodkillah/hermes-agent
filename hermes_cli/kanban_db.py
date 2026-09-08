@@ -2941,10 +2941,11 @@ def _ensure_notify_subscription_generation(conn: sqlite3.Connection) -> None:
         for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='trigger' "
             "AND name IN ('trg_notify_sub_generation_insert', "
+            "'trg_notify_sub_generation_required', "
             "'trg_notify_sub_generation_immutable')"
         )
     }
-    if not has_null and len(trigger_names) == 2:
+    if not has_null and len(trigger_names) == 3:
         return
     # One immediate transaction keeps legacy fill, uniqueness and trigger
     # installation indivisible.  The random token is generated in SQLite, so
@@ -2960,8 +2961,25 @@ def _ensure_notify_subscription_generation(conn: sqlite3.Connection) -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_subscription_generation "
             "ON kanban_notify_subs(subscription_generation)"
         )
+        # ``INSERT OR IGNORE`` can suppress a UNIQUE collision raised by the
+        # generation UPDATE below.  The required trigger is created first and
+        # the generator second because SQLite executes same-event triggers in
+        # reverse creation order: generation runs first, then this assertion
+        # aborts the entire INSERT if a collision left the new row untagged.
         conn.execute(
-            "CREATE TRIGGER IF NOT EXISTS trg_notify_sub_generation_insert AFTER INSERT ON kanban_notify_subs "
+            "CREATE TRIGGER IF NOT EXISTS trg_notify_sub_generation_required AFTER INSERT ON kanban_notify_subs "
+            "WHEN NEW.subscription_generation IS NULL BEGIN "
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM kanban_notify_subs "
+            "WHERE task_id = NEW.task_id AND platform = NEW.platform "
+            "AND chat_id = NEW.chat_id AND thread_id = NEW.thread_id "
+            "AND subscription_generation IS NULL) "
+            "THEN RAISE(ABORT, 'subscription_generation initialization failed') END; END"
+        )
+        # Recreate the older generator so it executes before the assertion
+        # above on DBs that were initialized before the required trigger.
+        conn.execute("DROP TRIGGER IF EXISTS trg_notify_sub_generation_insert")
+        conn.execute(
+            "CREATE TRIGGER trg_notify_sub_generation_insert AFTER INSERT ON kanban_notify_subs "
             "WHEN NEW.subscription_generation IS NULL BEGIN "
             "UPDATE kanban_notify_subs SET subscription_generation = lower(hex(randomblob(16))) "
             "WHERE task_id = NEW.task_id AND platform = NEW.platform "
@@ -12599,9 +12617,6 @@ def restore_notify_sub_state(
     if pre_image is not None and any(field not in pre_image for field in required):
         raise ValueError("pre_image is missing subscription identity")
 
-    def _metadata(value: Any) -> dict[str, Any]:
-        return _decode_notify_delivery_metadata(value)
-
     key = tuple(post_image[field] if field != "thread_id" else post_image[field] or "" for field in key_fields)
     with write_txn(conn, allow_nested=True):
         row = conn.execute(
@@ -12611,8 +12626,10 @@ def restore_notify_sub_state(
         ).fetchone()
         if row is None:
             return pre_image is None
+        # Images are a rollback guard, not notifier-facing metadata.  Preserve
+        # the stored SQLite value exactly: NULL and the literal JSON text '{}'
+        # are distinct incumbent states and must never compare equal here.
         current = dict(row)
-        current["delivery_metadata"] = _metadata(current.get("delivery_metadata"))
         if int(current.get("last_event_id") or 0) < int(post_image.get("last_event_id") or 0):
             # Cursor regression signals a replacement or an unsafe manual
             # rewrite.  A forward notifier claim may advance it, never rewind.
@@ -12623,8 +12640,6 @@ def restore_notify_sub_state(
             for field in stable_fields:
                 expected = image.get(field)
                 actual = current.get(field)
-                if field == "delivery_metadata":
-                    expected, actual = _metadata(expected), _metadata(actual)
                 if actual != expected:
                     return False
             return True
@@ -12649,12 +12664,12 @@ def restore_notify_sub_state(
                 "DELETE FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
                 "AND chat_id = ? AND thread_id = ? AND notifier_profile IS ? "
                 "AND delivery_mode IS ? AND user_id IS ? AND user_id_alt IS ? "
-                "AND chat_type IS ? AND delivery_metadata = ? AND created_at IS ? "
+                "AND chat_type IS ? AND delivery_metadata IS ? AND created_at IS ? "
                 "AND subscription_generation IS ?",
                 (*key, post_image["notifier_profile"], post_image["delivery_mode"],
                  post_image.get("user_id"), post_image.get("user_id_alt"),
                  post_image.get("chat_type"),
-                 _encode_notify_delivery_metadata(_metadata(post_image.get("delivery_metadata"))),
+                 post_image.get("delivery_metadata"),
                  post_image.get("created_at"), post_image[identity_field]),
             )
             return cur.rowcount == 1

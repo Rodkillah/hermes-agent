@@ -244,6 +244,9 @@ def run_file_job_restore(root: Path):
 
 with tempfile.TemporaryDirectory(prefix="amber-subscription-rollback-") as temp:
     root = Path(temp)
+    # rollback_journal writes an inverse marker too.  Keep the verifier fully
+    # private even though it imports the exact candidate overlay module.
+    module.JOURNAL_ROOT = root / "journals"
     migrated, advanced_cursor = run_nominal(root / "nominal.db")
     run_conflict(root / "conflict.db")
     run_file_job_restore(root / "files")
