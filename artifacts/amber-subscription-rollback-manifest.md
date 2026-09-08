@@ -5,7 +5,7 @@ Status: source-only candidate; no live board, gateway, job, subscription, Brain 
 ## Exact candidate
 
 - Prior reviewed candidate: `b7752bdfe62fd15a5fb9d8b64df0ac923935ce2e`.
-- Final candidate: `979ddc647ecbce77371667224fc51db77b69f1ac`.
+- Final candidate: `246df5624b990535d1a206aee64fa4000faf8d75`.
 - Branch: `ironrod/forge-amber-subscription-transfer-20260907`.
 - Existing job: `85fcd56ee535`, `forge-kanban-telegram-subscriptions`, `no_agent=true`, every 1 minute, script `kanban_telegram_subscribe_all.py`, observed `enabled=false`, state `paused`.
 - Runtime base remains `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`; no runtime promotion was performed.
@@ -34,6 +34,6 @@ Status: source-only candidate; no live board, gateway, job, subscription, Brain 
 3. For each journal entry with a pre-image, restore only `notifier_profile` and `delivery_mode` to that pre-image. Preserve `last_event_id`, events, origin IDs, metadata, `created_at`, and all rows outside the journal.
 4. For each entry with no pre-image, remove the exact `(task_id, platform, chat_id, thread_id)` row only if its post-image still matches. If a human took it over, changed it, or recreated it, abort the whole inverse with a conflict and make no overwrite.
 5. Re-read targeted rows, advanced cursors, independent human rows, subscription counts, and `PRAGMA quick_check`. A replay of the same inverse is a no-op for already restored rows and remains conflict-safe.
-6. If source removal is required, revert `979ddc647ecbce77371667224fc51db77b69f1ac` in a controlled source worktree to `b7752bdfe62fd15a5fb9d8b64df0ac923935ce2e`, rebuild/retest, and separately restore the live targeted files from the captured pre-images. A Git revert alone is not a database/job rollback.
+6. If source removal is required, revert `246df5624b990535d1a206aee64fa4000faf8d75` in a controlled source worktree to `b7752bdfe62fd15a5fb9d8b64df0ac923935ce2e`, rebuild/retest, and separately restore the live targeted files from the captured pre-images. A Git revert alone is not a database/job rollback.
 
 The verifier exercises the DB inverse, backup integrity, cursor preservation, conflict refusal, replay, and copy-only file/job restoration. It is not a live backup and does not authorize activation.
