@@ -162,9 +162,13 @@ def test_explicit_db_scope_ignores_poisoned_kanban_environment(monkeypatch, db, 
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "wrong-board")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "wrong-task")
 
-    assert mod.main([]) == 0
+    journal = tmp_path / "journal.json"
+    assert mod.main(["--journal", str(journal)]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["changed"] == 1
+    entries = json.loads(journal.read_text())
+    assert len(entries) == 1
+    assert entries[0]["post_image"]["notifier_profile"] == "amber"
     assert not (tmp_path / "poison.db").exists()
 
 
