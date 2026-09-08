@@ -2870,8 +2870,18 @@ def update_job(
     return None
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Pause a job without deleting it. Accepts a job ID or name."""
+def pause_job(
+    job_id: str,
+    reason: Optional[str] = None,
+    *,
+    paused_at: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Pause a job without deleting it. Accepts a job ID or name.
+
+    ``paused_at`` is an internal deterministic-CAS seam used by the rollback
+    package: the exact typed timestamp is persisted before effects and then
+    applied through this same native mutation.
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return None
@@ -2880,7 +2890,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
         {
             "enabled": False,
             "state": "paused",
-            "paused_at": _hermes_now().isoformat(),
+            "paused_at": paused_at if paused_at is not None else _hermes_now().isoformat(),
             "paused_reason": reason,
         },
     )

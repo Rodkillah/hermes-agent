@@ -3094,30 +3094,23 @@ def _notify_batch_schema_constraints(conn: sqlite3.Connection) -> None:
             "AND name IN ('kanban_notify_batches', 'kanban_notify_batch_entries')"
         )
     }
-    required_fragments = {
-        "kanban_notify_batches": (
-            "check (schema_version = 1)",
-            "check (phase in ('forward', 'inverse'))",
-            "inverse_of text unique references kanban_notify_batches(batch_id)",
-            "check (state in ('committed', 'reverted'))",
-            "check (entry_count >= 0)",
-            "check ( (phase = 'forward' and inverse_of is null",
-            "state = 'reverted' and reverted_at is not null",
+    def normalized_sql(sql: str) -> str:
+        return " ".join(sql.lower().split())
+
+    canonical_tables = {
+        "kanban_notify_batches": _NOTIFY_BATCH_SCHEMA_STATEMENTS[0].replace(
+            "CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1
         ),
-        "kanban_notify_batch_entries": (
-            "check (ordinal >= 0)",
-            "check (action in ('create', 'transfer', 'repair'))",
-            "primary key (batch_id, ordinal)",
-            "check (pre_image_json is null or json_valid(pre_image_json))",
-            "check (json_valid(post_image_json))",
+        "kanban_notify_batch_entries": _NOTIFY_BATCH_SCHEMA_STATEMENTS[1].replace(
+            "CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1
         ),
     }
-    for table, fragments in required_fragments.items():
-        sql = sql_by_table.get(table, "")
-        if any(fragment not in sql for fragment in fragments):
-            raise RuntimeError(f"notify batch ledger schema is incompatible for {table}")
+    for table, canonical in canonical_tables.items():
+        if sql_by_table.get(table) != normalized_sql(canonical):
+            raise RuntimeError(f"notify batch ledger schema is incompatible for {table}: full definition")
+
     trigger_sql = {
-        row["name"]: " ".join((row["sql"] or "").lower().split())
+        row["name"]: normalized_sql(row["sql"] or "")
         for row in conn.execute(
             "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
             "AND name IN ('trg_notify_batch_entries_immutable', "
@@ -3125,17 +3118,38 @@ def _notify_batch_schema_constraints(conn: sqlite3.Connection) -> None:
             "'trg_notify_batches_only_revert')"
         )
     }
-    required_triggers = {
-        "trg_notify_batch_entries_immutable": "before update on kanban_notify_batch_entries begin select raise(abort, 'notify batch entries are immutable'); end",
-        "trg_notify_batch_entries_no_delete": "before delete on kanban_notify_batch_entries begin select raise(abort, 'notify batch entries are immutable'); end",
-        "trg_notify_batches_no_delete": "before delete on kanban_notify_batches begin select raise(abort, 'notify batches are immutable'); end",
-        "trg_notify_batches_only_revert": "before update on kanban_notify_batches",
+    canonical_triggers = {
+        "trg_notify_batch_entries_immutable": (
+            "CREATE TRIGGER trg_notify_batch_entries_immutable "
+            "BEFORE UPDATE ON kanban_notify_batch_entries "
+            "BEGIN SELECT RAISE(ABORT, 'notify batch entries are immutable'); END"
+        ),
+        "trg_notify_batch_entries_no_delete": (
+            "CREATE TRIGGER trg_notify_batch_entries_no_delete "
+            "BEFORE DELETE ON kanban_notify_batch_entries "
+            "BEGIN SELECT RAISE(ABORT, 'notify batch entries are immutable'); END"
+        ),
+        "trg_notify_batches_no_delete": (
+            "CREATE TRIGGER trg_notify_batches_no_delete "
+            "BEFORE DELETE ON kanban_notify_batches "
+            "BEGIN SELECT RAISE(ABORT, 'notify batches are immutable'); END"
+        ),
+        "trg_notify_batches_only_revert": (
+            "CREATE TRIGGER trg_notify_batches_only_revert "
+            "BEFORE UPDATE ON kanban_notify_batches "
+            "WHEN NOT (OLD.phase = 'forward' AND OLD.state = 'committed' "
+            "AND NEW.batch_id IS OLD.batch_id AND NEW.schema_version IS OLD.schema_version "
+            "AND NEW.board IS OLD.board AND NEW.phase IS OLD.phase "
+            "AND NEW.inverse_of IS OLD.inverse_of AND NEW.request_digest IS OLD.request_digest "
+            "AND NEW.entry_count IS OLD.entry_count AND NEW.result_json IS OLD.result_json "
+            "AND NEW.committed_at IS OLD.committed_at AND NEW.state = 'reverted' "
+            "AND NEW.reverted_at IS NOT NULL) "
+            "BEGIN SELECT RAISE(ABORT, 'notify batch fields are immutable'); END"
+        ),
     }
-    for name, fragment in required_triggers.items():
-        if fragment not in trigger_sql.get(name, ""):
-            raise RuntimeError(f"notify batch ledger schema is incompatible: trigger {name}")
-    if "new.state = 'reverted'" not in trigger_sql["trg_notify_batches_only_revert"]:
-        raise RuntimeError("notify batch ledger schema is incompatible: revert trigger guard")
+    for name, canonical in canonical_triggers.items():
+        if trigger_sql.get(name) != normalized_sql(canonical):
+            raise RuntimeError(f"notify batch ledger schema is incompatible: trigger {name} definition")
 def _ensure_notify_batch_schema(conn: sqlite3.Connection) -> None:
     """Install or validate the authoritative notify-batch ledger atomically.
 
