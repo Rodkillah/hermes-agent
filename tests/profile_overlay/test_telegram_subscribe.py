@@ -476,3 +476,127 @@ def test_same_second_recreate_gets_new_generation_and_refuses_inverse(monkeypatc
     assert recreated["created_at"] == post["created_at"]
     assert recreated["subscription_generation"] != post["subscription_generation"]
     assert after == recreated
+
+
+def test_private_journal_parent_swap_at_publish_is_cleaned_without_db_commit(monkeypatch, db, tmp_path):
+    """A rename after the final preparation check must abort before SQLite commits.
+
+    This injects at the actual link(2) publication seam.  A secure implementation
+    may write through a directory descriptor, but it must then prove the batch is
+    still attached below JOURNAL_ROOT and clean that descriptor-relative write on
+    failure.
+    """
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        forge = seed_task(kb, conn, owner="forge")
+        monkeypatch.setattr(mod, "DB_PATH", db)
+        monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
+        root = tmp_path / "private-journals"
+        monkeypatch.setattr(mod, "JOURNAL_ROOT", root)
+        original_link = mod.os.link
+        injected = []
+
+        def link(source, destination, *args, **kwargs):
+            if Path(destination).name == "prepared.json" and not injected:
+                batch = next(root.iterdir())
+                outside = tmp_path / "outside-journal"
+                batch.rename(outside)
+                batch.symlink_to(outside, target_is_directory=True)
+                injected.append(outside)
+            return original_link(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "link", link)
+        assert mod.main([]) == 1
+        assert injected
+        assert not (injected[0] / "prepared.json").exists()
+        assert kb.list_notify_subs(conn, forge)[0]["notifier_profile"] == "forge"
+    finally:
+        conn.close()
+
+
+def test_private_journal_marker_open_refuses_aba_symlink_without_transfer(monkeypatch, db, tmp_path):
+    """Recovery must open the observed marker with O_NOFOLLOW, not read a path."""
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        seed_task(kb, conn, owner="amber")
+        seed_task(kb, conn, owner="forge")
+        monkeypatch.setattr(mod, "DB_PATH", db)
+        monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
+        root = tmp_path / "private-journals"
+        monkeypatch.setattr(mod, "JOURNAL_ROOT", root)
+        assert mod.main([]) == 0
+        marker = next(root.iterdir()) / "committed.json"
+        forge = seed_task(kb, conn, owner="forge")
+        original_open = mod.os.open
+        injected = []
+
+        def open_no_follow(path, flags, *args, **kwargs):
+            if Path(path).name == "committed.json" and not (flags & os.O_WRONLY) and not injected:
+                saved = tmp_path / "outside-marker.json"
+                marker.rename(saved)
+                marker.symlink_to(saved)
+                injected.append(saved)
+                try:
+                    return original_open(path, flags, *args, **kwargs)
+                finally:
+                    marker.unlink()
+                    saved.rename(marker)
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "open", open_no_follow)
+        assert mod.main([]) == 1
+        assert injected
+        assert kb.list_notify_subs(conn, forge)[0]["notifier_profile"] == "forge"
+    finally:
+        conn.close()
+
+
+def test_recovery_reads_marker_via_anchored_nofollow_descriptor(monkeypatch, db, tmp_path):
+    """Recovery opens each marker via an anchored descriptor with O_NOFOLLOW."""
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        seed_task(kb, conn, owner="amber")
+        seed_task(kb, conn, owner="forge")
+        monkeypatch.setattr(mod, "DB_PATH", db)
+        monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
+        root = tmp_path / "private-journals"
+        monkeypatch.setattr(mod, "JOURNAL_ROOT", root)
+        assert mod.main([]) == 0
+        batch = next(root.iterdir())
+        (batch / "committed.json").unlink()
+        forge = seed_task(kb, conn, owner="forge")
+        marker = batch / "prepared.json"
+        saved = tmp_path / "prepared-outside.json"
+        original_open = mod.os.open
+        injected = []
+
+        def open_at(path, flags, *args, **kwargs):
+            if (
+                Path(path).name == "prepared.json"
+                and kwargs.get("dir_fd") is not None
+                and not (flags & os.O_WRONLY)
+                and not injected
+            ):
+                assert flags & mod._O_NOFOLLOW
+                marker.rename(saved)
+                marker.symlink_to(saved)
+                injected.append(True)
+                try:
+                    return original_open(path, flags, *args, **kwargs)
+                finally:
+                    marker.unlink()
+                    saved.rename(marker)
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "open", open_at)
+        mod.BatchJournal.recover_pending(conn, root)
+        assert injected
+        assert kb.list_notify_subs(conn, forge)[0]["notifier_profile"] == "forge"
+    finally:
+        conn.close()

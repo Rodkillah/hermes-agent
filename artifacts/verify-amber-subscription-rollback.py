@@ -338,8 +338,9 @@ def run_file_job_restore(root: Path):
 
     base = "b20d9f3c7c8a0a709e862f63240eb3d6fe302e53"
     target_db = root / "live/hermes_cli/kanban_db.py"
+    target_cron = root / "live/cron/jobs.py"
     target_script = root / "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py"
-    for target in (target_db, target_script):
+    for target in (target_db, target_cron, target_script):
         target.parent.mkdir(parents=True, exist_ok=True)
 
     # Snapshot the actual two runtime targets into a private staging area.  The
@@ -351,7 +352,14 @@ def run_file_job_restore(root: Path):
     runtime_script = Path(os.environ.get(
         "AMBER_RUNTIME_RECONCILER", "/home/rodrigue/.hermes/profiles/amber/scripts/kanban_telegram_subscribe_all.py"
     ))
-    targets = ((runtime_db, target_db, ROOT / "hermes_cli/kanban_db.py"), (runtime_script, target_script, SCRIPT))
+    runtime_cron = Path(os.environ.get(
+        "AMBER_RUNTIME_CRON_JOBS", "/mnt/usb-ext4/hermes-agent-runtime/cron/jobs.py"
+    ))
+    targets = (
+        (runtime_db, target_db, ROOT / "hermes_cli/kanban_db.py"),
+        (runtime_cron, target_cron, ROOT / "cron/jobs.py"),
+        (runtime_script, target_script, SCRIPT),
+    )
     preimages = []
     for source, target, candidate in targets:
         if not source.is_file():

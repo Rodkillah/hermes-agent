@@ -51,6 +51,11 @@ ACTIVE_STATUSES = {
     "blocked",
 }
 MAX_BATCH_SIZE = 50
+# Hermes Amber runs on Linux. Some Python builds omit these GNU/Linux flags
+# even though the kernel supports them; use the stable ABI values rather than
+# silently dropping the no-follow protection.
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0o200000)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0o400000)
 _ALLOWED_OWNERS = {PROFILE, SOURCE_PROFILE}
 
 
@@ -83,36 +88,75 @@ def _private_directory(path: Path) -> None:
     _fsync_directory(path)
 
 
-def _write_private_json(path: Path, payload: Mapping[str, Any], *, exclusive: bool) -> None:
+def _open_safe_directory(path: Path) -> int:
+    """Open an already-created absolute directory one component at a time.
+
+    Operations below use the resulting descriptor instead of resolving the
+    journal pathname again.  A later rename can therefore neither redirect a
+    write through a replacement symlink nor make us follow a marker symlink.
+    """
+    absolute = path.absolute()
+    fd = os.open(absolute.anchor, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for part in absolute.parts[1:]:
+            child = os.open(
+                part,
+                os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW,
+                dir_fd=fd,
+            )
+            os.close(fd)
+            fd = child
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError("journal path is not a directory")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _same_directory_entry(parent_fd: int, name: str, child_fd: int) -> bool:
+    """True only while ``name`` still names the directory opened by ``child_fd``."""
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    child = os.fstat(child_fd)
+    return (
+        stat.S_ISDIR(entry.st_mode)
+        and entry.st_dev == child.st_dev
+        and entry.st_ino == child.st_ino
+    )
+
+
+def _read_fd_all(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _write_private_json_at(
+    parent_fd: int,
+    name: str,
+    payload: Mapping[str, Any],
+    *,
+    exclusive: bool,
+    anchor_fd: int | None = None,
+    anchor_name: str | None = None,
+) -> None:
+    """Durably publish one JSON record through anchored directory handles."""
     data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    _private_directory(path.parent)
-    if path.exists() and (path.is_symlink() or not path.is_file()):
-        raise RuntimeError("journal file path is unsafe")
-    if exclusive and path.exists():
-        raise FileExistsError(path)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    # O_NOFOLLOW protects the leaf; capture and re-check the parent as well so
-    # a directory swap cannot redirect a prepared/committed marker mid-write.
-    parent_before = path.parent.lstat()
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
     fd = os.open(
         temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
         0o600,
+        dir_fd=parent_fd,
     )
     try:
-        parent_after = path.parent.lstat()
-        if (
-            stat.S_ISLNK(parent_after.st_mode)
-            or parent_after.st_dev != parent_before.st_dev
-            or parent_after.st_ino != parent_before.st_ino
-        ):
-            os.close(fd)
-            fd = -1
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise RuntimeError("journal parent changed during private write")
         offset = 0
         while offset < len(data):
             written = os.write(fd, data[offset:])
@@ -124,29 +168,29 @@ def _write_private_json(path: Path, payload: Mapping[str, Any], *, exclusive: bo
         if fd >= 0:
             os.close(fd)
     try:
-        # The byte write used the verified parent, but pathname publication
-        # happens afterwards.  Refuse if that parent was replaced in between:
-        # otherwise link()/replace() can publish a durable record below an
-        # attacker-controlled symlink after the database transaction started.
-        parent_final = path.parent.lstat()
-        if (
-            stat.S_ISLNK(parent_final.st_mode)
-            or parent_final.st_dev != parent_before.st_dev
-            or parent_final.st_ino != parent_before.st_ino
+        if anchor_fd is not None and anchor_name is not None and not _same_directory_entry(
+            anchor_fd, anchor_name, parent_fd
         ):
-            raise RuntimeError("journal parent changed before private publication")
+            raise RuntimeError("journal batch detached before private publication")
         if exclusive:
-            # link() is an exclusive publish: unlike rename(), it never
-            # replaces a prepared/committed record created by another writer.
-            os.link(temporary, path)
-            os.unlink(temporary)
+            os.link(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+            os.unlink(temporary, dir_fd=parent_fd)
         else:
-            os.replace(temporary, path)
-        os.chmod(path, 0o600)
-        _fsync_directory(path.parent)
+            os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.chmod(name, 0o600, dir_fd=parent_fd, follow_symlinks=False)
+        if anchor_fd is not None and anchor_name is not None and not _same_directory_entry(
+            anchor_fd, anchor_name, parent_fd
+        ):
+            # The record may have been written through the still-open original
+            # descriptor after its batch was renamed.  Remove it there before
+            # refusing the SQLite transaction; never leave recovery material
+            # outside JOURNAL_ROOT.
+            os.unlink(name, dir_fd=parent_fd)
+            raise RuntimeError("journal batch detached during private publication")
+        os.fsync(parent_fd)
     except Exception:
         try:
-            temporary.unlink()
+            os.unlink(temporary, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
         raise
@@ -190,27 +234,19 @@ def _validate_image(image: Any, *, label: str) -> dict[str, Any]:
     return image
 
 
-def _read_regular_json(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
-    """Read one marker without following a link or accepting a special file."""
+def _read_regular_json_at(parent_fd: int, name: str, *, label: str) -> tuple[dict[str, Any], bytes]:
+    """Read a marker by descriptor, never resolving its parent again."""
     try:
-        info = path.lstat()
-    except FileNotFoundError as exc:
+        fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=parent_fd)
+    except (FileNotFoundError, OSError) as exc:
         raise RuntimeError(f"{label} is missing") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise RuntimeError(f"{label} is unsafe")
-    raw = path.read_bytes()
-    # ``Path.read_bytes`` opens by pathname.  Verify that the exact regular
-    # leaf observed above still occupies that name before accepting its bytes;
-    # a rename-to-symlink race is an unsafe marker, never a valid recovery
-    # record.  The private journal root is additionally serialized by LOCK_PATH.
-    after = path.lstat()
-    if (
-        stat.S_ISLNK(after.st_mode)
-        or not stat.S_ISREG(after.st_mode)
-        or after.st_dev != info.st_dev
-        or after.st_ino != info.st_ino
-    ):
-        raise RuntimeError(f"{label} changed while being read")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"{label} is unsafe")
+        raw = _read_fd_all(fd)
+    finally:
+        os.close(fd)
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -220,19 +256,25 @@ def _read_regular_json(path: Path, *, label: str) -> tuple[dict[str, Any], bytes
     return value, raw
 
 
-def _load_batch_record(candidate: Path) -> tuple[dict[str, Any], bool]:
+def _marker_exists_at(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _load_batch_record_at(batch_fd: int, batch_id: str) -> tuple[dict[str, Any], bool]:
     """Validate a whole durable record before treating it as resolved."""
-    if candidate.is_symlink() or not candidate.is_dir():
-        raise RuntimeError("unsafe journal batch entry")
-    prepared = candidate / "prepared.json"
-    committed = candidate / "committed.json"
-    aborted = candidate / "aborted.json"
-    if not prepared.exists():
-        if committed.exists() or aborted.exists():
+    try:
+        payload, raw = _read_regular_json_at(batch_fd, "prepared.json", label="journal preparation")
+    except RuntimeError as exc:
+        if str(exc) != "journal preparation is missing":
+            raise
+        if _marker_exists_at(batch_fd, "committed.json") or _marker_exists_at(batch_fd, "aborted.json"):
             raise RuntimeError("journal marker has no prepared record")
         return {}, False
-    payload, raw = _read_regular_json(prepared, label="journal preparation")
-    if payload.get("schema_version") != 1 or payload.get("batch_id") != candidate.name:
+    if payload.get("schema_version") != 1 or payload.get("batch_id") != batch_id:
         raise RuntimeError("journal preparation identity is malformed")
     if payload.get("phase") not in {"forward", "inverse"}:
         raise RuntimeError("journal preparation phase is malformed")
@@ -252,18 +294,18 @@ def _load_batch_record(candidate: Path) -> tuple[dict[str, Any], bool]:
                 if pre[field] != post[field]:
                     raise RuntimeError("journal images identify different subscription incarnations")
     resolved = False
-    if committed.exists():
-        marker, _ = _read_regular_json(committed, label="journal committed marker")
+    if _marker_exists_at(batch_fd, "committed.json"):
+        marker, _ = _read_regular_json_at(batch_fd, "committed.json", label="journal committed marker")
         if (
             marker.get("schema_version") != 1
-            or marker.get("batch_id") != candidate.name
+            or marker.get("batch_id") != batch_id
             or marker.get("prepared_sha256") != hashlib.sha256(raw).hexdigest()
         ):
             raise RuntimeError("journal committed marker does not match preparation")
         resolved = True
-    if aborted.exists():
-        marker, _ = _read_regular_json(aborted, label="journal aborted marker")
-        if marker.get("batch_id") != candidate.name:
+    if _marker_exists_at(batch_fd, "aborted.json"):
+        marker, _ = _read_regular_json_at(batch_fd, "aborted.json", label="journal aborted marker")
+        if marker.get("batch_id") != batch_id:
             raise RuntimeError("journal aborted marker does not match preparation")
         if resolved:
             raise RuntimeError("journal has conflicting terminal markers")
@@ -277,41 +319,76 @@ class BatchJournal:
     def __init__(self, root: Path, *, phase: str = "forward"):
         _private_directory(root)
         self.root = root
+        self.root_fd = _open_safe_directory(root)
         self.batch_id = uuid.uuid4().hex
         self.path = root / self.batch_id
-        if self.path.exists():
-            raise RuntimeError("journal batch id collision")
-        self.path.mkdir(mode=0o700)
-        _private_directory(self.path)
-        if self.path.is_symlink() or not self.path.is_dir():
-            raise RuntimeError("journal batch path is unsafe")
-        os.chmod(self.path, 0o700)
-        _fsync_directory(root)
+        try:
+            os.mkdir(self.batch_id, 0o700, dir_fd=self.root_fd)
+            self.batch_fd = os.open(
+                self.batch_id,
+                os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW,
+                dir_fd=self.root_fd,
+            )
+        except Exception:
+            os.close(self.root_fd)
+            raise
+        os.fsync(self.root_fd)
         self.phase = phase
         self.prepared_path = self.path / "prepared.json"
         self.committed_path = self.path / "committed.json"
 
+    def _assert_attached(self) -> None:
+        if not _same_directory_entry(self.root_fd, self.batch_id, self.batch_fd):
+            raise RuntimeError("journal batch detached from root")
+
+    def _read(self, name: str, *, label: str) -> tuple[dict[str, Any], bytes]:
+        self._assert_attached()
+        try:
+            fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=self.batch_fd)
+        except OSError as exc:
+            raise RuntimeError(f"{label} is missing") from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError(f"{label} is unsafe")
+            raw = _read_fd_all(fd)
+        finally:
+            os.close(fd)
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{label} is malformed") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(f"{label} is malformed")
+        return value, raw
+
     def prepare(self, entries: list[dict[str, Any]]) -> None:
         if not entries:
             return
-        _write_private_json(
-            self.prepared_path,
+        _write_private_json_at(
+            self.batch_fd,
+            "prepared.json",
             {"schema_version": 1, "batch_id": self.batch_id, "phase": self.phase, "entries": entries},
             exclusive=True,
+            anchor_fd=self.root_fd,
+            anchor_name=self.batch_id,
         )
 
     def mark_committed(self) -> None:
-        payload, raw = _read_regular_json(self.prepared_path, label="journal preparation")
+        payload, raw = self._read("prepared.json", label="journal preparation")
         if payload.get("batch_id") != self.batch_id:
             raise RuntimeError("journal preparation identity is malformed")
-        _write_private_json(
-            self.committed_path,
+        _write_private_json_at(
+            self.batch_fd,
+            "committed.json",
             {
                 "schema_version": 1,
                 "batch_id": self.batch_id,
                 "prepared_sha256": hashlib.sha256(raw).hexdigest(),
             },
             exclusive=True,
+            anchor_fd=self.root_fd,
+            anchor_name=self.batch_id,
         )
 
     @staticmethod
@@ -320,37 +397,66 @@ class BatchJournal:
         if not root.exists():
             return
         _private_directory(root)
-        with kb.write_txn(conn):
-            for candidate in sorted(root.iterdir()):
-                data, resolved = _load_batch_record(candidate)
-                if not data or resolved:
-                    continue
-                entries = data["entries"]
-                post = pre = True
-                for entry in entries:
-                    image = entry["post_image"]
-                    rows = _fetch_target_raw(conn, image)
-                    current = rows[0] if len(rows) == 1 else None
-                    post = post and _image_matches(current, image)
-                    pre = pre and _image_matches(current, entry.get("pre_image"))
-                phase = data["phase"]
-                applied = post if phase == "forward" else pre
-                unapplied = pre if phase == "forward" else post
-                prepared = candidate / "prepared.json"
-                committed = candidate / "committed.json"
-                if applied:
-                    journal = BatchJournal.__new__(BatchJournal)
-                    journal.path, journal.prepared_path, journal.committed_path = candidate, prepared, committed
-                    journal.batch_id = str(data["batch_id"])
-                    journal.mark_committed()
-                elif unapplied:
-                    _write_private_json(
-                        candidate / "aborted.json",
-                        {"schema_version": 1, "batch_id": data["batch_id"]},
-                        exclusive=True,
-                    )
-                else:
-                    raise RuntimeError("journal recovery is ambiguous; refusing a new batch")
+        root_fd = _open_safe_directory(root)
+        try:
+            with kb.write_txn(conn):
+                for name in sorted(os.listdir(root_fd)):
+                    try:
+                        batch_fd = os.open(
+                            name,
+                            os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW,
+                            dir_fd=root_fd,
+                        )
+                    except OSError as exc:
+                        raise RuntimeError("unsafe journal batch entry") from exc
+                    try:
+                        if not _same_directory_entry(root_fd, name, batch_fd):
+                            raise RuntimeError("journal batch detached from root")
+                        data, resolved = _load_batch_record_at(batch_fd, name)
+                        if not data or resolved:
+                            continue
+                        entries = data["entries"]
+                        post = pre = True
+                        for entry in entries:
+                            image = entry["post_image"]
+                            rows = _fetch_target_raw(conn, image)
+                            current = rows[0] if len(rows) == 1 else None
+                            post = post and _image_matches(current, image)
+                            pre = pre and _image_matches(current, entry.get("pre_image"))
+                        phase = data["phase"]
+                        applied = post if phase == "forward" else pre
+                        unapplied = pre if phase == "forward" else post
+                        if applied:
+                            _prepared, raw = _read_regular_json_at(
+                                batch_fd, "prepared.json", label="journal preparation"
+                            )
+                            _write_private_json_at(
+                                batch_fd,
+                                "committed.json",
+                                {
+                                    "schema_version": 1,
+                                    "batch_id": data["batch_id"],
+                                    "prepared_sha256": hashlib.sha256(raw).hexdigest(),
+                                },
+                                exclusive=True,
+                                anchor_fd=root_fd,
+                                anchor_name=name,
+                            )
+                        elif unapplied:
+                            _write_private_json_at(
+                                batch_fd,
+                                "aborted.json",
+                                {"schema_version": 1, "batch_id": data["batch_id"]},
+                                exclusive=True,
+                                anchor_fd=root_fd,
+                                anchor_name=name,
+                            )
+                        else:
+                            raise RuntimeError("journal recovery is ambiguous; refusing a new batch")
+                    finally:
+                        os.close(batch_fd)
+        finally:
+            os.close(root_fd)
 
 
 def _validate_export_path(path: Path) -> None:
