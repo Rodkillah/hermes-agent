@@ -71,6 +71,12 @@ def run_nominal(db: Path):
             task_id: dict(kb.list_notify_subs(conn, task_id)[0])
             for task_id in (anchor, forge, notify_only, human)
         }
+        backup = db.with_name("pre-activation-backup.db")
+        conn.execute("VACUUM INTO ?", (str(backup),))
+        with sqlite3.connect(f"file:{backup}?mode=ro", uri=True) as backup_conn:
+            assert backup_conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert backup_conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 5
+            assert backup_conn.execute("SELECT count(*) FROM kanban_notify_subs").fetchone()[0] == 4
         journal = []
         migrated = module.reconcile(conn, journal=journal)
         assert migrated["changed"] == 4, migrated
