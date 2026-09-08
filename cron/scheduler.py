@@ -7526,10 +7526,7 @@ def run_one_job(
             fire_owner or None,
             profile_home,
         )
-    heartbeat_signal = []
-
     def _run_body_with_signal(signal):
-        heartbeat_signal.append(signal)
         combined_cancel = (
             _CombinedCancelEvent(signal, cancel_event)
             if cancel_event is not None
