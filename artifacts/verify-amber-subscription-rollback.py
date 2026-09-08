@@ -19,12 +19,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py"
 
 # The package is deliberately narrow: it is a rollback receipt for exactly the
-# three files and five administrative fields that this candidate owns.  Keep
+# four files and five administrative fields that this candidate owns.  Keep
 # these contracts explicit so a partial/duplicate manifest cannot be mistaken
 # for a complete rollback package.
 _ROLLBACK_TARGETS = frozenset({
     "live/hermes_cli/kanban_db.py",
     "live/cron/jobs.py",
+    "live/cron/scheduler.py",
     "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py",
 })
 _ROLLBACK_JOB_ID = "85fcd56ee535"
@@ -541,7 +542,7 @@ def _prepare_and_restore_file_job_package(root: Path):
     ]
 
     # Only after the guarded job state has returned through the candidate code
-    # may the three exact runtime files be conditionally restored to their
+    # may the four exact runtime files be conditionally restored to their
     # private pre-images. This is a pathname-CAS, never hash-check then copy.
     for target, staged_post, staged_pre, pre_hash, pre_mode in preimages:
         restore_file_from_private_preimage(
@@ -668,7 +669,7 @@ def _validate_existing_file_job_package(root: Path) -> dict[str, object]:
         raise RuntimeError("rollback package manifest is not consumable")
     files = package.get("files")
     if not isinstance(files, list) or len(files) != len(_ROLLBACK_TARGETS):
-        raise RuntimeError("rollback package must contain exactly three file images")
+        raise RuntimeError("rollback package must contain exactly four file images")
     if package.get("job_id") != _ROLLBACK_JOB_ID:
         raise RuntimeError("rollback package job identity is outside the owned scope")
     job_preimage = _validate_job_admin_image(package.get("job_preimage"), "job_preimage")
@@ -710,7 +711,7 @@ def _validate_existing_file_job_package(root: Path) -> dict[str, object]:
         target_rel, pre_rel, post_rel, expected_pre_file, expected_post_file = _validate_file_image_entry(item)
         target_key, pre_key, post_key = str(target_rel), str(pre_rel), str(post_rel)
         if target_key not in _ROLLBACK_TARGETS:
-            raise RuntimeError(f"rollback package target is not one of the three owned files: {target_key}")
+            raise RuntimeError(f"rollback package target is not one of the four owned files: {target_key}")
         if target_key in seen_targets or pre_key in seen_preimages or post_key in seen_postimages:
             raise RuntimeError("rollback package contains duplicate file images")
         seen_targets.add(target_key)
@@ -738,7 +739,7 @@ def _validate_existing_file_job_package(root: Path) -> dict[str, object]:
         else:
             raise RuntimeError(f"rollback package target is missing: {target.name}")
     if seen_targets != _ROLLBACK_TARGETS:
-        raise RuntimeError("rollback package does not cover exactly the three owned files")
+        raise RuntimeError("rollback package does not cover exactly the four owned files")
     return package
 
 
@@ -882,6 +883,7 @@ def run_file_job_restore(root: Path, *, consume: bool = True):
     candidates = (
         (root / "live/hermes_cli/kanban_db.py", Path(os.environ.get("AMBER_RUNTIME_KANBAN_DB", "/mnt/usb-ext4/hermes-agent-runtime/hermes_cli/kanban_db.py")), ROOT / "hermes_cli/kanban_db.py"),
         (root / "live/cron/jobs.py", Path(os.environ.get("AMBER_RUNTIME_CRON_JOBS", "/mnt/usb-ext4/hermes-agent-runtime/cron/jobs.py")), ROOT / "cron/jobs.py"),
+        (root / "live/cron/scheduler.py", Path(os.environ.get("AMBER_RUNTIME_CRON_SCHEDULER", "/mnt/usb-ext4/hermes-agent-runtime/cron/scheduler.py")), ROOT / "cron/scheduler.py"),
         (root / "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py", Path(os.environ.get("AMBER_RUNTIME_RECONCILER", "/home/rodrigue/.hermes/profiles/amber/scripts/kanban_telegram_subscribe_all.py")), SCRIPT),
     )
     package = {
