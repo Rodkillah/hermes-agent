@@ -1,6 +1,6 @@
 # Candidat Amber subscription reconciliation — manifeste SQLite et reprise bornée
 
-Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtime ou Brain n'a été muté. Le job `85fcd56ee535` reste disabled/paused jusqu'à revue indépendante et gate Amber.
+Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtime ou Brain n'a été muté par ce candidat. Des écritures Brain antérieures sur la carte restent un écart de gouvernance séparé, non validé ni réparé ici. Le job `85fcd56ee535` reste disabled/paused jusqu'à revue indépendante et gate Amber.
 
 ## Identité contrôlée
 
@@ -44,4 +44,4 @@ Publication: manifeste temporaire écrit et fsyncé, répertoire fsyncé, rempla
 
 ## Retour sûr
 
-Le rollback candidat est un revert Git du SHA exact `ae6d32788d9a132bc3a8b327765eb3576a1d8dfc` vers son parent `14f860d24a0580239c326be3dd15724f8732b020`, après revue. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.
+Le rollback source-only du candidat exact est le revert du commit d'implémentation `8e7b4a854d` vers son parent `cf3e9c95de`, puis, si nécessaire, des commits documentaires ultérieurs dans l'ordre inverse. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.
