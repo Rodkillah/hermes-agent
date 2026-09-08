@@ -6,8 +6,8 @@ Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
 - Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
-- Implémentation exacte de ce rework: `7af432a6e94316bd8072e78c6be30cd852d2c440` (parent `642a4d464b49cb23f3d312ff438ffaf9c4afbe6b`). Le candidat final est le HEAD de cette branche au gel de revue ; aucun autre SHA ne vaut candidat.
-- Fichiers de ce rework: `artifacts/verify-amber-subscription-rollback.py`, `artifacts/amber-subscription-rollback-manifest.md`.
+- Implementation exacte de ce rework: `d436b88f90c15ba5545dad7c01c091204f233314` (parent `7b85a46e09483a28fe0c9b2aef60855c8c0171f1`). Le candidat final est le HEAD de cette branche au gel de revue ; aucun autre SHA ne vaut candidat.
+- Fichiers de ce rework: `cron/jobs.py`, `artifacts/verify-amber-subscription-rollback.py`, `tests/cron/test_update_job_expected_cas.py`, `artifacts/amber-subscription-rollback-manifest.md`.
 - Le worktree candidat doit être relu propre et le SHA final exact doit être gelé avant revue; aucun autre SHA ne vaut candidat.
 
 ## Autorité et atomicité
@@ -23,6 +23,8 @@ Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 
 La consommation opérationnelle exige ensuite ce paquet existant: DB + `forward_batch_id` explicite, document de job privé et trois fichiers privés. Elle valide et récupère le manifeste complet avant l'inverse, sans jamais préparer selon l'existence d'un répertoire, reseed, recopier une source live, réinstaller une fixture ou reconstruire les pré-images après interruption. Les pré-images et post-images sont validées contre le manifeste immuable; une décision job tierce est refusée sans écrasement. Un marqueur de restauration fichier laissé par SIGKILL est récupéré après cette validation et avant la classification du fichier, puis le fichier est restauré par CAS. Un état terminal est rejoué depuis le reçu et ses copies privées, sans lecture live.
 
+La garde finale de `cron.jobs.update_job(..., expected=...)` compare désormais sous le verrou natif la présence, le type JSON exact et la valeur de chaque champ attendu: `False` ne correspond pas à `0` et une clé absente ne correspond pas à `null`. Le caller de reprise lit l'image brute du document privé et la valide sans passer par la normalisation d'affichage de `get_job()`.
+
 Publication: manifeste temporaire écrit et fsyncé, répertoire fsyncé, remplacement atomique, sans `write_text` tronquant le primaire. Lors d'une récupération, le primaire endommagé n'écrase jamais la seule copie `.previous` valide. Le paquet nominal est préparé et durable avant l'ordre exercé `inverse SQLite -> job CAS -> trois fichiers CAS`; le replay du même paquet ne réapplique aucune inverse.
 
 ## Preuves source-only réellement exécutées
@@ -33,7 +35,9 @@ Publication: manifeste temporaire écrit et fsyncé, répertoire fsyncé, rempla
 - Rejeu indépendant R10→R14 sous sandbox isolé avec adaptateurs de fixtures explicites R14 (aucune désélection) → 77 passed, rc 0. Les deux anciens contrôles de préparation implicite ont été réalignés sur le contrat strict « prepare puis consume »; le contrôle de refus d'un paquet absent est conservé.
 - `env -u HERMES_KANBAN_TASK -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD python artifacts/verify-amber-subscription-rollback.py` → `targeted Amber rollback verifier: PASS`, `quick_check=ok`, conflit concurrent refusé sans overwrite, rc 0.
 - Contrat indépendant R16 (`test_review_round16_contract.py`) → 7 passed, rc 0. Il couvre le refus sans effet d'un marqueur non régulier, d'une identité de job hors périmètre ou dupliquée, et d'un état administratif observé incomplet ou mal typé.
-- `python3 -m py_compile artifacts/verify-amber-subscription-rollback.py cron/jobs.py hermes_cli/kanban_db.py` → rc 0; `git diff --check bba2fe5e..HEAD` → rc 0.
+- Contrat indépendant R17 (`test_review_round17_contract.py`) → 6 passed, rc 0 après correction de la garde finale; les deux interventions tardives `False→0` et `null→absent` sont refusées sans restauration des fichiers et avec reçu conservé `prepared`.
+- Régressions natives `tests/cron/test_update_job_expected_cas.py tests/cron/test_jobs.py` → 116 passed, rc 0; suite overlay → 21 passed, rc 0; suite Hermes/cron → 65 passed, rc 0.
+- `python3 -m py_compile artifacts/verify-amber-subscription-rollback.py cron/jobs.py tests/cron/test_update_job_expected_cas.py` → rc 0; `git diff --check 7b85a46e09483a28fe0c9b2aef60855c8c0171f1..HEAD` → rc 0.
 
 ## Préconditions de gate (non réalisées)
 
@@ -45,4 +49,4 @@ Publication: manifeste temporaire écrit et fsyncé, répertoire fsyncé, rempla
 
 ## Retour sûr
 
-Le rollback source-only du candidat exact est le revert du commit `7af432a6e94316bd8072e78c6be30cd852d2c440` vers `642a4d464b49cb23f3d312ff438ffaf9c4afbe6b`, puis, si nécessaire, des commits antérieurs dans l'ordre inverse. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.
+Le rollback source-only du candidat exact est le revert du commit `d436b88f90c15ba5545dad7c01c091204f233314` vers `7b85a46e09483a28fe0c9b2aef60855c8c0171f1`, puis, si nécessaire, des commits antérieurs dans l'ordre inverse. Pour un rollback runtime, pause native du job, quiescence et absence de run/descripteur en vol; sous le verrou historique, résoudre les batches SQLite et appliquer l'inverse native. Restaurer ensuite l'administration guarded du seul job, puis les trois fichiers par CAS pré/post-image. Conserver le schéma additif, index et triggers; ne jamais restaurer globalement `kanban.db` ou `jobs.json`, ni écraser claims, historique ou autres jobs.
