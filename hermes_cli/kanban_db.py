@@ -3080,6 +3080,12 @@ def _notify_batch_schema_constraints(conn: sqlite3.Connection) -> None:
     }
     if "idx_notify_batches_inverse" not in index_names:
         raise RuntimeError("notify batch ledger schema is incompatible: missing inverse index")
+    inverse_columns = [
+        row["name"]
+        for row in conn.execute("PRAGMA index_info(idx_notify_batches_inverse)")
+    ]
+    if inverse_columns != ["inverse_of"]:
+        raise RuntimeError("notify batch ledger schema is incompatible: inverse index columns")
 
     sql_by_table = {
         row["name"]: " ".join((row["sql"] or "").lower().split())
@@ -3096,6 +3102,7 @@ def _notify_batch_schema_constraints(conn: sqlite3.Connection) -> None:
             "check (state in ('committed', 'reverted'))",
             "check (entry_count >= 0)",
             "check ( (phase = 'forward' and inverse_of is null",
+            "state = 'reverted' and reverted_at is not null",
         ),
         "kanban_notify_batch_entries": (
             "check (ordinal >= 0)",
@@ -3109,8 +3116,26 @@ def _notify_batch_schema_constraints(conn: sqlite3.Connection) -> None:
         sql = sql_by_table.get(table, "")
         if any(fragment not in sql for fragment in fragments):
             raise RuntimeError(f"notify batch ledger schema is incompatible for {table}")
-
-
+    trigger_sql = {
+        row["name"]: " ".join((row["sql"] or "").lower().split())
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name IN ('trg_notify_batch_entries_immutable', "
+            "'trg_notify_batch_entries_no_delete', 'trg_notify_batches_no_delete', "
+            "'trg_notify_batches_only_revert')"
+        )
+    }
+    required_triggers = {
+        "trg_notify_batch_entries_immutable": "before update on kanban_notify_batch_entries begin select raise(abort, 'notify batch entries are immutable'); end",
+        "trg_notify_batch_entries_no_delete": "before delete on kanban_notify_batch_entries begin select raise(abort, 'notify batch entries are immutable'); end",
+        "trg_notify_batches_no_delete": "before delete on kanban_notify_batches begin select raise(abort, 'notify batches are immutable'); end",
+        "trg_notify_batches_only_revert": "before update on kanban_notify_batches",
+    }
+    for name, fragment in required_triggers.items():
+        if fragment not in trigger_sql.get(name, ""):
+            raise RuntimeError(f"notify batch ledger schema is incompatible: trigger {name}")
+    if "new.state = 'reverted'" not in trigger_sql["trg_notify_batches_only_revert"]:
+        raise RuntimeError("notify batch ledger schema is incompatible: revert trigger guard")
 def _ensure_notify_batch_schema(conn: sqlite3.Connection) -> None:
     """Install or validate the authoritative notify-batch ledger atomically.
 
@@ -3184,6 +3209,7 @@ def _ensure_notify_batch_schema(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    _notify_batch_schema_constraints(conn)
 
 
 def _preflight_notify_batch_schema(conn: sqlite3.Connection) -> None:
@@ -12943,6 +12969,9 @@ def _validate_notify_batch_image(image: Optional[Mapping[str, Any]], *, label: s
     for field in ("platform", "chat_id", "thread_id", "notifier_profile", "delivery_mode"):
         if not isinstance(image[field], str):
             raise ValueError(f"{label} has an invalid {field}")
+    for field in ("user_id", "user_id_alt", "chat_type"):
+        if image[field] is not None and not isinstance(image[field], str):
+            raise ValueError(f"{label} has a non-SQLite {field}")
     generation = image["subscription_generation"]
     if not isinstance(generation, str) or len(generation) != 32 or any(c not in "0123456789abcdef" for c in generation):
         raise ValueError(f"{label} has an invalid subscription generation")
@@ -13046,14 +13075,24 @@ def record_notify_batch(
         ))
     if identityless_create_entries:
         forward_entries = list_notify_batch_entries(conn, inverse_of) if inverse_of else []
-        allowed = sum(
-            1 for entry in forward_entries
-            if entry["action"] == "create"
-            and entry["pre_image_json"] is None
-            and entry["post_image_json"] != "null"
-        )
-        if identityless_create_entries != allowed:
-            raise ValueError("inverse absent-create entry does not match its forward batch")
+        if not inverse_of or len(forward_entries) == 0:
+            raise ValueError("inverse absent-create entry has no forward batch")
+        # Inverse entries are recorded in reverse forward order.  Match an
+        # already-absent creation to that exact ordinal, rather than comparing
+        # one global count: a mixed batch may contain one absent creation and
+        # another creation that was present and was correctly deleted.
+        if len(materialized) != len(forward_entries):
+            raise ValueError("inverse batch entry count does not match its forward batch")
+        for ordinal, entry in enumerate(materialized):
+            if entry.get("action") != "create" or entry.get("post_image") is not None:
+                continue
+            forward = forward_entries[len(forward_entries) - 1 - ordinal]
+            if not (
+                forward["action"] == "create"
+                and forward["pre_image_json"] is None
+                and forward["post_image_json"] != "null"
+            ):
+                raise ValueError("inverse absent-create entry does not match its forward batch")
     result_json = _canonical_notify_batch_json(dict(result))
     with write_txn(conn, allow_nested=True):
         existing = get_notify_batch(conn, batch_id)

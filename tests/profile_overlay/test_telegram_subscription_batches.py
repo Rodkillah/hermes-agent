@@ -106,3 +106,40 @@ def test_batch_migration_rejects_preexisting_incompatible_schema(monkeypatch, tm
     kb._INITIALIZED_PATHS.discard(str(path.resolve()))
     with pytest.raises(RuntimeError, match="notify batch.*schema"):
         kb.init_db(path)
+
+
+def test_inverse_mixed_creation_absence_matches_each_forward_ordinal(monkeypatch, db):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        seed_task(kb, conn, owner="amber")
+        absent = seed_task(kb, conn)
+        present = seed_task(kb, conn)
+        mod.reconcile(conn, batch_id="mixed-forward")
+        kb.remove_notify_sub(conn, task_id=absent, platform="telegram", chat_id="chat", thread_id="thread")
+        assert mod.rollback_batch(conn, "mixed-forward") == 2
+        assert kb.list_notify_subs(conn, absent) == []
+        assert kb.list_notify_subs(conn, present) == []
+        assert kb.get_notify_batch(conn, "mixed-forward")["state"] == "reverted"
+    finally:
+        conn.close()
+
+
+def test_authoritative_images_reject_non_sqlite_origin_values(monkeypatch, db):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        task = seed_task(kb, conn, owner="forge")
+        mod.reconcile(conn, batch_id="origin-forward")
+        post = dict(kb.list_notify_subs(conn, task)[0])
+        pre = dict(post, notifier_profile="forge", delivery_mode="notify+wake", user_id=["not text"])
+        with pytest.raises(ValueError, match="non-SQLite user_id"):
+            kb.record_notify_batch(
+                conn, batch_id="invalid-origin", board=mod.BOARD, phase="forward",
+                request_digest="invalid-origin", result={},
+                entries=[{"action": "transfer", "pre_image": pre, "post_image": post}],
+            )
+    finally:
+        conn.close()

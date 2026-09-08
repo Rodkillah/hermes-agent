@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -167,6 +168,51 @@ def _fsync_parent(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _publish_manifest(path: Path, payload: dict[str, object]) -> None:
+    """Publish a durable receipt while retaining a recovery copy.
+
+    The backup is fsynced before the compatibility write to ``path``.  If a
+    process dies after the destination is truncated, the next consumer can
+    recover the last complete receipt instead of rebuilding from live state.
+    """
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    backup = path.with_name(path.name + ".previous")
+    if path.exists() and path.stat().st_size:
+        shutil.copy2(path, backup)
+        fd = os.open(backup, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _fsync_parent(backup)
+    # Keep this named-path write so the disposable SIGKILL probe exercises the
+    # real publication boundary.  The previous receipt remains recoverable.
+    path.write_text(encoded, encoding="utf-8")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_parent(path)
+    if backup.exists():
+        backup.unlink()
+        _fsync_parent(backup)
+
+
+def _load_manifest(path: Path) -> dict[str, object]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        backup = path.with_name(path.name + ".previous")
+        if not backup.is_file():
+            raise RuntimeError("rollback package manifest is unreadable and has no durable recovery copy") from exc
+        payload = json.loads(backup.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("rollback package recovery copy is malformed")
+        _publish_manifest(path, payload)
+        return payload
 
 
 def _write_restore_marker(marker: Path, payload: dict[str, object]) -> None:
@@ -336,53 +382,24 @@ def _prepare_and_restore_file_job_package(root: Path):
     """
     from cron import jobs as cron_jobs
 
-    base = "b20d9f3c7c8a0a709e862f63240eb3d6fe302e53"
-    target_db = root / "live/hermes_cli/kanban_db.py"
-    target_cron = root / "live/cron/jobs.py"
-    target_script = root / "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py"
-    for target in (target_db, target_cron, target_script):
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-    # Snapshot the actual two runtime targets into a private staging area.  The
-    # overlay script is already installed on the host, so treating it as an
-    # assumed absence would turn a rollback into an unintended deletion.
-    runtime_db = Path(os.environ.get(
-        "AMBER_RUNTIME_KANBAN_DB", "/mnt/usb-ext4/hermes-agent-runtime/hermes_cli/kanban_db.py"
-    ))
-    runtime_script = Path(os.environ.get(
-        "AMBER_RUNTIME_RECONCILER", "/home/rodrigue/.hermes/profiles/amber/scripts/kanban_telegram_subscribe_all.py"
-    ))
-    runtime_cron = Path(os.environ.get(
-        "AMBER_RUNTIME_CRON_JOBS", "/mnt/usb-ext4/hermes-agent-runtime/cron/jobs.py"
-    ))
-    targets = (
-        (runtime_db, target_db, ROOT / "hermes_cli/kanban_db.py"),
-        (runtime_cron, target_cron, ROOT / "cron/jobs.py"),
-        (runtime_script, target_script, SCRIPT),
-    )
-    preimages = []
-    for source, target, candidate in targets:
-        if not source.is_file():
-            raise AssertionError(f"runtime rollback target is missing: {source}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        staged_pre = root / "preimages" / target.name
-        staged_pre.parent.mkdir(mode=0o700, exist_ok=True)
-        shutil.copy2(target, staged_pre)
-        preimages.append((target, candidate, staged_pre, file_hash(target), file_mode(target)))
-
-    # Commit the immutable file pre-images into the package receipt before any
-    # candidate bytes or job state are installed.  A later process must reject
-    # a changed staging file, never discover a new baseline.
     marker_path = _package_marker(root)
-    package = json.loads(marker_path.read_text(encoding="utf-8"))
-    for item, (_target, _candidate, staged_pre, pre_hash, pre_mode) in zip(package["files"], preimages):
-        item["pre_hash"] = pre_hash
-        item["pre_mode"] = pre_mode
-    marker_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _fsync_parent(marker_path)
+    package = _load_manifest(marker_path)
+    if package.get("state") != "prepared" or not isinstance(package.get("files"), list):
+        raise RuntimeError("rollback package is not a prepared durable package")
+    preimages = []
+    for item in package["files"]:
+        target = root / item["target"]
+        staged_pre = root / item["preimage"]
+        staged_post = root / item["candidate_image"]
+        candidate = Path(item["candidate"])
+        if file_state(staged_pre) != (item["pre_hash"], int(item["pre_mode"])):
+            raise RuntimeError(f"rollback package pre-image changed: {target.name}")
+        if file_state(staged_post) != (item["post_hash"], int(item["post_mode"])):
+            raise RuntimeError(f"rollback package post-image changed: {target.name}")
+        preimages.append((target, candidate, staged_pre, item["pre_hash"], int(item["pre_mode"])))
 
-    # Install and prove the exact candidate bytes on copies only.
+    # The package already contains every pre/post image.  No source runtime or
+    # live jobs document is read during consumption.
     for target, candidate, _staged_pre, _pre_hash, _pre_mode in preimages:
         shutil.copy2(candidate, target)
         assert file_hash(target) == file_hash(candidate)
@@ -393,32 +410,21 @@ def _prepare_and_restore_file_job_package(root: Path):
     # imported in-memory copy of cron.jobs after its on-disk candidate has been
     # replaced by old code.
 
-    # Read the real existing job document, then route cron.jobs through an
-    # isolated copy.  Only the named job's administrative fields may change;
-    # other records, claims and history are byte-for-byte copied and compared
-    # structurally after the native pause/restore cycle.
-    live_jobs = Path(
-        os.environ.get(
-            "AMBER_PROFILE_JOBS_FILE",
-            "/home/rodrigue/.hermes/profiles/amber/cron/jobs.json",
-        )
-    )
-    raw_document = json.loads(live_jobs.read_text(encoding="utf-8"))
-    raw_jobs = raw_document.get("jobs", raw_document) if isinstance(raw_document, dict) else raw_document
-    if not isinstance(raw_jobs, list):
-        raise AssertionError("Amber jobs document has no job list")
-    original = next(job for job in raw_jobs if job.get("id") == "85fcd56ee535")
+    # Consume only the durable private job document from the package.
+    original = package["job_preimage"]
     private_cron = root / "private-cron"
-    private_cron.mkdir(mode=0o700)
     private_jobs = private_cron / "jobs.json"
-    shutil.copy2(live_jobs, private_jobs)
+    if not private_jobs.is_file():
+        raise RuntimeError("rollback package job document is missing")
+    raw_document = json.loads(private_jobs.read_text(encoding="utf-8"))
+    raw_jobs = raw_document.get("jobs", raw_document) if isinstance(raw_document, dict) else raw_document
     original_constants = cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR
     cron_jobs.CRON_DIR = private_cron
     cron_jobs.JOBS_FILE = private_jobs
     cron_jobs.OUTPUT_DIR = private_cron / "output"
     try:
         observed = cron_jobs.get_job("85fcd56ee535")
-        assert observed and observed["id"] == original["id"]
+        assert observed and observed["id"] == "85fcd56ee535"
         admin = {key: original.get(key) for key in (
             "enabled", "state", "paused_at", "paused_reason", "next_run_at"
         )}
@@ -433,11 +439,6 @@ def _prepare_and_restore_file_job_package(root: Path):
         # timeout or concurrent native update is a conflict, never a stale
         # overwrite of administrative cron state.
         post_admin = {key: paused.get(key) for key in admin}
-        package = json.loads(marker_path.read_text(encoding="utf-8"))
-        package["job_postimage"] = post_admin
-        package["job_preimage"] = admin
-        marker_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        _fsync_parent(marker_path)
         restored = cron_jobs.update_job(observed["id"], admin, expected=post_admin)
         if restored is None:
             raise RuntimeError("cron administrative state changed before guarded restore")
@@ -449,10 +450,10 @@ def _prepare_and_restore_file_job_package(root: Path):
         restored_document.get("jobs", restored_document)
         if isinstance(restored_document, dict) else restored_document
     )
-    restored_job = next(job for job in restored_jobs if job.get("id") == original["id"])
+    restored_job = next(job for job in restored_jobs if job.get("id") == "85fcd56ee535")
     assert all(restored_job.get(key) == value for key, value in admin.items())
-    assert [job for job in restored_jobs if job.get("id") != original["id"]] == [
-        job for job in raw_jobs if job.get("id") != original["id"]
+    assert [job for job in restored_jobs if job.get("id") != "85fcd56ee535"] == [
+        job for job in raw_jobs if job.get("id") != "85fcd56ee535"
     ]
 
     # Only after the guarded job state has returned through the candidate code
@@ -489,7 +490,7 @@ def _resume_existing_file_job_package(root: Path) -> None:
     reopening the live jobs document or recopying any runtime file.
     """
     marker_path = _package_marker(root)
-    package = json.loads(marker_path.read_text(encoding="utf-8"))
+    package = _load_manifest(marker_path)
     if package.get("schema_version") != 1 or not package.get("files"):
         raise RuntimeError("rollback package manifest is malformed")
     if package.get("state") == "completed":
@@ -541,10 +542,20 @@ def _resume_existing_file_job_package(root: Path) -> None:
         current_admin = {key: observed.get(key) for key in job_fields}
         expected_post = {key: job_postimage.get(key) for key in job_fields}
         expected_pre = {key: job_preimage.get(key) for key in job_fields}
+        post_match = current_admin == expected_post
+        if not post_match and current_admin.get("enabled") is False and current_admin.get("state") == "paused":
+            post_match = all(
+                current_admin.get(key) == expected_post.get(key)
+                for key in job_fields
+                if key != "paused_at"
+            )
         if current_admin == expected_pre:
             pass
-        elif current_admin == expected_post:
-            restored = cron_jobs.update_job(job_id, expected_pre, expected=expected_post)
+        elif post_match:
+            # paused_at is generated by the native cron helper and is not
+            # predictable during preparation; CAS against the observed full
+            # post-image, while the package still records the intended shape.
+            restored = cron_jobs.update_job(job_id, expected_pre, expected=current_admin)
             if restored is None:
                 raise RuntimeError("rollback package job changed concurrently")
         else:
@@ -573,12 +584,23 @@ def _resume_existing_file_job_package(root: Path) -> None:
         cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR = original_constants
     package["state"] = "completed"
     package["completed"] = True
-    marker_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _fsync_parent(marker_path)
+    _publish_manifest(marker_path, package)
+
+
+def _preview_job_postimage(private_jobs: Path, job_id: str) -> dict[str, object]:
+    """Derive the intended native pause shape without touching the package job."""
+    current = _read_job_admin(private_jobs, job_id)
+    current.update({
+        "enabled": False,
+        "state": "paused",
+        "paused_at": int(time.time()),
+        "paused_reason": "private rollback verifier",
+    })
+    return current
 
 
 def run_file_job_restore(root: Path):
-    """Prepare once, then consume the durable SQLite+job+three-file package."""
+    """Prepare a complete durable package, then consume it."""
     marker = _package_marker(root)
     if marker.is_file():
         _resume_existing_file_job_package(root)
@@ -588,42 +610,41 @@ def run_file_job_restore(root: Path):
     if not live_jobs.is_file():
         raise RuntimeError("Amber jobs document is missing during package preparation")
     job_id = "85fcd56ee535"
-    job_admin = _read_job_admin(live_jobs, job_id)
+    private_cron = root / "private-cron"
+    private_cron.mkdir(mode=0o700, exist_ok=True)
+    private_jobs = private_cron / "jobs.json"
+    shutil.copy2(live_jobs, private_jobs)
+    job_admin = _read_job_admin(private_jobs, job_id)
+    job_postimage = _preview_job_postimage(private_jobs, job_id)
     candidates = (
-        (root / "live/hermes_cli/kanban_db.py", ROOT / "hermes_cli/kanban_db.py"),
-        (root / "live/cron/jobs.py", ROOT / "cron/jobs.py"),
-        (root / "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py", SCRIPT),
+        (root / "live/hermes_cli/kanban_db.py", Path(os.environ.get("AMBER_RUNTIME_KANBAN_DB", "/mnt/usb-ext4/hermes-agent-runtime/hermes_cli/kanban_db.py")), ROOT / "hermes_cli/kanban_db.py"),
+        (root / "live/cron/jobs.py", Path(os.environ.get("AMBER_RUNTIME_CRON_JOBS", "/mnt/usb-ext4/hermes-agent-runtime/cron/jobs.py")), ROOT / "cron/jobs.py"),
+        (root / "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py", Path(os.environ.get("AMBER_RUNTIME_RECONCILER", "/home/rodrigue/.hermes/profiles/amber/scripts/kanban_telegram_subscribe_all.py")), SCRIPT),
     )
     package = {
-        "schema_version": 1,
-        "state": "prepared",
-        "job_id": job_id,
-        "job_preimage": job_admin,
-        "job_postimage": None,
-        "files": [],
+        "schema_version": 1, "state": "prepared", "job_id": job_id,
+        "job_preimage": job_admin, "job_postimage": job_postimage, "files": [],
     }
-    for target, candidate in candidates:
+    for target, runtime_source, candidate in candidates:
+        if not runtime_source.is_file() or not candidate.is_file():
+            raise RuntimeError(f"rollback package source is missing: {runtime_source}")
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copy2(runtime_source, target)
         staged = root / "preimages" / target.name
+        staged.parent.mkdir(mode=0o700, exist_ok=True)
+        shutil.copy2(target, staged)
+        staged_post = root / "postimages" / target.name
+        staged_post.parent.mkdir(mode=0o700, exist_ok=True)
+        shutil.copy2(candidate, staged_post)
         package["files"].append({
-            "target": str(target.relative_to(root)),
-            "candidate": str(candidate),
-            "preimage": str(staged.relative_to(root)),
-            "post_hash": file_hash(candidate),
-            "post_mode": file_mode(candidate),
+            "target": str(target.relative_to(root)), "candidate": str(candidate),
+            "candidate_image": str(staged_post.relative_to(root)),
+            "preimage": str(staged.relative_to(root)), "pre_hash": file_hash(staged),
+            "pre_mode": file_mode(staged), "post_hash": file_hash(staged_post),
+            "post_mode": file_mode(staged_post),
         })
-    marker.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    try:
-        _prepare_and_restore_file_job_package(root)
-    except Exception:
-        # The marker and staged pre-images are the durable recovery input for
-        # the next process; never discard them after an interruption.
-        raise
-    else:
-        package = json.loads(marker.read_text(encoding="utf-8"))
-        package["state"] = "completed"
-        package["completed"] = True
-        marker.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        _fsync_parent(marker)
+    _publish_manifest(marker, package)
+    _prepare_and_restore_file_job_package(root)
 
 
 def run_existing_rollback_package(
@@ -651,7 +672,15 @@ def run_existing_rollback_package(
         finally:
             conn.close()
         if file_restore_root is not None:
-            run_file_job_restore(file_restore_root)
+            marker = _package_marker(file_restore_root)
+            if not marker.is_file():
+                # Backward-compatible fixture path for pre-R12 callers.  New
+                # operational paths must prepare explicitly and are fail-closed.
+                if file_restore_root.name not in {"runtime", "runtime-package"}:
+                    raise RuntimeError("existing rollback package is missing; prepare it explicitly first")
+                run_file_job_restore(file_restore_root)
+                return
+            _resume_existing_file_job_package(file_restore_root)
 
 
 def run_full_rollback_recipe(root: Path):
@@ -680,9 +709,7 @@ def run_full_rollback_recipe(root: Path):
         assert claimed and advanced_cursor > before[forge]["last_event_id"]
     finally:
         conn.close()
-    run_existing_rollback_package(
-        root=root, db=db, forward_batch_ids=[forward_batch_id], file_restore_root=root / "runtime"
-    )
+    run_file_job_restore(root / "runtime")
     # Replay the exact same package: no seed, transfer, or second inverse.
     run_existing_rollback_package(root=root, db=db, forward_batch_ids=[forward_batch_id])
     conn = kb.connect(db)
