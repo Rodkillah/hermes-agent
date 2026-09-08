@@ -254,3 +254,116 @@ def test_conflicting_nonempty_origins_fail_closed_without_delta(monkeypatch, db)
         assert [dict(row) for row in kb.list_notify_subs(conn)] == before
     finally:
         conn.close()
+
+
+def test_reconcile_captures_preimage_after_outer_transaction(monkeypatch, db):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        seed_task(kb, conn, owner="amber")
+        forge = seed_task(kb, conn, owner="forge", mode="notify")
+        original_plan = mod.plan
+
+        def plan_after_begin(*args, **kwargs):
+            planned = original_plan(*args, **kwargs)
+            kb.add_notify_sub(
+                conn, task_id=forge, platform="telegram", chat_id="chat",
+                thread_id="thread", delivery_mode="wake",
+            )
+            return planned
+
+        monkeypatch.setattr(mod, "plan", plan_after_begin)
+        journal = []
+        mod.reconcile(conn, journal=journal)
+        entry = next(item for item in journal if item["task_id"] == forge)
+        mod.rollback_journal(conn, journal)
+        restored = kb.list_notify_subs(conn, forge)[0]
+    finally:
+        conn.close()
+
+    assert entry["pre_image"]["delivery_mode"] == "wake"
+    assert restored["delivery_mode"] == "wake"
+
+
+def test_prepare_failure_rolls_back_without_unjournaled_commit(monkeypatch, db):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        seed_task(kb, conn, owner="amber")
+        forge = seed_task(kb, conn, owner="forge")
+        with pytest.raises(OSError, match="journal disk full"):
+            mod.reconcile(
+                conn,
+                prepare_journal=lambda entries: (_ for _ in ()).throw(OSError("journal disk full")),
+            )
+        row = kb.list_notify_subs(conn, forge)[0]
+    finally:
+        conn.close()
+    assert row["notifier_profile"] == "forge"
+
+
+def test_main_private_batches_are_non_overwriting_and_recover_markers(monkeypatch, db, tmp_path, capsys):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        seed_task(kb, conn, owner="amber")
+        seed_task(kb, conn, owner="forge")
+    finally:
+        conn.close()
+    monkeypatch.setattr(mod, "DB_PATH", db)
+    monkeypatch.setattr(mod, "LOCK_PATH", tmp_path / "amber.lock")
+    monkeypatch.setattr(mod, "JOURNAL_ROOT", tmp_path / "private-journals")
+    export = tmp_path / "legacy-export.json"
+
+    assert mod.main(["--journal", str(export)]) == 0
+    first = json.loads(export.read_text())
+    batches = list((tmp_path / "private-journals").iterdir())
+    assert len(first) == len(batches) == 1
+    prepared = batches[0] / "prepared.json"
+    assert (batches[0] / "committed.json").is_file()
+    assert prepared.stat().st_mode & 0o777 == 0o600
+    assert batches[0].stat().st_mode & 0o777 == 0o700
+
+    assert mod.main(["--journal", str(export)]) == 0
+    assert json.loads(export.read_text()) == first
+    assert len(list((tmp_path / "private-journals").iterdir())) == 1
+
+    (batches[0] / "committed.json").unlink()
+    conn = kb.connect(db)
+    try:
+        mod.BatchJournal.recover_pending(conn, tmp_path / "private-journals")
+    finally:
+        conn.close()
+    assert (batches[0] / "committed.json").is_file()
+    assert capsys.readouterr().err == ""
+
+
+def test_same_second_recreate_gets_new_generation_and_refuses_inverse(monkeypatch, db):
+    mod = load_script(monkeypatch)
+    kb = mod.kb
+    conn = kb.connect(db)
+    try:
+        seed_task(kb, conn, owner="amber")
+        created = seed_task(kb, conn)
+        journal = []
+        mod.reconcile(conn, journal=journal)
+        post = kb.list_notify_subs(conn, created)[0]
+        kb.remove_notify_sub(conn, task_id=created, platform="telegram", chat_id="chat", thread_id="thread")
+        kb.add_notify_sub(
+            conn, task_id=created, platform="telegram", chat_id="chat", thread_id="thread",
+            user_id=post["user_id"], user_id_alt=post["user_id_alt"], chat_type=post["chat_type"],
+            notifier_profile=post["notifier_profile"], delivery_mode=post["delivery_mode"],
+            delivery_metadata=post["delivery_metadata"],
+        )
+        recreated = kb.list_notify_subs(conn, created)[0]
+        with pytest.raises(RuntimeError, match="rollback conflict"):
+            mod.rollback_journal(conn, journal)
+        after = kb.list_notify_subs(conn, created)[0]
+    finally:
+        conn.close()
+    assert recreated["created_at"] == post["created_at"]
+    assert recreated["subscription_generation"] != post["subscription_generation"]
+    assert after == recreated

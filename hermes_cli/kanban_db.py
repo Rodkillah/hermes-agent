@@ -1524,9 +1524,14 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'notify',
     delivery_metadata TEXT,
+    subscription_generation TEXT DEFAULT NULL CHECK (
+        subscription_generation IS NULL OR
+        (length(subscription_generation) = 32 AND subscription_generation NOT GLOB '*[^0-9a-f]*')
+    ),
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (task_id, platform, chat_id, thread_id)
+    PRIMARY KEY (task_id, platform, chat_id, thread_id),
+    UNIQUE (subscription_generation)
 );
 
 -- Immutable production proof.  These tables are additive and deliberately
@@ -2901,6 +2906,79 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _ensure_notify_subscription_generation(conn)
+
+
+def _ensure_notify_subscription_generation(conn: sqlite3.Connection) -> None:
+    """Add and initialize the durable incarnation token for subscriptions.
+
+    A composite subscription key can be deleted and recreated in the same
+    second, and SQLite may reuse the highest rowid.  Neither timestamp nor
+    rowid is therefore a safe rollback identity.  The generation is assigned
+    only by SQLite on insertion, remains stable on ordinary subscription
+    updates, and changes on every remove/recreate incarnation.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
+    ).fetchone()
+    if exists is None:
+        return
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
+    if "subscription_generation" not in columns:
+        _add_column_if_missing(
+            conn,
+            "kanban_notify_subs",
+            "subscription_generation",
+            "subscription_generation TEXT DEFAULT NULL CHECK ("
+            "subscription_generation IS NULL OR (length(subscription_generation) = 32 "
+            "AND subscription_generation NOT GLOB '*[^0-9a-f]*'))",
+        )
+    has_null = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs WHERE subscription_generation IS NULL LIMIT 1"
+    ).fetchone() is not None
+    trigger_names = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name IN ('trg_notify_sub_generation_insert', "
+            "'trg_notify_sub_generation_immutable')"
+        )
+    }
+    if not has_null and len(trigger_names) == 2:
+        return
+    # One immediate transaction keeps legacy fill, uniqueness and trigger
+    # installation indivisible.  The random token is generated in SQLite, so
+    # no public API can forge an incarnation used by guarded rollback.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if has_null:
+            conn.execute(
+                "UPDATE kanban_notify_subs SET subscription_generation = lower(hex(randomblob(16))) "
+                "WHERE subscription_generation IS NULL"
+            )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_subscription_generation "
+            "ON kanban_notify_subs(subscription_generation)"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_notify_sub_generation_insert AFTER INSERT ON kanban_notify_subs "
+            "WHEN NEW.subscription_generation IS NULL BEGIN "
+            "UPDATE kanban_notify_subs SET subscription_generation = lower(hex(randomblob(16))) "
+            "WHERE task_id = NEW.task_id AND platform = NEW.platform "
+            "AND chat_id = NEW.chat_id AND thread_id = NEW.thread_id "
+            "AND subscription_generation IS NULL; END"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_notify_sub_generation_immutable "
+            "BEFORE UPDATE OF subscription_generation ON kanban_notify_subs "
+            "WHEN OLD.subscription_generation IS NOT NULL "
+            "AND NEW.subscription_generation IS NOT OLD.subscription_generation "
+            "BEGIN SELECT RAISE(ABORT, 'subscription_generation is immutable'); END"
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2954,9 +3032,13 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT,"
         " chat_type TEXT,"
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
-        " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
+        " delivery_metadata TEXT, subscription_generation TEXT DEFAULT NULL CHECK ("
+        "subscription_generation IS NULL OR (length(subscription_generation) = 32 "
+        "AND subscription_generation NOT GLOB '*[^0-9a-f]*')),"
+        " created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
+        " PRIMARY KEY (task_id, platform, chat_id, thread_id),"
+        " UNIQUE (subscription_generation))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
 }
@@ -12506,10 +12588,12 @@ def restore_notify_sub_state(
     remains intact; an already absent created row is an idempotent success.
     """
     key_fields = ("task_id", "platform", "chat_id", "thread_id")
+    identity_field = "subscription_generation"
     stable_fields = (
         "user_id", "user_id_alt", "chat_type", "delivery_metadata", "created_at",
+        "subscription_generation",
     )
-    required = (*key_fields, "notifier_profile", "delivery_mode")
+    required = (*key_fields, identity_field, "notifier_profile", "delivery_mode")
     if any(field not in post_image for field in required):
         raise ValueError("post_image is missing subscription identity")
     if pre_image is not None and any(field not in pre_image for field in required):
@@ -12521,15 +12605,21 @@ def restore_notify_sub_state(
     key = tuple(post_image[field] if field != "thread_id" else post_image[field] or "" for field in key_fields)
     with write_txn(conn, allow_nested=True):
         row = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
-            "AND chat_id = ? AND thread_id = ?",
+            "SELECT * FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             key,
         ).fetchone()
         if row is None:
             return pre_image is None
         current = dict(row)
         current["delivery_metadata"] = _metadata(current.get("delivery_metadata"))
+        if int(current.get("last_event_id") or 0) < int(post_image.get("last_event_id") or 0):
+            # Cursor regression signals a replacement or an unsafe manual
+            # rewrite.  A forward notifier claim may advance it, never rewind.
+            return False
         def _stable_matches(image: Mapping[str, Any]) -> bool:
+            if current.get(identity_field) != image.get(identity_field):
+                return False
             for field in stable_fields:
                 expected = image.get(field)
                 actual = current.get(field)
@@ -12559,20 +12649,23 @@ def restore_notify_sub_state(
                 "DELETE FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
                 "AND chat_id = ? AND thread_id = ? AND notifier_profile IS ? "
                 "AND delivery_mode IS ? AND user_id IS ? AND user_id_alt IS ? "
-                "AND chat_type IS ? AND delivery_metadata = ? AND created_at IS ?",
+                "AND chat_type IS ? AND delivery_metadata = ? AND created_at IS ? "
+                "AND subscription_generation IS ?",
                 (*key, post_image["notifier_profile"], post_image["delivery_mode"],
                  post_image.get("user_id"), post_image.get("user_id_alt"),
                  post_image.get("chat_type"),
                  _encode_notify_delivery_metadata(_metadata(post_image.get("delivery_metadata"))),
-                 post_image.get("created_at")),
+                 post_image.get("created_at"), post_image[identity_field]),
             )
             return cur.rowcount == 1
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET notifier_profile = ?, delivery_mode = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND notifier_profile IS ? AND delivery_mode IS ?",
+            "AND notifier_profile IS ? AND delivery_mode IS ? "
+            "AND subscription_generation IS ?",
             (pre_image.get("notifier_profile"), pre_image.get("delivery_mode"),
-             *key, post_image["notifier_profile"], post_image["delivery_mode"]),
+             *key, post_image["notifier_profile"], post_image["delivery_mode"],
+             post_image[identity_field]),
         )
         return cur.rowcount == 1
 
@@ -12613,6 +12706,7 @@ def list_notify_subs(
     *,
     notifier_profiles: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
+    include_identity: bool = False,
 ) -> list[dict]:
     """List subscriptions, optionally restricted to notifier profile owners.
 
@@ -12632,7 +12726,7 @@ def list_notify_subs(
     if owner_where:
         where.append(owner_where)
         params.extend(owner_params)
-    sql = "SELECT * FROM kanban_notify_subs"
+    sql = "SELECT " + ("rowid AS _subscription_rowid, " if include_identity else "") + "* FROM kanban_notify_subs"
     if where:
         sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
     rows = conn.execute(sql, params).fetchall()

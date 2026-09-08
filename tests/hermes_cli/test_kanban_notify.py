@@ -978,6 +978,8 @@ def _assert_full_inherited_sub(subs):
     assert md and md.get("reply_fallback") == "general", (
         "delivery_metadata dropped during inheritance (issue #73030)"
     )
+    generation = s.get("subscription_generation")
+    assert isinstance(generation, str) and len(generation) == 32
 
 
 def test_link_tasks_inherits_all_routing_columns(kanban_home):
@@ -992,9 +994,11 @@ def test_link_tasks_inherits_all_routing_columns(kanban_home):
         child = kb.create_task(conn, title="existing child", assignee="w1")
         kb.link_tasks(conn, parent, child)
         subs = kb.list_notify_subs(conn, child)
+        parent_sub = kb.list_notify_subs(conn, parent)[0]
     finally:
         conn.close()
     _assert_full_inherited_sub(subs)
+    assert subs[0]["subscription_generation"] != parent_sub["subscription_generation"]
 
 
 def test_create_with_parents_inherits_delivery_metadata(kanban_home):

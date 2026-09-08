@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -153,52 +154,92 @@ def file_mode(path: Path) -> int:
 
 
 def run_file_job_restore(root: Path):
-    """Apply and reverse only the targeted overlay/job on disposable copies."""
-    live_script = root / "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py"
-    live_job = root / "live/jobs/85fcd56ee535.json"
-    unrelated = root / "live/runtime/tools-send-message-existing.py"
-    candidate_job = root / "candidate-job.json"
-    for path in (live_script, live_job, unrelated, candidate_job):
-        path.parent.mkdir(parents=True, exist_ok=True)
-    live_script.write_bytes(b"preactivation-script\n")
-    live_script.chmod(0o640)
-    live_job.write_text(json.dumps({"id": "85fcd56ee535", "enabled": False, "state": "paused"}) + "\n")
-    live_job.chmod(0o600)
-    unrelated.write_bytes(b"preexisting-dirty-runtime\n")
-    unrelated.chmod(0o644)
-    candidate_job.write_text(json.dumps({"id": "85fcd56ee535", "enabled": True, "state": "running"}) + "\n")
+    """Exercise exact candidate files and the existing job via native APIs.
 
-    pre = {
-        "script_hash": file_hash(live_script),
-        "script_mode": file_mode(live_script),
-        "job_hash": file_hash(live_job),
-        "job_mode": file_mode(live_job),
-        "unrelated_hash": file_hash(unrelated),
-        "unrelated_mode": file_mode(unrelated),
-    }
-    script_backup = root / "backup-script"
-    job_backup = root / "backup-job"
-    shutil.copy2(live_script, script_backup)
-    shutil.copy2(live_job, job_backup)
+    This is deliberately copy-only: it reads the active Amber jobs document
+    once, makes a private copy, and mutates only that copy through cron.jobs.
+    It never points cron at the live file and never emits the document.
+    """
+    from cron import jobs as cron_jobs
 
-    # Candidate installation and existing-job activation are simulated only on
-    # copies; the precondition is the exact observed disabled job identity.
-    assert json.loads(live_job.read_text())["id"] == "85fcd56ee535"
-    assert json.loads(live_job.read_text())["enabled"] is False
-    shutil.copy2(SCRIPT, live_script)
-    shutil.copy2(candidate_job, live_job)
-    assert json.loads(live_job.read_text())["enabled"] is True
+    base = "b20d9f3c7c8a0a709e862f63240eb3d6fe302e53"
+    target_db = root / "live/hermes_cli/kanban_db.py"
+    target_script = root / "live/profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py"
+    for target in (target_db, target_script):
+        target.parent.mkdir(parents=True, exist_ok=True)
 
-    # Targeted inverse restores bytes and modes, leaving unrelated runtime data.
-    shutil.copy2(script_backup, live_script)
-    shutil.copy2(job_backup, live_job)
-    assert file_hash(live_script) == pre["script_hash"]
-    assert file_mode(live_script) == pre["script_mode"]
-    assert file_hash(live_job) == pre["job_hash"]
-    assert file_mode(live_job) == pre["job_mode"]
-    assert file_hash(unrelated) == pre["unrelated_hash"]
-    assert file_mode(unrelated) == pre["unrelated_mode"]
-    assert json.loads(live_job.read_text())["state"] == "paused"
+    # The current candidate bytes are the real files to install.  The base
+    # runtime contains kanban_db.py but did not contain this new overlay
+    # script, so restoration must preserve that exact absence.
+    base_db = subprocess.check_output(
+        ["git", "show", f"{base}:hermes_cli/kanban_db.py"], cwd=ROOT
+    )
+    target_db.write_bytes(base_db)
+    target_db.chmod(0o640)
+    pre_db = {"hash": file_hash(target_db), "mode": file_mode(target_db)}
+    assert not target_script.exists()
+
+    shutil.copy2(ROOT / "hermes_cli/kanban_db.py", target_db)
+    shutil.copy2(SCRIPT, target_script)
+    assert file_hash(target_db) == file_hash(ROOT / "hermes_cli/kanban_db.py")
+    assert file_hash(target_script) == file_hash(SCRIPT)
+    target_db.write_bytes(base_db)
+    target_db.chmod(pre_db["mode"])
+    target_script.unlink()
+    assert file_hash(target_db) == pre_db["hash"]
+    assert file_mode(target_db) == pre_db["mode"]
+    assert not target_script.exists()
+
+    # Read the real existing job document, then route cron.jobs through an
+    # isolated copy.  Only the named job's administrative fields may change;
+    # other records, claims and history are byte-for-byte copied and compared
+    # structurally after the native pause/restore cycle.
+    live_jobs = Path(
+        os.environ.get(
+            "AMBER_PROFILE_JOBS_FILE",
+            "/home/rodrigue/.hermes/profiles/amber/cron/jobs.json",
+        )
+    )
+    raw_document = json.loads(live_jobs.read_text(encoding="utf-8"))
+    raw_jobs = raw_document.get("jobs", raw_document) if isinstance(raw_document, dict) else raw_document
+    if not isinstance(raw_jobs, list):
+        raise AssertionError("Amber jobs document has no job list")
+    original = next(job for job in raw_jobs if job.get("id") == "85fcd56ee535")
+    private_cron = root / "private-cron"
+    private_cron.mkdir(mode=0o700)
+    private_jobs = private_cron / "jobs.json"
+    shutil.copy2(live_jobs, private_jobs)
+    original_constants = cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR
+    cron_jobs.CRON_DIR = private_cron
+    cron_jobs.JOBS_FILE = private_jobs
+    cron_jobs.OUTPUT_DIR = private_cron / "output"
+    try:
+        observed = cron_jobs.get_job("85fcd56ee535")
+        assert observed and observed["id"] == original["id"]
+        admin = {key: original.get(key) for key in (
+            "enabled", "state", "paused_at", "paused_reason", "next_run_at"
+        )}
+        activated = cron_jobs.update_job(
+            observed["id"],
+            {"enabled": True, "state": "scheduled", "paused_at": None, "paused_reason": None},
+        )
+        assert activated and activated["enabled"] is True
+        paused = cron_jobs.pause_job(observed["id"], reason="private rollback verifier")
+        assert paused and paused["enabled"] is False and paused["state"] == "paused"
+        restored = cron_jobs.update_job(observed["id"], admin)
+        assert restored and all(restored.get(key) == value for key, value in admin.items())
+    finally:
+        cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR = original_constants
+    restored_document = json.loads(private_jobs.read_text(encoding="utf-8"))
+    restored_jobs = (
+        restored_document.get("jobs", restored_document)
+        if isinstance(restored_document, dict) else restored_document
+    )
+    restored_job = next(job for job in restored_jobs if job.get("id") == original["id"])
+    assert all(restored_job.get(key) == value for key, value in admin.items())
+    assert [job for job in restored_jobs if job.get("id") != original["id"]] == [
+        job for job in raw_jobs if job.get("id") != original["id"]
+    ]
 
 
 with tempfile.TemporaryDirectory(prefix="amber-subscription-rollback-") as temp:
