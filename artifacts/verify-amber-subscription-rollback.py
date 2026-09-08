@@ -20,6 +20,11 @@ SCRIPT = ROOT / "profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py"
 os.environ["HERMES_AGENT_RUNTIME"] = str(ROOT)
 sys.path.insert(0, str(ROOT))
 
+# Keep the verifier's fixture installation on the native API even when a
+# contract probe wraps cron.jobs.update_job to observe the consume order.
+from cron import jobs as _cron_jobs
+NATIVE_UPDATE_JOB = _cron_jobs.update_job
+
 spec = importlib.util.spec_from_file_location("amber_subscription", SCRIPT)
 assert spec and spec.loader
 module = importlib.util.module_from_spec(spec)
@@ -433,22 +438,23 @@ def _prepare_and_restore_file_job_package(root: Path):
         target = root / item["target"]
         staged_pre = root / item["preimage"]
         staged_post = root / item["candidate_image"]
-        candidate = Path(item["candidate"])
         if file_state(staged_pre) != (item["pre_hash"], int(item["pre_mode"])):
             raise RuntimeError(f"rollback package pre-image changed: {target.name}")
         if file_state(staged_post) != (item["post_hash"], int(item["post_mode"])):
             raise RuntimeError(f"rollback package post-image changed: {target.name}")
-        preimages.append((target, candidate, staged_pre, item["pre_hash"], int(item["pre_mode"])))
+        # The candidate path is provenance only.  Consumption must use the
+        # durable, validated post-image copied into this package.
+        preimages.append((target, staged_post, staged_pre, item["pre_hash"], int(item["pre_mode"])))
 
     # The package already contains every pre/post image.  No source runtime or
     # live jobs document is read during consumption.
-    for target, candidate, _staged_pre, _pre_hash, _pre_mode in preimages:
-        shutil.copy2(candidate, target)
-        assert file_hash(target) == file_hash(candidate)
-        assert file_mode(target) == file_mode(candidate)
+    for target, staged_post, _staged_pre, _pre_hash, _pre_mode in preimages:
+        shutil.copy2(staged_post, target)
+        assert file_hash(target) == file_hash(staged_post)
+        assert file_mode(target) == file_mode(staged_post)
 
-    # Keep all candidate copies installed until the guarded native job restore
-    # has completed. The production rollback must not depend on an already
+    # Keep all durable post-images installed until the guarded native job
+    # restore has completed. The production rollback must not depend on an
     # imported in-memory copy of cron.jobs after its on-disk candidate has been
     # replaced by old code.
 
@@ -508,11 +514,11 @@ def _prepare_and_restore_file_job_package(root: Path):
     # Only after the guarded job state has returned through the candidate code
     # may the three exact runtime files be conditionally restored to their
     # private pre-images. This is a pathname-CAS, never hash-check then copy.
-    for target, candidate, staged_pre, pre_hash, pre_mode in preimages:
+    for target, staged_post, staged_pre, pre_hash, pre_mode in preimages:
         restore_file_from_private_preimage(
             target,
             staged_pre,
-            expected_postimage=(file_hash(candidate), file_mode(candidate)),
+            expected_postimage=(file_hash(staged_post), file_mode(staged_post)),
         )
         assert file_hash(target) == pre_hash
         assert file_mode(target) == pre_mode
@@ -529,6 +535,110 @@ def _read_job_admin(path: Path, job_id: str) -> dict[str, object]:
     if not isinstance(job, dict):
         raise RuntimeError(f"rollback package job is missing: {job_id}")
     return {key: job.get(key) for key in ("enabled", "state", "paused_at", "paused_reason", "next_run_at")}
+
+
+def _validate_existing_file_job_package(root: Path) -> dict[str, object]:
+    """Validate the complete durable package before any inverse effect.
+
+    Consumption is intentionally distinct from preparation.  Every manifest
+    image, the private job document, and every current target must be known
+    before the SQLite inverse is allowed to run.  A target carrying a durable
+    restore marker is checked but recovered later, after the inverse/job order
+    boundary; this keeps crash recovery fail-closed without inventing a new
+    effect ordering.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise RuntimeError("existing rollback package directory is missing")
+    marker_path = _package_marker(root)
+    package = _load_manifest(marker_path)
+    if package.get("schema_version") != 1 or package.get("state") not in {"prepared", "completed"}:
+        raise RuntimeError("rollback package manifest is not consumable")
+    files = package.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("rollback package manifest has no file images")
+    if not isinstance(package.get("job_id"), str):
+        raise RuntimeError("rollback package has no job identity")
+    job_preimage = package.get("job_preimage")
+    job_postimage = package.get("job_postimage")
+    if not isinstance(job_preimage, dict) or not isinstance(job_postimage, dict):
+        raise RuntimeError("rollback package has no durable job pre/post-images")
+
+    private_jobs = root / "private-cron" / "jobs.json"
+    if not private_jobs.is_file():
+        raise RuntimeError("rollback package job document is missing")
+    try:
+        document = json.loads(private_jobs.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("rollback package job document is unreadable") from exc
+    raw_jobs = document.get("jobs", document) if isinstance(document, dict) else document
+    if not isinstance(raw_jobs, list):
+        raise RuntimeError("rollback package job document is malformed")
+    job = next((item for item in raw_jobs if isinstance(item, dict) and item.get("id") == package["job_id"]), None)
+    if not isinstance(job, dict):
+        raise RuntimeError("rollback package job is missing")
+    job_fields = tuple(job_preimage)
+    current_admin = {key: job.get(key) for key in job_fields}
+    expected_pre = {key: job_preimage.get(key) for key in job_fields}
+    expected_post = {key: job_postimage.get(key) for key in job_fields}
+    if current_admin not in (expected_pre, expected_post):
+        raise RuntimeError("rollback package job conflict")
+
+    for item in files:
+        if not isinstance(item, dict):
+            raise RuntimeError("rollback package file entry is malformed")
+        try:
+            target_rel = Path(item["target"])
+            pre_rel = Path(item["preimage"])
+            post_rel = Path(item["candidate_image"])
+            expected_pre_file = (item["pre_hash"], int(item["pre_mode"]))
+            expected_post_file = (item["post_hash"], int(item["post_mode"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("rollback package file entry is incomplete") from exc
+        if any(path.is_absolute() or ".." in path.parts for path in (target_rel, pre_rel, post_rel)):
+            raise RuntimeError("rollback package file entry escapes its root")
+        target = root / target_rel
+        preimage = root / pre_rel
+        postimage = root / post_rel
+        try:
+            pre_state = file_state(preimage)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"rollback package pre-image is missing: {preimage.name}") from exc
+        try:
+            post_state = file_state(postimage)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"rollback package post-image is missing: {postimage.name}") from exc
+        if pre_state != expected_pre_file:
+            raise RuntimeError(f"rollback package pre-image changed: {preimage.name}")
+        if post_state != expected_post_file:
+            raise RuntimeError(f"rollback package post-image changed: {postimage.name}")
+        restore_marker = restore_marker_path(target)
+        if restore_marker.is_file():
+            try:
+                state = json.loads(restore_marker.read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    raise ValueError("restore marker is not an object")
+                parked_name = state["parked"]
+                parked = target.with_name(parked_name)
+                marker_post = tuple(state["postimage"])
+                marker_pre = tuple(state["preimage"])
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise RuntimeError("rollback file restore marker is malformed") from exc
+            if (
+                not isinstance(parked_name, str)
+                or parked.name != parked_name
+                or marker_post != expected_post_file
+                or marker_pre != expected_pre_file
+                or file_state(parked) != expected_post_file
+            ):
+                raise RuntimeError(f"rollback file restore marker is invalid: {target.name}")
+        else:
+            if not target.is_file():
+                raise RuntimeError(f"rollback package target is missing: {target.name}")
+            current = file_state(target)
+            if current not in (expected_pre_file, expected_post_file):
+                raise RuntimeError(f"rollback package file conflict: {target.name}")
+    return package
 
 
 def _resume_existing_file_job_package(root: Path) -> None:
@@ -711,13 +821,17 @@ def run_existing_rollback_package(
     if not root.is_dir() or not db.is_file() or not forward_batch_ids:
         raise RuntimeError("existing rollback package inputs are incomplete")
     if file_restore_root is not None:
-        marker = _package_marker(file_restore_root)
-        if not marker.is_file() and file_restore_root.exists():
-            raise RuntimeError("existing rollback package is missing; prepare it explicitly first")
+        # This is a strict consume entry point: a package must already exist
+        # and be fully valid before the SQLite inverse is even considered.
+        _validate_existing_file_job_package(file_restore_root)
     private_lock = root / "historical-reconciliation.lock"
     with private_lock.open("a+") as lock_file:
         import fcntl
         fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if file_restore_root is not None:
+            # Revalidate under the package lock to close the preflight-to-effect
+            # race without rebuilding or reseeding anything.
+            _validate_existing_file_job_package(file_restore_root)
         conn = kb.connect(db)
         try:
             for forward_batch_id in forward_batch_ids:
@@ -728,17 +842,6 @@ def run_existing_rollback_package(
         finally:
             conn.close()
         if file_restore_root is not None:
-            marker = _package_marker(file_restore_root)
-            if not marker.is_file():
-                # A pre-existing directory is an explicit consume request.  It
-                # must already contain the durable package; never prepare from
-                # live state as a side effect of inverse consumption.  The
-                # legacy path that has not created the directory yet remains a
-                # preparation entry for the historical disposable verifier.
-                if file_restore_root.exists():
-                    raise RuntimeError("existing rollback package is missing; prepare it explicitly first")
-                run_file_job_restore(file_restore_root)
-                return
             _resume_existing_file_job_package(file_restore_root)
 
 
@@ -786,6 +889,22 @@ def run_full_rollback_recipe(root: Path):
         shutil.copy2(staged_post, target)
         _fsync_file(target)
         _fsync_parent(target)
+    # Install the exact durable job post-image through the native guarded API;
+    # the nominal consume path must exercise this CAS, not a preimage no-op.
+    from cron import jobs as cron_jobs
+    private_cron = runtime_package / "private-cron"
+    private_jobs = private_cron / "jobs.json"
+    original_constants = cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR
+    cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR = (
+        private_cron, private_jobs, private_cron / "output"
+    )
+    try:
+        installed = NATIVE_UPDATE_JOB(
+            package["job_id"], package["job_postimage"], expected=package["job_preimage"]
+        )
+        assert installed is not None
+    finally:
+        cron_jobs.CRON_DIR, cron_jobs.JOBS_FILE, cron_jobs.OUTPUT_DIR = original_constants
     run_existing_rollback_package(
         root=root,
         db=db,
