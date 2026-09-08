@@ -1,14 +1,14 @@
 # Candidat Amber subscription reconciliation — manifeste SQLite et reprise bornée
 
-Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtime ou Brain n'a été muté par ce candidat. Des écritures Brain antérieures sur la carte restent un écart de gouvernance séparé, non validé ni réparé ici. Le job `85fcd56ee535` reste disabled/paused jusqu'à revue indépendante et gate Amber.
+Statut: candidat intégré source-only, préparation de livraison. Aucun board live, gateway, job, abonnement, runtime ou Brain n'a été muté par ce candidat. Des écritures Brain antérieures sur la carte restent un écart de gouvernance séparé, non validé ni réparé ici. Le job `85fcd56ee535` reste disabled/paused jusqu'à revue Architect intégrée, gate Amber et canari.
 
 ## Identité contrôlée
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
-- Branche: `ironrod/forge-amber-subscription-transfer-20260907`.
-- Implementation exacte de ce rework: `d436b88f90c15ba5545dad7c01c091204f233314` (parent `7b85a46e09483a28fe0c9b2aef60855c8c0171f1`). Le candidat final est le HEAD de cette branche au gel de revue ; aucun autre SHA ne vaut candidat.
-- Fichiers de ce rework: `cron/jobs.py`, `artifacts/verify-amber-subscription-rollback.py`, `tests/cron/test_update_job_expected_cas.py`, `artifacts/amber-subscription-rollback-manifest.md`.
-- Le worktree candidat doit être relu propre et le SHA final exact doit être gelé avant revue; aucun autre SHA ne vaut candidat.
+- Intégration locale: candidats source `af69b045ed7212a0beeb0be68db35e915f38de19` (Amber subscription transfer) et `77e0dd9fde88bd1ac2940835a7c2815803ba5e36` (cron owner heartbeat/cancellation), réconciliés sans écraser leurs worktrees.
+- SHA intégré exact: sera consigné sur la carte après le commit documentaire d'intégration; il contient les deux historiques source et les treize fichiers listés ci-dessous.
+- Fichiers de l'intégration: `cron/jobs.py`, `cron/scheduler.py`, `hermes_cli/kanban_db.py`, `profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py`, `artifacts/verify-amber-subscription-rollback.py`, `artifacts/amber-subscription-rollback-manifest.md`, et leurs tests ciblés `tests/cron/`, `tests/hermes_cli/`, `tests/profile_overlay/`.
+- Les worktrees source restent les références relues et propres; aucun autre SHA ne vaut candidat intégré.
 
 ## Autorité et atomicité
 
