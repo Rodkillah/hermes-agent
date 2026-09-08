@@ -5,7 +5,7 @@ Statut: candidat source-only. Aucun board live, gateway, job, abonnement, runtim
 ## Identité contrôlée
 
 - Base runtime: `b20d9f3c7c8a0a709e862f63240eb3d6fe302e53`.
-- Candidat: SHA exact consigné après le commit source final sur la branche `ironrod/forge-amber-subscription-transfer-20260907`.
+- Candidat: `0368e1dc2387c3e42c0ae533ac912f6f63c5d6bb`; parent de rework: `d6cdd5facb90db451f6fe4a2c30723f40da3c62b`.
 - Fichiers concernés: `hermes_cli/kanban_db.py`, `cron/jobs.py`, `profile-overlay/amber/scripts/kanban_telegram_subscribe_all.py`, `artifacts/verify-amber-subscription-rollback.py`, et les tests associés.
 
 ## Autorité et atomicité
