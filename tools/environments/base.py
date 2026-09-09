@@ -544,7 +544,8 @@ def _cwd_marker(session_id: str) -> str:
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)"
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT|"
+    "HERMES_KANBAN_)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -589,6 +590,9 @@ def _export_dump_excluding_session_vars(
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "${!HERMES_BROWSER_CONTROL_*} "
+        # Execution lineage and dispatcher identity are injected per spawn,
+        # never shell state: a child shares this snapshot with its parent.
+        "HERMES_DELEGATED_CHILD_CONTEXT ${!HERMES_KANBAN_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers
         # (re-exported by every _wrap_command with outer-harness-preserving
         # ${VAR:-default} semantics).  Persisting them into the snapshot
@@ -890,6 +894,15 @@ class BaseEnvironment(ABC):
 
         parts = []
         passthrough_names = self._snapshot_excluded_passthrough_names()
+        if self.is_local:
+            from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+
+            # LocalEnvironment injects the authoritative lineage/worker env on
+            # every spawn. Even a pre-fix snapshot must not override it (nor
+            # restore parent worker identity into a scrubbed child process).
+            passthrough_names = tuple(dict.fromkeys((
+                *passthrough_names, DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS,
+            )))
 
         # A shared snapshot may contain the previous profile's value. Save
         # the current process environment before sourcing it, then restore the
