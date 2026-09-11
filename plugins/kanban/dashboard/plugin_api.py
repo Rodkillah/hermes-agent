@@ -1289,9 +1289,40 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
-    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
+    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
+
+    Iron Rod 2026-09-12: the nudge used to pass ``max_spawn`` alone. In
+    ``_dispatch_once_locked`` a ``None`` cap means UNCAPPED, so one click on
+    "Nudge dispatcher" bypassed ``kanban.max_in_progress`` and
+    ``kanban.max_in_progress_per_profile`` entirely. On 2026-09-11 at 23:41:35
+    a single nudge spawned 6 workers at once (max=8 minus 2 already running),
+    put 3 'architect' cards in parallel against a per-profile cap of 1 and
+    saturated the host (load 22, 3 GB of swap). The nudge now resolves the same
+    caps as ``hermes_cli.kanban_ops._cmd_dispatch`` and the gateway watcher.
+    ``default_assignee`` is deliberately NOT forwarded: unassigned cards must
+    stay inert on a nudge, as they do on a tick (Iron Rod doctrine).
+    """
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        max_in_progress = kbd.resolve_max_in_progress(
+            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
+        )
+        max_in_progress_per_profile = kbd._positive_int(
+            _kanban_cfg.get("max_in_progress_per_profile"), None
+        )
+    except Exception:
+        max_in_progress = max_in_progress_per_profile = None
     with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        result = kbd.dispatch_once(
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            max_in_progress=max_in_progress,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            board=board,
+        )
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:
