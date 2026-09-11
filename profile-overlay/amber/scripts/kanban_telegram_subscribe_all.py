@@ -27,6 +27,24 @@ if _RUNTIME_ROOT.is_dir() and str(_RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_ROOT))
 from hermes_cli import kanban_db as kb  # noqa: E402
 
+# Le runtime injecte ci-dessus decide d'ou viennent connect et les *_notify_sub.
+# Post-decomposition (runtime servi, >= 2026-09-11) ils vivent dans des modules
+# freres ; le shim de kanban_db qui les reexportait est supprime le 2026-09-14.
+# Pre-decomposition (l'arbre de cette branche, que ses tests injectent) ils sont
+# encore dans kanban_db lui-meme.
+# Un try/except ImportError ne suffirait PAS : avec le venv editable du runtime,
+# `from hermes_cli import kanban_db_connect` reussit en resolvant vers le runtime
+# SERVI alors que kanban_db vient de l'arbre local. Les deux modules ouvrent alors
+# des transactions concurrentes sur la meme connexion (RuntimeError write_txn).
+# On n'accepte donc les modules freres que s'ils viennent du MEME arbre.
+kbc = kbn = kb
+if Path(kb.__file__).with_name("kanban_db_connect.py").exists():
+    from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
+    from hermes_cli import kanban_db_notify as _kbn  # noqa: E402
+
+    if Path(_kbc.__file__).parent == Path(kb.__file__).parent:
+        kbc, kbn = _kbc, _kbn
+
 
 BOARD = "iron-rod"
 SOURCE_PROFILE = "forge"
@@ -697,7 +715,7 @@ def _fetch_target_raw(conn: sqlite3.Connection, key: Mapping[str, Any]) -> list[
     # for recovery. Its notifier projection is intentionally not used as the
     # image below because it normalizes NULL metadata, but this call preserves
     # its existing read instrumentation and transaction contract.
-    kb.list_notify_subs(conn, str(key.get("task_id")))
+    kbn.list_notify_subs(conn, str(key.get("task_id")))
     rows = conn.execute(
         "SELECT * FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
         "AND chat_id = ? AND thread_id = ?",
@@ -733,7 +751,7 @@ def _ensure_amber_notify_wake(
         metadata = anchor.get("delivery_metadata")
         if not isinstance(metadata, dict):
             metadata = kb._decode_notify_delivery_metadata(metadata)
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn,
             **key,
             user_id=anchor.get("user_id"),
@@ -754,7 +772,7 @@ def _ensure_amber_notify_wake(
             raise RuntimeError(f"Unexpected subscription owner for {task_id}")
         # Explicit mode update is native and leaves the cursor, origin,
         # identifiers, metadata and created_at untouched on an existing row.
-        kb.add_notify_sub(conn, **key, delivery_mode="notify+wake")
+        kbn.add_notify_sub(conn, **key, delivery_mode="notify+wake")
 
     verified = _fetch_target(conn, task_id, anchor)
     if len(verified) != 1:
@@ -807,7 +825,7 @@ def reconcile(
 ) -> dict[str, int]:
     if dry_run:
         tasks = kb.list_tasks(conn, include_archived=False, limit=None)
-        subscriptions = kb.list_notify_subs(conn)
+        subscriptions = kbn.list_notify_subs(conn)
         active, _anchor, targets, actions = plan(tasks, subscriptions, limit)
         already = sum(
             1
@@ -844,7 +862,7 @@ def reconcile(
                 raise RuntimeError("notify batch result is malformed")
             return {key: int(value) for key, value in stored.items()}
         tasks = kb.list_tasks(conn, include_archived=False, limit=None)
-        subscriptions = kb.list_notify_subs(conn)
+        subscriptions = kbn.list_notify_subs(conn)
         active, anchor, targets, actions = plan(tasks, subscriptions, limit)
         already = sum(
             1
@@ -875,7 +893,7 @@ def reconcile(
                 "post_image": dict(after_rows[0]),
             })
             result["changed"] += 1
-        after = kb.list_notify_subs(conn)
+        after = kbn.list_notify_subs(conn)
         remaining = 0
         for task_id in active:
             rows = _rows_for_task(
@@ -948,7 +966,7 @@ def main(argv: list[str] | None = None) -> int:
                 # durable SQLite commit. Its failure is surfaced as a warning,
                 # never recast as an uncommitted subscription batch.
                 batch_id = args.batch_id or uuid.uuid4().hex
-                with kb.connect(DB_PATH, board=BOARD) as conn:
+                with kbc.connect(DB_PATH, board=BOARD) as conn:
                     result = reconcile(
                         conn,
                         dry_run=False,
@@ -972,7 +990,7 @@ def main(argv: list[str] | None = None) -> int:
         # DB remains explicitly unknown and fail-closed.
         if not args.dry_run and batch_id:
             try:
-                with kb.connect(DB_PATH, board=BOARD) as probe:
+                with kbc.connect(DB_PATH, board=BOARD) as probe:
                     durable = kb.get_notify_batch(probe, batch_id)
                 if durable is not None:
                     stored = json.loads(durable["result_json"])
