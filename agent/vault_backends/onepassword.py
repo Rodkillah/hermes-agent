@@ -38,6 +38,11 @@ class OnePasswordLoginBackend(LoginBackend):
         from agent.secret_scope import get_secret
         env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
         self._service_token = get_secret(env_name, "") or ""
+        # In-memory item_id -> vault identity, built ONLY from the non-sensitive
+        # ``item.vault`` metadata returned by ``list_items``. The public handle
+        # stays ``op:<item_id>`` (no vault identity in it), so this index is what
+        # lets ``resolve_password`` / ``resolve_otp`` add ``--vault`` at fill time.
+        self._vault_index: Dict[str, str] = {}
 
     # ── auth ────────────────────────────────────────────────────────────────
 
@@ -104,6 +109,10 @@ class OnePasswordLoginBackend(LoginBackend):
         raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
         out: List[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
+            item_id = str(item.get("id") or "")
+            vault = self._vault_identity(item.get("vault"))
+            if item_id and vault:
+                self._vault_index[item_id] = vault
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origin = _first_origin(urls)
             if not origin:
@@ -118,14 +127,63 @@ class OnePasswordLoginBackend(LoginBackend):
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         return next((m for m in self.list_items() if m.id == handle), None)
 
+    @staticmethod
+    def _vault_identity(vault: object) -> Optional[str]:
+        """Extract a stable vault identity from ``item.vault`` metadata.
+
+        Accepts the realistic shapes ``{"id": ..., "name": ...}`` (preferring the
+        stable ``id``) or a bare string. Returns None when no identity is present.
+        Never hardcodes a vault name or id.
+        """
+        if isinstance(vault, dict):
+            vid = str(vault.get("id") or "").strip()
+            if vid:
+                return vid
+            name = str(vault.get("name") or "").strip()
+            return name or None
+        if isinstance(vault, str):
+            return vault.strip() or None
+        return None
+
+    def _resolve_vault(self, item_id: str) -> str:
+        """Return the vault identity for ``item_id``, recovering it via a bounded
+        ``item list`` metadata refresh when the in-memory index has no entry (an
+        old handle resolved before any ``list_items``). Fails closed with a
+        non-secret error when the identity stays absent or ambiguous — never an
+        unbounded ``item get`` without ``--vault`` under a service account.
+        """
+        vault = self._vault_index.get(item_id)
+        if vault:
+            return vault
+        # Preserve the original UnlockRequired contract: a locked backend must
+        # surface as locked, not as "no vault metadata" (list_items returns []
+        # while locked, which would otherwise mask the real cause).
+        if not self.is_unlocked():
+            raise UnlockRequired(self)
+        # Bounded, non-revealing metadata recovery: item list only, never item get.
+        self.list_items()
+        vault = self._vault_index.get(item_id)
+        if not vault:
+            raise RuntimeError(
+                f"1Password item {item_id!r} has no vault metadata; cannot resolve "
+                "it under a service account (a vault query is required). Re-run "
+                "browser_vault_list to refresh the item's vault, or grant the item "
+                "a vault."
+            )
+        return vault
+
     def resolve_password(self, handle: str) -> str:
         item_id = handle[len(self.prefix):]
-        return self._run("item", "get", item_id, "--fields", "label=password", "--reveal").rstrip("\r\n")
+        vault = self._resolve_vault(item_id)
+        return self._run("item", "get", item_id, "--vault", vault,
+                          "--fields", "label=password", "--reveal").rstrip("\r\n")
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
+        item_id = handle[len(self.prefix):]
+        vault = self._resolve_vault(item_id)
         try:
-            code = self._run("item", "get", handle[len(self.prefix):], "--otp").strip()
+            code = self._run("item", "get", item_id, "--vault", vault, "--otp").strip()
         except Exception:
             return None
         return code if code.isdigit() else None
