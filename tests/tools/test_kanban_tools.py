@@ -1235,9 +1235,10 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
 def test_resolve_block_loop_handler_archives_for_orchestrator(worker_env, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="loop", assignee="worker")
         with kb.write_txn(conn):
@@ -1268,9 +1269,10 @@ def test_resolve_block_loop_handler_archives_for_orchestrator(worker_env, monkey
 def test_kanban_show_event_id_drives_block_loop_resolution(worker_env, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="loop", assignee="worker")
         with kb.write_txn(conn):

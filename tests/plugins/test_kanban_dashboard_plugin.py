@@ -1233,7 +1233,7 @@ def test_specify_happy_path(client, monkeypatch):
 
 
 def test_resolve_block_loop_endpoint_retries_with_audit(client):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="loop", assignee="worker")
         with kb.write_txn(conn):
@@ -1271,7 +1271,7 @@ def test_resolve_block_loop_endpoint_retries_with_audit(client):
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "ready"
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_resolved"][-1]
         assert event.payload["actor"] == "dashboard-user"
@@ -1281,7 +1281,7 @@ def test_resolve_block_loop_endpoint_retries_with_audit(client):
 
 
 def test_resolve_block_loop_endpoint_rejects_missing_cas(client):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="loop", assignee="worker")
         with kb.write_txn(conn):
@@ -1303,7 +1303,7 @@ def test_resolve_block_loop_endpoint_rejects_missing_cas(client):
     )
     assert response.status_code == 422, response.text
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "triage"
     finally:
@@ -1311,7 +1311,7 @@ def test_resolve_block_loop_endpoint_rejects_missing_cas(client):
 
 
 def test_resolve_block_loop_endpoint_rejects_stale_first_loop(client):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="two loops", assignee="worker")
         with kb.write_txn(conn):
@@ -1350,7 +1350,7 @@ def test_resolve_block_loop_endpoint_rejects_stale_first_loop(client):
     )
     assert response.status_code == 409, response.text
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "triage"
         resolved = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_resolved"]
@@ -1364,7 +1364,7 @@ def test_dashboard_diagnostics_include_prod_without_receipt(client):
     """The dashboard feeds production state into the shared rule engine."""
     from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(
             conn, title="orphaned production state", assignee="worker",
@@ -1381,7 +1381,7 @@ def test_dashboard_diagnostics_include_prod_without_receipt(client):
 def test_dashboard_diagnostics_do_not_use_event_fallback_for_missing_current_row(client):
     from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="missing current receipt", assignee="worker")
         with kb.write_txn(conn):
@@ -1402,7 +1402,7 @@ def test_dashboard_diagnostics_do_not_use_event_fallback_for_missing_current_row
 def test_dashboard_diagnostics_keep_event_fallback_for_legacy_board(client):
     from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="legacy production event", assignee="worker")
         with kb.write_txn(conn):
@@ -1431,7 +1431,7 @@ def test_dashboard_diagnostics_keep_event_fallback_for_legacy_board(client):
 def test_dashboard_diagnostics_detect_sqlite_integer_required_probe(client):
     from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="failed stored probe", assignee="worker")
         with kb.write_txn(conn):

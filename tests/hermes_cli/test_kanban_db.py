@@ -44,7 +44,7 @@ def _init_git_repo(repo: Path) -> None:
 
 
 def test_kanban_writes_repair_utf8_mojibake_without_touching_legitimate_text(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="IRON ROD TRAINING â\x80\x94 contrat des Ã©quipements",
@@ -72,7 +72,7 @@ def test_kanban_writes_repair_utf8_mojibake_without_touching_legitimate_text(kan
 
 
 def test_block_and_completion_repair_mojibake_in_run_summaries(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         blocked_id = kb.create_task(conn, title="blocked", assignee="ops")
         assert kb.block_task(
             conn,

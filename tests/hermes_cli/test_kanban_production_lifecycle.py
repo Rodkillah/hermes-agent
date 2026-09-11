@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -97,7 +98,7 @@ def test_done_to_prod_stores_receipt_without_second_completion(
 ) -> None:
     verifier = _verifier(tmp_path)
     _configure(kanban_home, verifier)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = _done(conn)
         before = kb.get_task(conn, task_id)
         stored = kb.mark_task_prod(
@@ -122,7 +123,7 @@ def test_prod_retry_is_idempotent_but_changed_proof_conflicts(
     kanban_home: Path, tmp_path: Path
 ) -> None:
     _configure(kanban_home, _verifier(tmp_path))
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = _done(conn)
         first = kb.mark_task_prod(
             conn, task_id, receipt=_receipt(), actor="amber", idempotency_key="idem-2"
@@ -140,7 +141,7 @@ def test_prod_retry_is_idempotent_but_changed_proof_conflicts(
 
 
 def test_missing_verifier_leaves_done_card_untouched(kanban_home: Path) -> None:
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = _done(conn)
         with pytest.raises(kb.ProductionLifecycleError):
             kb.mark_task_prod(
@@ -154,7 +155,7 @@ def test_non_done_and_unauthorized_promotions_are_refused(
     kanban_home: Path, tmp_path: Path
 ) -> None:
     _configure(kanban_home, _verifier(tmp_path))
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = _done(conn)
         with pytest.raises(kb.ProductionLifecycleError, match="allowed"):
             kb.mark_task_prod(
@@ -169,7 +170,7 @@ def test_non_done_and_unauthorized_promotions_are_refused(
 
 
 def test_done_page_is_keyset_paginated_and_prod_is_a_valid_status(kanban_home: Path) -> None:
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         ids = [_done(conn) for _ in range(3)]
         page = kb.list_tasks_page(conn, status="done", limit=2)
         assert len(page["tasks"]) == 2
@@ -186,7 +187,7 @@ def test_production_verifier_fails_closed_when_ambient_db_override_is_incoherent
     verifier = _verifier(tmp_path)
     _configure(kanban_home, verifier)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "unrelated.db"))
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = _done(conn)
         with pytest.raises(kb.ProductionLifecycleError, match="board"):
             kb.mark_task_prod(
@@ -200,7 +201,7 @@ def test_done_to_prod_does_not_recompute_or_mutate_child_tasks(
     kanban_home: Path, tmp_path: Path
 ) -> None:
     _configure(kanban_home, _verifier(tmp_path))
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = _done(conn)
         child_id = _done(conn)
         kb.link_tasks(conn, parent_id, child_id)
@@ -228,7 +229,7 @@ def test_gc_events_retains_production_promotion_event_for_prod_task(
     kanban_home: Path, tmp_path: Path
 ) -> None:
     _configure(kanban_home, _verifier(tmp_path))
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = _done(conn)
         kb.mark_task_prod(
             conn, task_id, receipt=_receipt(), actor="amber", idempotency_key="idem-gc"

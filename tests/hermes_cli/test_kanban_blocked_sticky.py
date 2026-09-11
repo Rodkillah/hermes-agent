@@ -85,7 +85,7 @@ def test_initially_blocked_parentless_task_is_sticky(kanban_home: Path) -> None:
     to record an explicit ``blocked`` event, not only ``status='blocked'`` in
     the task row / ``created`` payload.
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(
             conn,
             title="operator gate",

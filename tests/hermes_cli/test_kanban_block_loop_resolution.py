@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -38,7 +39,7 @@ def _escalated_task(conn, title="task"):
 
 
 def test_generic_triage_cannot_use_block_loop_resolution(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="raw idea", assignee="worker", triage=True)
         assert not kb.resolve_block_loop_task(
             conn, tid, decision="retry", actor="amber", reason="not this path",
@@ -48,7 +49,7 @@ def test_generic_triage_cannot_use_block_loop_resolution(kanban_home: Path) -> N
 
 
 def test_retry_preserves_loop_memory_and_parent_gates(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         tid = _escalated_task(conn)
         kb.link_tasks(conn, parent, tid)
@@ -67,7 +68,7 @@ def test_retry_preserves_loop_memory_and_parent_gates(kanban_home: Path) -> None
 
 
 def test_resolution_refuses_stale_provenance_cas(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _escalated_task(conn)
         event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1]
         assert not kb.resolve_block_loop_task(
@@ -82,7 +83,7 @@ def test_resolution_refuses_stale_provenance_cas(kanban_home: Path) -> None:
 
 
 def test_resolution_requires_a_cas_token(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _escalated_task(conn)
         with pytest.raises(ValueError, match="expected_event_id"):
             kb.resolve_block_loop_task(
@@ -92,7 +93,7 @@ def test_resolution_requires_a_cas_token(kanban_home: Path) -> None:
 
 
 def test_stale_first_loop_decision_cannot_resolve_second_loop(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _escalated_task(conn)
         first_event = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1]
 
@@ -116,7 +117,7 @@ def test_stale_first_loop_decision_cannot_resolve_second_loop(kanban_home: Path)
 
 
 def test_complete_resets_memory_and_releases_dependants(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _escalated_task(conn)
         child = kb.create_task(conn, title="dependent", assignee="worker")
         kb.link_tasks(conn, tid, child)
@@ -135,7 +136,7 @@ def test_complete_resets_memory_and_releases_dependants(kanban_home: Path) -> No
 
 
 def test_complete_preserves_parent_gating(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="open parent", assignee="worker")
         tid = _escalated_task(conn)
         kb.link_tasks(conn, parent, tid)
@@ -153,7 +154,7 @@ def test_complete_preserves_parent_gating(kanban_home: Path) -> None:
 
 
 def test_archive_does_not_release_dependants(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _escalated_task(conn)
         child = kb.create_task(conn, title="dependent", assignee="worker")
         kb.link_tasks(conn, tid, child)
@@ -170,7 +171,7 @@ def test_archive_does_not_release_dependants(kanban_home: Path) -> None:
 
 
 def test_resolution_requires_handoff_for_complete(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _escalated_task(conn)
         with pytest.raises(ValueError, match="handoff"):
             kb.resolve_block_loop_task(
@@ -181,7 +182,7 @@ def test_resolution_requires_handoff_for_complete(kanban_home: Path) -> None:
 
 
 def test_resolution_refuses_an_orphaned_active_run(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _escalated_task(conn)
         with kb.write_txn(conn):
             conn.execute(
@@ -196,7 +197,7 @@ def test_resolution_refuses_an_orphaned_active_run(kanban_home: Path) -> None:
 
 
 def test_retry_restores_review_phase_when_loop_started_in_review(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="review loop", assignee="worker")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))

@@ -73,7 +73,7 @@ def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
     db_path = tmp_path / "block-loop-resolution.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="loop", assignee="worker")
         with kb.write_txn(conn):
@@ -89,7 +89,7 @@ def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
         ][-1].id
         # Subscribe after the detection event so this test isolates the
         # resolution notification rather than replaying both events.
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         assert kb.resolve_block_loop_task(
             conn, tid, decision="archive", actor="amber", reason="superseded",
             expected_event_id=expected_event_id,
@@ -794,7 +794,7 @@ def test_notifier_delivers_production_promoted_post_commit_without_replay(
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(
             conn, title="production candidate", assignee="worker",
@@ -802,7 +802,7 @@ def test_notifier_delivers_production_promoted_post_commit_without_replay(
         kb.complete_task(conn, task_id, summary="source complete")
         # Subscribe after the work-completion event so this test isolates the
         # distinct production transition.
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=task_id, platform="telegram", chat_id="chat-1",
         )
         # This write is committed before the watcher tick, matching the

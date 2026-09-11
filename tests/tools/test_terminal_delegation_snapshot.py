@@ -58,6 +58,7 @@ def test_stale_snapshot_cannot_override_spawn_identity(monkeypatch, tmp_path, in
 def test_native_delegation_timeout_parent_cli_and_child_guard(monkeypatch, tmp_path):
     """Real delegate timeout + bash + CLI/DB, with no model or live board."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import delegate_tool
     from tests.tools.test_delegate_timeout_cleanup import _SlowUnwindingChild
 
@@ -65,7 +66,7 @@ def test_native_delegation_timeout_parent_cli_and_child_guard(monkeypatch, tmp_p
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = kb.init_db()
     assert db.resolve().is_relative_to(tmp_path.resolve())
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="fixture", assignee="fixture")
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     env = LocalEnvironment(cwd=str(repo), timeout=10)
@@ -117,7 +118,7 @@ def test_native_delegation_timeout_parent_cli_and_child_guard(monkeypatch, tmp_p
             result = cli(action)
             assert result["returncode"] == 0, result
             json.loads(result["output"])
-        with kb.connect() as conn:
+        with kbc.connect() as conn:
             with delegated_child_context():
                 with pytest.raises(PermissionError, match="delegate_task child"):
                     kb.create_task(conn, title="forbidden", assignee="fixture")

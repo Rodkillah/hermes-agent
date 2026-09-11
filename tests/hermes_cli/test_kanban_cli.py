@@ -73,7 +73,7 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
 
 
 def test_cli_show_and_diagnostics_read_normalized_production_probes(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="failed production probe", assignee="worker")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'prod' WHERE id = ?", (task_id,))
@@ -111,7 +111,7 @@ def test_cli_show_and_diagnostics_read_normalized_production_probes(kanban_home)
 
 
 def test_kanban_show_json_event_id_drives_block_loop_resolution(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="loop", assignee="worker")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
@@ -134,7 +134,7 @@ def test_kanban_show_json_event_id_drives_block_loop_resolution(kanban_home):
 
 
 def test_kanban_show_text_includes_event_id(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="loop", assignee="worker")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
