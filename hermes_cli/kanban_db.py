@@ -3694,7 +3694,7 @@ def schedule_task(
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Everything a worker should read about its task: header, body,
-    attachments, prior attempts, done-parent handoffs, the assignee's recent
+    attachments, prior attempts, completed-parent handoffs, the assignee's recent
     work, comments. Lists are tail-capped and fields char-capped
     (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
     task = get_task(conn, task_id)
@@ -3820,16 +3820,21 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
 
 
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
+    """Completed-parent handoffs: newest ``completed`` run's summary+metadata,
     falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
+    relative age so the worker re-verifies stale upstream results.
+
+    Iron Rod: the predicate is ``WORK_COMPLETED_STATUSES`` (``done`` and
+    ``prod``), never a local copy. Gating already releases a child whose
+    parent was promoted to ``prod``; if this filter disagreed, that child
+    would start with no handoff at all, and nothing would report it."""
     parent_rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
     ).fetchall()
     wrote_header = False
     for pid in (r["parent_id"] for r in parent_rows):
         pt = get_task(conn, pid)
-        if not pt or pt.status != "done":
+        if not pt or pt.status not in WORK_COMPLETED_STATUSES:
             continue
         runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
         runs.sort(key=lambda r: r.started_at, reverse=True)
