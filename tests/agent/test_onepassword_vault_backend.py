@@ -193,3 +193,48 @@ def test_locked_backend_raises_unlock_required_not_no_vault(backend_factory, mon
         backend.resolve_password("op:itemA")
     with pytest.raises(UnlockRequired):
         backend.resolve_otp("op:itemA")
+
+
+def test_conflicting_vault_metadata_fails_closed_without_item_get(backend_factory):
+    # The same item_id appears under two distinct vaults: no last-wins, fail closed.
+    items = [
+        dict(_ITEMS[0], vault={"id": "vault-a", "name": "A"}),
+        dict(_ITEMS[0], vault={"id": "vault-b", "name": "B"}),
+    ]
+    backend, calls = backend_factory(items=items)
+    backend.list_items()
+    with pytest.raises(RuntimeError, match="vault"):
+        backend.resolve_password("op:itemA")
+    with pytest.raises(RuntimeError, match="vault"):
+        backend.resolve_otp("op:itemA")
+    assert not _get_calls(calls)
+
+
+def test_metadata_refresh_drops_stale_vault_before_resolution(backend_factory):
+    # A later authoritative refresh no longer carries a vault identity: the old
+    # resolution must be dropped, not silently reused.
+    items = [dict(_ITEMS[0], vault={"id": "vault-a", "name": "A"})]
+    backend, calls = backend_factory(items=items)
+    backend.list_items()
+    items[0]["vault"] = {}
+    backend.list_items()
+    with pytest.raises(RuntimeError, match="vault"):
+        backend.resolve_password("op:itemA")
+    with pytest.raises(RuntimeError, match="vault"):
+        backend.resolve_otp("op:itemA")
+    assert not _get_calls(calls)
+
+
+def test_ambiguous_vault_after_refresh_fails_closed_without_item_get(backend_factory):
+    # A refresh that turns a single identity into two distinct ones must block
+    # resolution entirely (no last-wins), for both password and OTP.
+    items = [dict(_ITEMS[0], vault={"id": "vault-a", "name": "A"})]
+    backend, calls = backend_factory(items=items)
+    backend.list_items()
+    items.append(dict(_ITEMS[0], vault={"id": "vault-b", "name": "B"}))
+    backend.list_items()
+    with pytest.raises(RuntimeError, match="vault"):
+        backend.resolve_password("op:itemA")
+    with pytest.raises(RuntimeError, match="vault"):
+        backend.resolve_otp("op:itemA")
+    assert not _get_calls(calls)
