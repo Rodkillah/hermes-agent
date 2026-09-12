@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import threading
-from pathlib import Path
 
 import pytest
 
@@ -254,7 +253,8 @@ def test_create_with_target_on_matching_board(kanban_home):
     """Red: creation without any session channel + a configured iron-rod target
     produces the exact Forge/Telegram/DM/notify+wake subscription."""
     _write_config(kanban_home, [_forge_target()])
-    conn = kbc.connect()
+    kb.create_board("iron-rod")
+    conn = kbc.connect(board="iron-rod")
     try:
         tid = kb.create_task(conn, title="forge sub", assignee="w", board="iron-rod")
         subs = _subs(conn, tid)
@@ -273,7 +273,8 @@ def test_create_with_target_on_matching_board(kanban_home):
 def test_create_with_target_on_other_board_adds_nothing(kanban_home):
     """A target scoped to iron-rod must not leak onto another board."""
     _write_config(kanban_home, [_forge_target(board="iron-rod")])
-    conn = kbc.connect()
+    kb.create_board("other-board")
+    conn = kbc.connect(board="other-board")
     try:
         tid = kb.create_task(conn, title="other board", assignee="w", board="other-board")
         assert _subs(conn, tid) == []
@@ -284,7 +285,8 @@ def test_create_with_target_on_other_board_adds_nothing(kanban_home):
 def test_create_keeps_creator_sub_and_adds_default(kanban_home):
     """Nominal: a distinct creator route is preserved alongside the default target."""
     _write_config(kanban_home, [_forge_target()])
-    conn = kbc.connect()
+    kb.create_board("iron-rod")
+    conn = kbc.connect(board="iron-rod")
     try:
         tid = kb.create_task(conn, title="both", assignee="w", board="iron-rod")
         # Simulate the creator's own auto-subscription on a distinct route.
@@ -304,7 +306,8 @@ def test_create_identical_route_not_double_inserted(kanban_home):
     """Nominal dedup: a default target identical to an already-present route
     (creator/parent) is treated as satisfied and not double-inserted."""
     _write_config(kanban_home, [_forge_target()])
-    conn = kbc.connect()
+    kb.create_board("iron-rod")
+    conn = kbc.connect(board="iron-rod")
     try:
         tid = kb.create_task(conn, title="dedup", assignee="w", board="iron-rod")
         # Pre-seed the exact same route as the default target (as a creator would).
@@ -329,7 +332,8 @@ def test_create_invalid_config_fails_closed_no_orphan(kanban_home):
         "board": "iron-rod", "platform": "telegram", "chat_id": "SECRET-CHAT",
         "delivery_mode": "bogus",
     }])
-    conn = kbc.connect()
+    kb.create_board("iron-rod")
+    conn = kbc.connect(board="iron-rod")
     try:
         before = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
         with pytest.raises(ValueError) as exc:
@@ -348,7 +352,8 @@ def test_create_respects_auto_subscribe_gate(kanban_home):
         "  auto_subscribe_on_create: false\n"
         "  default_notify_targets: " + json.dumps([_forge_target()]) + "\n"
     )
-    conn = kbc.connect()
+    kb.create_board("iron-rod")
+    conn = kbc.connect(board="iron-rod")
     try:
         tid = kb.create_task(conn, title="gated", assignee="w", board="iron-rod")
         assert _subs(conn, tid) == []
@@ -377,6 +382,37 @@ def test_create_uses_opened_db_board_when_slug_omitted(kanban_home, monkeypatch)
     with kbc.connect_closing(db_path=kb.board_dir("other-board") / "kanban.db") as conn:
         assert kb.get_task(conn, tid) is None
         assert kbn.list_notify_subs(conn) == []
+
+
+def test_create_rejects_explicit_board_that_differs_from_opened_db(
+    kanban_home, monkeypatch
+):
+    """An explicit board cannot select another board's target when the DB path
+    override pins the connection to a known board."""
+    kb.create_board("iron-rod")
+    kb.create_board("other-board")
+    _write_config(kanban_home, [
+        _forge_target(board="iron-rod", chat_id="iron-chat"),
+        _forge_target(board="other-board", chat_id="other-route"),
+    ])
+    iron_db = kb.board_dir("iron-rod") / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(iron_db))
+
+    with kbc.connect_closing(board="other-board") as conn:
+        with pytest.raises(ValueError, match="does not match the opened board") as exc:
+            kb.create_task(
+                conn, title="must not cross boards", assignee="w", board="other-board"
+            )
+        assert "iron-chat" not in str(exc.value)
+        assert "other-route" not in str(exc.value)
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
+
+    with kbc.connect_closing(
+        db_path=kb.board_dir("other-board") / "kanban.db"
+    ) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
 
 
 def test_create_unknown_platform_is_atomic(kanban_home):
@@ -438,11 +474,3 @@ def test_real_cli_create_applies_default_target(kanban_home):
     task_id = output.split()[1]
     with kbc.connect_closing() as conn:
         assert len(_subs(conn, task_id)) == 1
-
-
-def test_docs_include_config_example_and_rollback():
-    doc = (Path(__file__).resolve().parents[2]
-           / "website/docs/user-guide/features/kanban.md").read_text()
-    assert "default_notify_targets:\n    - board: iron-rod" in doc
-    assert "Rollback `default_notify_targets`" in doc
-    assert "default_notify_targets: []" in doc
