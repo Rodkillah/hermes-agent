@@ -1729,6 +1729,15 @@ DEFAULT_CONFIG = {
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "auto_subscribe_on_create": True,
+        # Explicit per-board default notification targets, applied to every new task created on a
+        # matching board (tool + CLI + dashboard) in addition to the creator's auto-subscription.
+        # Empty by default: other installs/profiles gain no implicit destination. Each entry is a
+        # mapping with keys board (required), platform (required), chat_id (required),
+        # delivery_mode (required: notify|wake|notify+wake), notifier_profile (required for
+        # wake/notify+wake), and optional thread_id / chat_type / user_id / user_id_alt /
+        # delivery_metadata. A non-empty invalid list fails task creation (fail-closed) rather than
+        # silently creating an un-notified card. Gated by auto_subscribe_on_create.
+        "default_notify_targets": [],
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,

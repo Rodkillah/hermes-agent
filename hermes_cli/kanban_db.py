@@ -1293,6 +1293,39 @@ def _repair_utf8_mojibake(value: Optional[str]) -> Optional[str]:
     return value
 
 
+def _load_default_notify_targets() -> list[dict]:
+    """Resolve + validate ``kanban.default_notify_targets``.
+
+    Returns the normalized target list (board filtering happens at insert time so
+    one normalized list serves every board). Absent/empty config -> ``[]``
+    (historical behaviour: no implicit destination). Gated by
+    ``kanban.auto_subscribe_on_create``, matching the creator auto-subscription.
+    An unreadable config -> ``[]``; a readable but non-empty invalid value raises
+    :class:`ValueError` (fail-closed, no silent un-notified card).
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        cfg = load_config()
+        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+            return []
+        raw = cfg_get(cfg, "kanban", "default_notify_targets", default=None)
+    except Exception:
+        return []
+    from hermes_cli import kanban_db_notify as _kbn
+    return _kbn.normalize_default_notify_targets(raw)
+
+
+def _resolve_board_slug(board: Optional[str]) -> str:
+    """Resolve the board slug with the same priority as the connection path
+    (``_board_path``): explicit ``board`` -> ``get_current_board()`` (context/env
+    -> current symlink -> default). Used to match ``default_notify_targets``
+    entries against the board a task is actually created on."""
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    return slug
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1375,6 +1408,12 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+
+    # Resolve + validate configured default notify targets once, before the write
+    # txn, so a non-empty invalid config fails creation before any row is written
+    # (fail-closed: no silent un-notified card). Board filtering happens at insert.
+    board_slug = _resolve_board_slug(board)
+    default_targets = _load_default_notify_targets()
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
@@ -1464,6 +1503,14 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                # Configured default notify targets (kanban.default_notify_targets),
+                # applied in the same transaction after creator/parent inheritance so
+                # an identical route already owned by the creator/parent wins and the
+                # default target is treated as satisfied (no destructive overwrite).
+                if default_targets:
+                    from hermes_cli import kanban_db_notify as _kbn
+                    _kbn.apply_default_notify_targets(
+                        conn, task_id=task_id, board=board_slug, targets=default_targets)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
