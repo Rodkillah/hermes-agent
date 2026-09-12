@@ -15,6 +15,7 @@ from hermes_cli.kanban_goal_gate import (
     new_attempt_id,
     record_unavailable_audit,
     review_readiness_decision,
+    run_completion_gate,
 )
 
 
@@ -181,3 +182,46 @@ def test_unavailable_audit_is_atomic_under_concurrency(audit_board):
     with kbc.connect() as conn:
         events = [e for e in kb.list_events(conn, tid) if e.kind == "goal_gate_unavailable"]
     assert len(events) == 1
+
+
+def test_completion_gate_replay_uses_stable_attempt_identity(audit_board, monkeypatch):
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
+    )
+
+    def unavailable_judge(**_kwargs):
+        return "continue", "raw provider failure", False, None, True
+
+    def run_once(evidence):
+        with kbc.connect() as conn:
+            task = kb.get_task(conn, tid)
+            return run_completion_gate(
+                conn, task, evidence, run_id=run_id, judge=unavailable_judge,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        decisions = list(pool.map(lambda _index: run_once("same proof"), range(2)))
+    assert all(item.outcome == "allow_with_diagnostic" for item in decisions)
+
+    with kbc.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "goal_gate_unavailable"]
+    assert len(events) == 1
+    assert events[0].payload is not None
+    assert events[0].payload["attempt_id"] == new_attempt_id(tid, run_id, "same proof")
+    assert "same proof" not in events[0].payload["attempt_id"]
+
+    run_once("corrected proof")
+    with kbc.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "goal_gate_unavailable"]
+    assert len(events) == 2
+    assert len({event.payload["attempt_id"] for event in events}) == 2
+
+
+def test_attempt_identity_ignores_surface_injected_session_metadata():
+    base = {"tests_run": 3}
+    stamped = {**base, "worker_session_id": "session-from-tool-surface"}
+    assert new_attempt_id("t_same", 7, "proof", base) == new_attempt_id(
+        "t_same", 7, "proof", stamped,
+    )

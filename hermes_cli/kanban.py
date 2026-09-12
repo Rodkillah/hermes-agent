@@ -820,7 +820,9 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_completion_gate_error(conn, tid: str, evidence: str) -> Optional[str]:
+def _goal_completion_gate_error(
+    conn, tid: str, evidence: str, metadata: Optional[dict] = None,
+) -> Optional[str]:
     """Adapt the shared completion policy to the CLI error envelope."""
     from hermes_cli.goals import judge_goal
     from hermes_cli.kanban_goal_gate import GoalGateAuditUnavailable, run_completion_gate
@@ -828,7 +830,7 @@ def _goal_completion_gate_error(conn, tid: str, evidence: str) -> Optional[str]:
     try:
         decision = run_completion_gate(
             conn, kb.get_task(conn, tid), evidence,
-            run_id=_worker_run_id_for(tid), judge=judge_goal,
+            run_id=_worker_run_id_for(tid), judge=judge_goal, attempt_metadata=metadata,
         )
     except GoalGateAuditUnavailable as exc:
         return f"kanban: {exc}"
@@ -868,7 +870,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         def op(tid):
             gate_err = _goal_completion_gate_error(
-                conn, tid, (summary or args.result or "").strip())
+                conn, tid, (summary or args.result or "").strip(), metadata)
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False

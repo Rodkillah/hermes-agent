@@ -84,7 +84,8 @@ verification and publication alone are not remote acceptance.
 
 ## Goal-mode completion and review readiness
 
-Goal-mode cards have two separate gates:
+Goal-mode cards have two separate gates. Worker tools, the CLI, and dashboard
+status transitions all use the same policies:
 
 - `kanban_complete` asks the configured goal judge whether the card is finally
   complete. A valid `continue`, `wait`, or `blocked` verdict refuses completion;
@@ -93,13 +94,19 @@ Goal-mode cards have two separate gates:
   deterministic `metadata.review_readiness` V1 dossier. Entering review never
   requires a review verdict that cannot exist yet.
 
+A dashboard override may supersede a live worker claim, but it does not bypass
+either quality gate.
+
 Judge transport failures (including authentication errors and timeouts), unusable
 or unknown responses, and a judge that cannot be resolved fail open for
 completion. Before the completion transition, Hermes commits one redacted,
 idempotent `goal_gate_unavailable` event classified as `unavailable`, `transport`,
 or `parse`. The event contains only the action, effective provider/model (or
 `unresolved`), policy version, run id, and attempt id—not prompts, responses,
-provider exception text, credentials, or handoff metadata. If this audit cannot
+provider exception text, credentials, or handoff metadata. The attempt id is a
+non-reversible digest derived from the task, worker run, and structured handoff:
+replayed or concurrent submissions of the same logical proof produce one audit
+event, while corrected proof produces a distinct attempt. If this audit cannot
 be written, completion is refused as `goal_gate_audit_unavailable`; Hermes does
 not call the judge again.
 
