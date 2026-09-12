@@ -384,11 +384,29 @@ def test_create_uses_opened_db_board_when_slug_omitted(kanban_home, monkeypatch)
         assert kbn.list_notify_subs(conn) == []
 
 
-def test_create_rejects_explicit_board_that_differs_from_opened_db(
+def test_explicit_board_mismatch_without_targets_preserves_creation(
     kanban_home, monkeypatch
 ):
-    """An explicit board cannot select another board's target when the DB path
-    override pins the connection to a known board."""
+    """An empty default-target config preserves task creation even when an env
+    DB override is authoritative over a divergent explicit board."""
+    kb.create_board("iron-rod")
+    kb.create_board("other-board")
+    iron_db = kb.board_dir("iron-rod") / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(iron_db))
+
+    with kbc.connect_closing(board="other-board") as conn:
+        task_id = kb.create_task(
+            conn, title="preserve upstream creation", assignee="w", board="other-board"
+        )
+        assert kb.get_task(conn, task_id) is not None
+        assert _subs(conn, task_id) == []
+
+
+def test_create_uses_opened_db_board_when_explicit_differs(
+    kanban_home, monkeypatch
+):
+    """A divergent explicit board cannot select another board's target when an
+    env override pins the connection to a known board."""
     kb.create_board("iron-rod")
     kb.create_board("other-board")
     _write_config(kanban_home, [
@@ -399,14 +417,13 @@ def test_create_rejects_explicit_board_that_differs_from_opened_db(
     monkeypatch.setenv("HERMES_KANBAN_DB", str(iron_db))
 
     with kbc.connect_closing(board="other-board") as conn:
-        with pytest.raises(ValueError, match="does not match the opened board") as exc:
-            kb.create_task(
-                conn, title="must not cross boards", assignee="w", board="other-board"
-            )
-        assert "iron-chat" not in str(exc.value)
-        assert "other-route" not in str(exc.value)
-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
+        task_id = kb.create_task(
+            conn, title="must not cross boards", assignee="w", board="other-board"
+        )
+        assert kb.get_task(conn, task_id) is not None
+        assert [(sub["platform"], sub["chat_id"]) for sub in _subs(conn, task_id)] == [
+            ("telegram", "iron-chat")
+        ]
 
     with kbc.connect_closing(
         db_path=kb.board_dir("other-board") / "kanban.db"
