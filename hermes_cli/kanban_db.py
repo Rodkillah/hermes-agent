@@ -1344,17 +1344,13 @@ def _canonical_board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
 def _resolve_board_slug(conn: sqlite3.Connection, board: Optional[str]) -> str:
     """Resolve the board identity for a write from the opened database.
 
-    A known canonical DB is authoritative.  Reject a divergent explicit slug
-    rather than selecting another board's notification targets for that DB.
-    Custom DB paths fall back to the explicit slug, then ambient state.
+    A known canonical DB is authoritative, so a divergent explicit slug cannot
+    select another board's notification targets for that DB. Custom DB paths
+    fall back to the explicit slug, then ambient state.
     """
     opened = _canonical_board_for_connection(conn)
     explicit = _normalize_board_slug(board)
-    if opened:
-        if explicit and explicit != opened:
-            raise ValueError("explicit board does not match the opened board")
-        return opened
-    return explicit or get_current_board()
+    return opened or explicit or get_current_board()
 
 
 def create_task(
