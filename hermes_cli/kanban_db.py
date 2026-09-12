@@ -4021,7 +4021,12 @@ def task_age(task: Task) -> dict:
 # --- Retention + garbage collection ---
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion."""
+    """Prune old terminal-task events, retaining decomposition identity until task deletion.
+
+    Goal-gate reservation, result, and unavailable-audit events intentionally use
+    this existing retention path: they are created before terminal transition and
+    are therefore removed no later than the configured terminal-task window.
+    """
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(

@@ -91,9 +91,10 @@ def test_tool_unresolved_judge_fails_open_without_calling_judge(goal_worker, mon
     with kbc.connect() as conn:
         events = [e for e in kb.list_events(conn, goal_worker) if e.kind == "goal_gate_unavailable"]
     assert len(events) == 1
-    assert events[0].payload["classification"] == "unavailable"
-    assert events[0].payload["provider"] == "unresolved"
-    assert events[0].payload["model"] == "unresolved"
+    payload = events[0].payload
+    assert payload is not None
+    assert payload["classification"] == "unavailable"
+    assert set(payload) == {"attempt_id", "classification", "policy_version"}
 
 
 def test_audit_survives_a_later_completion_guard_failure(goal_worker, monkeypatch):
