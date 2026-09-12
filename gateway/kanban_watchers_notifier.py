@@ -468,10 +468,33 @@ class _KanbanNotification:
             self.wake_review_detail = review_detail
         return msg
 
+    def _stale_block_loop_detection_ids(self) -> set[int]:
+        """Ids of ``block_loop_detected`` events superseded by a later
+        ``block_loop_resolved`` in the same claimed batch.
+
+        A triage escalation already resolved before this tick must not ping a
+        human with a stale "routed to TRIAGE" alert. The cursor still advances
+        past the skipped event (it was claimed); only the alert and its wake are
+        suppressed. History is preserved, and a still-open detection (no later
+        resolution) is delivered normally.
+        """
+        events = self.d["events"]
+        resolved_ids = {ev.id for ev in events if ev.kind == "block_loop_resolved"}
+        if not resolved_ids:
+            return set()
+        return {
+            ev.id for ev in events
+            if ev.kind == "block_loop_detected" and any(rid > ev.id for rid in resolved_ids)
+        }
+
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        stale = self._stale_block_loop_detection_ids()
+        self.wake_kinds = {
+            ev.kind for ev in self.d["events"]
+            if ev.kind in _WAKE_KINDS and ev.id not in stale
+        } if self.wake_agent else set()
         if not self.wake_kinds:
             return
         if self.is_push_adapter:
@@ -565,7 +588,12 @@ class _KanbanNotification:
 
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        stale = self._stale_block_loop_detection_ids()
         for ev in self.d["events"]:
+            if ev.id in stale:
+                # Superseded by a later block_loop_resolved in this batch: skip the
+                # stale "routed to TRIAGE" alert (and its wake). Cursor still advances.
+                continue
             msg = self.format_event(ev)
             if msg is None:
                 continue

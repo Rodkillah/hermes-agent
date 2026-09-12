@@ -990,3 +990,107 @@ def test_default_notify_target_delivers_all_terminal_kinds(tmp_path, monkeypatch
     runner._active_profile_name = lambda: "forge"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 5
+
+
+def _make_block_loop_task(conn, kb, *, resolved: bool):
+    """Create a task with a notify+wake subscription, then a ``block_loop_detected``
+    event, optionally followed by a ``block_loop_resolved`` event."""
+    tid = kb.create_task(conn, title="loop", assignee="worker")
+    kbn.add_notify_sub(
+        conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        notifier_profile="forge", delivery_mode="notify+wake",
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+        kb._append_event(
+            conn, tid, "block_loop_detected",
+            {"source_status": "ready", "recurrences": 2, "reason": "repeat"},
+        )
+        if resolved:
+            kb._append_event(
+                conn, tid, "block_loop_resolved",
+                {"decision": "retry", "actor": "amber", "reason": "superseded"},
+            )
+    return tid
+
+
+def test_block_loop_detected_then_resolved_before_tick_is_not_delivered(tmp_path, monkeypatch):
+    """A triage escalation resolved before the notifier tick must not ping a human
+    with a stale 'routed to TRIAGE' alert (the exact t_9ae74e66 regression)."""
+    db_path = tmp_path / "block-loop-resolved-before-tick.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = _make_block_loop_task(conn, kb, resolved=True)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # No stale "routed to TRIAGE" alert; the resolution is the only actionable event.
+    assert len(adapter.sent) == 1
+    assert "block loop resolved" in adapter.sent[0]["text"]
+    assert "TRIAGE" not in adapter.sent[0]["text"]
+
+
+def test_block_loop_detected_unresolved_is_delivered(tmp_path, monkeypatch):
+    """A still-open triage escalation (no later resolution) is delivered normally."""
+    db_path = tmp_path / "block-loop-unresolved.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = _make_block_loop_task(conn, kb, resolved=False)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "TRIAGE" in adapter.sent[0]["text"]
+
+
+def test_block_loop_resolved_after_delivery_is_not_replayed(tmp_path, monkeypatch):
+    """A resolution arriving after the detection was already delivered does not
+    replay the detection (cursor advanced), and the resolution itself is delivered."""
+    db_path = tmp_path / "block-loop-resolved-after-tick.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = _make_block_loop_task(conn, kb, resolved=False)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert "TRIAGE" in adapter.sent[0]["text"]
+
+    # Resolution lands after the first tick.
+    conn = kbc.connect()
+    try:
+        kb._append_event(
+            conn, tid, "block_loop_resolved",
+            {"decision": "retry", "actor": "amber", "reason": "superseded"},
+        )
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Only the resolution is new; the detection is not replayed.
+    assert len(adapter.sent) == 2
+    assert "block loop resolved" in adapter.sent[1]["text"]
+    assert "TRIAGE" not in adapter.sent[1]["text"]
