@@ -155,3 +155,15 @@ def test_goal_review_missing_readiness_fails_actionably_without_llm(goal_worker,
     assert "metadata.review_readiness" in result["error"]
     with kbc.connect() as conn:
         assert kb.get_task(conn, goal_worker).status == "running"
+
+
+def test_goal_gate_documentation_describes_only_expurgated_payload() -> None:
+    doc = (
+        Path(__file__).resolve().parents[2]
+        / "website/docs/user-guide/features/kanban.md"
+    ).read_text(encoding="utf-8")
+    section = doc.split("Judge transport failures", 1)[1].split("For a Git candidate", 1)[0]
+    normalized = " ".join(section.split())
+    assert "classification, policy version, and attempt id" in normalized
+    assert "effective provider/model" not in normalized
+    assert "only the action" not in normalized

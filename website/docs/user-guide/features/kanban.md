@@ -101,14 +101,14 @@ Judge transport failures (including authentication errors and timeouts), unusabl
 or unknown responses, and a judge that cannot be resolved fail open for
 completion. Before the completion transition, Hermes commits one redacted,
 idempotent `goal_gate_unavailable` event classified as `unavailable`, `transport`,
-or `parse`. The event contains only the action, effective provider/model (or
-`unresolved`), policy version, run id, and attempt id—not prompts, responses,
-provider exception text, credentials, or handoff metadata. The attempt id is a
-non-reversible digest derived from the task, worker run, and structured handoff:
-replayed or concurrent submissions of the same logical proof produce one audit
-event, while corrected proof produces a distinct attempt. If this audit cannot
-be written, completion is refused as `goal_gate_audit_unavailable`; Hermes does
-not call the judge again.
+or `parse`. Its JSON payload contains only classification, policy version, and
+attempt id; the native event row carries the run id. It never stores the action,
+provider/model, prompts, responses, provider exception text, credentials, or
+handoff metadata. The attempt id is a non-reversible digest derived from the
+task, worker run, and structured handoff: replayed or concurrent submissions of
+the same logical proof produce one audit event, while corrected proof produces a
+distinct attempt. If this audit cannot be written, completion is refused as
+`goal_gate_audit_unavailable`; Hermes does not call the judge again.
 
 For a Git candidate, supply:
 

@@ -216,7 +216,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "reopen-completed-review",
     "gc",
 })
 
@@ -1059,6 +1059,29 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot reopen {tid} (not in review?)")
 
 
+def _cmd_reopen_completed_review(args: argparse.Namespace) -> int:
+    reason = str(kb.redact_review_value(args.reason.strip())).strip()
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.reopen_completed_review_task(
+                conn,
+                args.task_id,
+                expected_run_id=args.expected_run_id,
+                assignee=args.assignee,
+                actor=_profile_author(),
+                reason=reason,
+            )
+    except ValueError as exc:
+        return _err(str(exc))
+    if not ok:
+        return _err(
+            f"cannot reopen completed review for {args.task_id}: "
+            "state, run id, claim, or prior approval did not match"
+        )
+    print(f"Reopened completed negative review for {args.task_id}; routed to {args.assignee}")
+    return 0
+
+
 def _cmd_promote(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
@@ -1293,7 +1316,9 @@ _HANDLERS = {
     "resolve-block-loop": _cmd_resolve_block_loop,
     "mark-prod": _cmd_mark_prod, "route-deploy-todo": _cmd_route_deploy_todo,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
-    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "reopen-review": _cmd_reopen_review,
+    "reopen-completed-review": _cmd_reopen_completed_review,
+    "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

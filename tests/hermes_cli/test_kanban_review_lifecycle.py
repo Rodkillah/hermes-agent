@@ -635,6 +635,139 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
         assert kb.reopen_review_task(conn, tid) is False
 
 
+def test_reopen_completed_negative_review_clears_completion_markers(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="negative audit", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="candidate",
+            reviewer="architect",
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer_claim = kb.claim_review_task(conn, tid, claimer="architect:review")
+        assert reviewer_claim is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="NO_GO_RUNTIME_CANDIDATE",
+            metadata={"review_outcome": "rejected_runtime_candidate"},
+            expected_run_id=reviewer_claim.current_run_id,
+        )
+        completed_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["id"]
+        conn.execute(
+            "UPDATE tasks SET work_completed_at = completed_at WHERE id = ?",
+            (tid,),
+        )
+
+        assert kb.reopen_completed_review_task(
+            conn,
+            tid,
+            expected_run_id=completed_run,
+            assignee="builder",
+            actor="forge",
+            reason="security findings require correction",
+        ) is True
+
+        row = conn.execute(
+            "SELECT status, assignee, completed_at, work_completed_at, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert dict(row) == {
+            "status": "ready",
+            "assignee": "builder",
+            "completed_at": None,
+            "work_completed_at": None,
+            "current_run_id": None,
+        }
+        event = _events(conn, tid, kind="completed_review_reopened")[-1][1]
+        assert event["review_run_id"] == completed_run
+        assert event["assignee"] == "builder"
+
+
+def test_reopen_completed_review_rejects_stale_run_and_approval(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="approved review", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="candidate", reviewer="architect",
+            expected_run_id=claimed.current_run_id,
+        )
+        review_claim = kb.claim_review_task(conn, tid, claimer="architect:review")
+        assert review_claim is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="GO_SOURCE_ONLY",
+            metadata={"review_outcome": "approved_source_only"},
+            expected_run_id=review_claim.current_run_id,
+        )
+        run_id = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["id"]
+
+        assert kb.reopen_completed_review_task(
+            conn, tid, expected_run_id=run_id - 1, assignee="builder",
+            actor="forge", reason="stale",
+        ) is False
+        assert kb.reopen_completed_review_task(
+            conn, tid, expected_run_id=run_id, assignee="builder",
+            actor="forge", reason="must not reopen approval",
+        ) is False
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_reopen_completed_review_invalidates_done_descendant(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="builder")
+        claimed = kb.claim_task(conn, parent)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, parent, summary="candidate", reviewer="architect",
+            expected_run_id=claimed.current_run_id,
+        )
+        review_claim = kb.claim_review_task(conn, parent, claimer="architect:review")
+        assert review_claim is not None
+        assert kb.complete_task(
+            conn, parent, summary="NO_GO", expected_run_id=review_claim.current_run_id,
+        )
+        child = kb.create_task(
+            conn, title="dependent", assignee="builder", parents=[parent],
+        )
+        assert kb.complete_task(conn, child, summary="dependent done")
+        run_id = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (parent,),
+        ).fetchone()["id"]
+
+        assert kb.reopen_completed_review_task(
+            conn, parent, expected_run_id=run_id, assignee="builder",
+            actor="amber", reason="negative review",
+        )
+        child_row = conn.execute(
+            "SELECT status, completed_at, work_completed_at FROM tasks WHERE id = ?",
+            (child,),
+        ).fetchone()
+        assert dict(child_row) == {
+            "status": "todo", "completed_at": None, "work_completed_at": None,
+        }
+        assert _events(conn, child, kind="descendant_invalidated")
+
+
 def test_review_cycle_end_to_end(kanban_home: Path) -> None:
     """Full loop: run -> review -> follow-up reopen -> re-run -> review ->
     approve -> done. Never blocks, never triages, and stays wake-subscribed

@@ -290,6 +290,60 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
         assert secret not in comments[0].body
 
 
+def test_cli_reopen_completed_review_requires_exact_run_and_redacts_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "forge")
+    secret = "ghp_" + "R" * 40
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="negative review", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="candidate",
+            reviewer="architect",
+            expected_run_id=claimed.current_run_id,
+        )
+        review_claim = kb.claim_review_task(conn, tid, claimer="architect:review")
+        assert review_claim is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="NO_GO_RUNTIME_CANDIDATE",
+            metadata={"review_outcome": "rejected_runtime_candidate"},
+            expected_run_id=review_claim.current_run_id,
+        )
+        run_id = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["id"]
+
+    output = kc.run_slash(
+        f'reopen-completed-review {tid} --expected-run-id {run_id} '
+        f'--assignee builder --reason "fix {secret}"'
+    )
+    assert "Reopened completed negative review" in output
+    assert secret not in output
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "builder"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'completed_review_reopened' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        assert secret not in (event["payload"] or "")
+
+
 def test_goal_mode_review_handoff_requires_readiness_without_calling_judge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

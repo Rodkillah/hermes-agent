@@ -350,6 +350,15 @@ _SPECS = [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
+    _cmd("reopen-completed-review", [
+        _TASK_ID,
+        _arg("--expected-run-id", required=True, type=int,
+             help="Exact latest negative reviewer run id (CAS guard)"),
+        _arg("--assignee", required=True,
+             help="Implementer profile that receives the correction run"),
+        _arg("--reason", required=True,
+             help="Bounded correction reason; secrets are redacted"),
+    ], help="Forge/Amber recovery: done negative review -> ready/todo"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),

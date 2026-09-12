@@ -3482,6 +3482,97 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def reopen_completed_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    assignee: str,
+    actor: str,
+    reason: str,
+    verdict: str = "no-go",
+) -> bool:
+    """Return a mistakenly completed negative review to implementation.
+
+    This is an operator recovery path, not a second approval path.  The exact
+    latest completed run is a CAS guard; positive structured review outcomes
+    cannot be reopened through it.  Completion markers are invalidated while
+    runs, comments, links, and production receipts remain immutable.
+    """
+    actor = str(actor or "").strip().lower()
+    if actor not in {"amber", "forge"}:
+        raise ValueError("only amber or forge may reopen a completed negative review")
+    if str(verdict or "").strip().lower() != "no-go":
+        raise ValueError("verdict must be 'no-go'")
+    try:
+        expected_run_id = int(expected_run_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected_run_id must be an integer") from exc
+    assignee = _canonical_assignee(assignee)
+    if not assignee:
+        raise ValueError("assignee is required")
+    reason = _production_ref(redact_review_value(reason), "reason")
+    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None or task["status"] != "done" or any(
+            task[key] is not None
+            for key in ("current_run_id", "claim_lock", "claim_expires", "worker_pid")
+        ):
+            return False
+        run = conn.execute(
+            "SELECT id, status, outcome, summary, metadata FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if (
+            run is None
+            or int(run["id"]) != expected_run_id
+            or run["status"] != "done"
+            or run["outcome"] != "completed"
+        ):
+            return False
+        metadata = _json_dict(run["metadata"])
+        review_outcome = str(metadata.get("review_outcome") or "").strip().lower()
+        summary = str(run["summary"] or "").strip().upper()
+        if review_outcome.startswith("approved") or (
+            summary.startswith("GO_") and not summary.startswith("NO_GO_")
+        ):
+            return False
+        new_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, assignee = ?, completed_at = NULL, "
+            "work_completed_at = NULL, current_run_id = NULL, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ? AND status = 'done'",
+            (new_status, assignee, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        invalidation = invalidate_descendants_for_parent_reopen(
+            conn, task_id, author=actor,
+        )
+        terminations.extend(invalidation["terminations"])
+        _append_event(
+            conn,
+            task_id,
+            "completed_review_reopened",
+            {
+                "status": new_status,
+                "review_run_id": expected_run_id,
+                "assignee": assignee,
+                "verdict": "no-go",
+                "reason": reason,
+            },
+        )
+    for pid, claim_lock in terminations:
+        _terminate_reclaimed_worker(pid, claim_lock)
+    return True
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection, task_id: str, *, author: str,
 ) -> dict[str, Any]:
