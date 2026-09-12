@@ -785,27 +785,31 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `default_notify_targets` | `[]` | Explicit per-board default notification targets applied to every new task created on a matching board (tool + CLI + dashboard), in addition to the creator's auto-subscription. Each entry is a mapping: `board` (required), `platform` (required), `chat_id` (required), `delivery_mode` (required: `notify`/`wake`/`notify+wake`), `notifier_profile` (required for `wake`/`notify+wake`), and optional `thread_id`/`chat_type`/`user_id`/`user_id_alt`/`delivery_metadata`. Empty by default — other installs gain no implicit destination. A non-empty invalid list fails task creation (fail-closed) rather than silently creating an un-notified card. Gated by `auto_subscribe_on_create`. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 
-A complete default-target configuration looks like this:
+Configure a default target with the native config command. Keep private route
+identifiers out of source-controlled files; inject them from an ephemeral shell
+variable instead:
 
-```yaml
-kanban:
-  auto_subscribe_on_create: true
-  default_notify_targets:
-    - board: iron-rod
-      platform: telegram
-      chat_id: "<forge-chat-id>"
-      chat_type: dm
-      notifier_profile: forge
-      delivery_mode: notify+wake
+```bash
+export FORGE_CHAT_ID='<forge-chat-id>'
+hermes config set kanban.default_notify_targets "[{\"board\":\"iron-rod\",\"platform\":\"telegram\",\"chat_id\":\"${FORGE_CHAT_ID}\",\"chat_type\":\"dm\",\"notifier_profile\":\"forge\",\"delivery_mode\":\"notify+wake\"}]"
+unset FORGE_CHAT_ID
+hermes config get kanban.default_notify_targets --json
 ```
 
 Board slugs and platform names are canonicalized to lowercase. Every configured
 platform must resolve to a built-in or registered plugin adapter; otherwise task
 creation fails before writing a task or subscription.
 
-Rollback `default_notify_targets` for future task creation by replacing the list
-with `default_notify_targets: []` (or removing the key). Existing subscriptions
-are intentionally retained; remove one explicitly with
+Rollback default targets for future task creation without disabling creator-session
+auto-subscription:
+
+```bash
+hermes config set kanban.default_notify_targets '[]'
+hermes config set kanban.auto_subscribe_on_create true
+hermes config get kanban.default_notify_targets --json
+```
+
+Existing subscriptions are intentionally retained; remove one explicitly with
 `hermes kanban notify-unsubscribe <task-id> --platform telegram --chat-id <forge-chat-id>`.
 
 And the two auxiliary LLM slots:
