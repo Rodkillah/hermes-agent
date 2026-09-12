@@ -847,3 +847,53 @@ def test_notifier_delivers_production_promoted_post_commit_without_replay(
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 1
+
+
+def test_default_notify_target_delivers_terminal_event(tmp_path, monkeypatch):
+    """End-to-end: a task created with a configured ``kanban.default_notify_targets``
+    target (no session channel) carries a Forge/Telegram/DM/notify+wake subscription
+    that the notifier actually delivers on a terminal event, and does not replay it
+    on a second tick (cursor caught up)."""
+    db_path = tmp_path / "default-target-delivery.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: telegram\n"
+        "      chat_id: forge-chat\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: forge\n"
+        "      delivery_mode: notify+wake\n"
+    )
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="forge default target", assignee="worker")
+        subs = kbn.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["chat_id"] == "forge-chat"
+        assert subs[0]["notifier_profile"] == "forge"
+        assert subs[0]["delivery_mode"] == "notify+wake"
+        kb.complete_task(conn, tid, summary="done via default target")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "done" in adapter.sent[0]["text"]
+
+    # Second tick: cursor already advanced, no replay.
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
