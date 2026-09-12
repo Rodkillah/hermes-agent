@@ -1396,13 +1396,17 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    # A known opened DB is authoritative for every inherited board default;
+    # resolve it once before consulting metadata so ambient board state cannot
+    # select another project's repo for this connection.
+    board_slug = _resolve_board_slug(conn, board)
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
     # it must not be upgraded to a worktree in the board's repo (#106342).
     if project_id is None and workspace_kind != "scratch":
         try:
-            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
+            project_id = (_board_meta_for(board_slug).get("project_id") or "").strip() or None
         except Exception:
             pass
     if workspace_kind is None:
@@ -1439,7 +1443,6 @@ def create_task(
     # Resolve + validate configured default notify targets once, before the write
     # txn, so a non-empty invalid config fails creation before any row is written
     # (fail-closed: no silent un-notified card). Board filtering happens at insert.
-    board_slug = _resolve_board_slug(conn, board)
     default_targets = _load_default_notify_targets()
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch

@@ -45,7 +45,7 @@ def setup_runner(tmp_path, monkeypatch):
     return runner
 
 
-def completion(*, profile="yuki", metadata=None, chat="post", thread="post", mode="notify+wake"):
+def completion(*, profile: str | None = "yuki", metadata=None, chat="post", thread="post", mode="notify+wake"):
     with kbc.connect() as conn:
         task = kb.create_task(conn, title="route completion", assignee="worker")
         kbn.add_notify_sub(conn, task_id=task, platform="discord", chat_id=chat,
@@ -99,12 +99,31 @@ def test_exact_routed_profile_delivers_once_on_its_authorized_transport(tmp_path
     assert not unseen(task)
 
 
+def test_unowned_routed_subscription_delivers_once_without_dispatch_lock(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    runner._kanban_dispatcher_lock_handle = None
+    primary = runner.adapters[Platform.DISCORD]
+    foreign = RecordingAdapter()
+    runner._profile_adapters["other"] = {Platform.DISCORD: foreign}  # type: ignore[dict-item]
+    task = completion(profile=None, mode="notify")
+
+    rows = collect(runner)
+    assert [row["task"].id for row in rows] == [task]
+    asyncio.run(deliver(runner, rows))
+
+    assert len(getattr(primary, "sent")) == 1
+    assert foreign.sent == []
+    assert not unseen(task)
+    assert not collect(runner)
+
+
 def test_route_denials_leave_events_retryable_at_claim_and_send(tmp_path, monkeypatch):
     runner = setup_runner(tmp_path, monkeypatch)
     primary = runner.adapters[Platform.DISCORD]
-    # Unknown owners, wrong/default owners, incomplete anchors, and partial credentials
-    # never become primary delivery authority.
-    tasks = [completion(profile=owner) for owner in ("other", "default", None)]
+    # Unknown/wrong owners, incomplete anchors (including an ownerless row),
+    # and partial credentials never become primary delivery authority.
+    tasks = [completion(profile=owner) for owner in ("other", "default")]
+    tasks += [completion(profile=None, metadata={"scope_id": "guild"})]
     tasks += [completion(metadata=meta) for meta in (
         {"parent_chat_id": "parent"}, {"guild_id": "guild"},
         {"guild_id": "wrong", "parent_chat_id": "parent"},

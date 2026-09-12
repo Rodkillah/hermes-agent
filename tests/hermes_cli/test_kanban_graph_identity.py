@@ -37,9 +37,14 @@ def test_completed_decomposition_survives_retriage(tmp_path, monkeypatch):
 
 def test_parent_tenant_is_inherited_at_creation_boundary(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_TENANT", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nkanban:\n  can_create: true\n", encoding="utf-8"
+    )
     from tools.kanban_tools import _handle_create
     with kbc.connect_closing() as conn:
         unscoped = kb.create_task(conn, title="unscoped")

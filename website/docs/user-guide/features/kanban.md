@@ -715,7 +715,9 @@ hermes config get kanban.default_notify_targets --json
 
 Board slugs and platform names are canonicalized to lowercase. Every configured
 platform must resolve to a built-in or registered plugin adapter; otherwise task
-creation fails before writing a task or subscription.
+creation fails before writing a task or subscription. `api_server` is excluded
+from persistent default targets because its request/response adapter cannot push
+a notification; direct ephemeral API wake subscriptions remain supported.
 
 Rollback default targets for future task creation without disabling creator-session
 auto-subscription:
@@ -1194,8 +1196,11 @@ dispatch and delivery have separate owners:
   missing required routing anchors are not guessed into a profile. Wake turns keep
   the destination profile's runtime scope and the authorized transport.
 - **Legacy subscriptions** created before profile stamping (no
-  `notifier_profile` on the row) are delivered only by the gateway that holds
-  the actual dispatcher singleton lock, so two gateways never race for them.
+  `notifier_profile` on the row) remain visible to the gateway holding the
+  dispatcher singleton lock. A multiplex gateway may also claim one when the
+  row's persisted route anchors resolve to an exact served profile and its
+  authorized adapter; ambiguous or incomplete routes stay retryable. Atomic
+  per-event claims still ensure only one gateway delivers the event.
 
 Duplicate delivery across gateways is prevented by the atomic per-event claim
 in the board DB. No relays, credential sharing, or extra dispatchers are

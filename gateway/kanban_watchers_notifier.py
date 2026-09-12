@@ -100,20 +100,15 @@ def _platform_names(mapping: Any) -> set[str]:
 
 def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profile: Optional[str]) -> Any:
     """Resolve a durable route without turning a missing secondary bot into primary authority."""
-    adapter = runner._authorization_adapter(platform, owner_profile)
     config = getattr(runner, "config", None)
+    adapter = runner._authorization_adapter(platform, owner_profile)
     if not getattr(config, "multiplex_profiles", False):
         return adapter
     primary = runner.adapters.get(platform)
-    if adapter is not None and adapter is not primary:
+    if owner_profile and adapter is not None and adapter is not primary:
         return adapter
-    profile = owner_profile or getattr(runner, "_kanban_notifier_profile", None)
+    profile_adapters = getattr(runner, "_profile_adapters", {}) or {}
     primary_profile = getattr(runner, "_primary_profile_name", None) or runner._active_profile_name()
-    profile = profile or primary_profile
-    # Empty maps are startup placeholders for route-only profiles; a connected
-    # secondary on ANY platform establishes an independent credential boundary.
-    if (getattr(runner, "_profile_adapters", {}) or {}).get(profile):
-        return None
     metadata = sub.get("delivery_metadata") or {}
     guild = metadata.get("scope_id") or metadata.get("guild_id")
     parent = metadata.get("parent_chat_id")
@@ -124,11 +119,21 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     # Preserve canonical route order, including equal-specificity ties. An older
     # row missing an anchor must not skip a potentially winning route. Reuse the
     # route's matcher (including platform-specific identity aliases), not a second
-    # hand-maintained equality implementation.
+    # hand-maintained equality implementation. Ownerless rows derive authority
+    # from the exact route rather than whichever profile happens to poll first.
     for route in getattr(config, "profile_routes", None) or []:
         if route.matches(platform.value, guild_id=guild, chat_id=chat,
                          thread_id=thread, parent_chat_id=parent):
-            if route.profile != profile:
+            if owner_profile and route.profile != owner_profile:
+                return None
+            profile = owner_profile or route.profile
+            adapter = runner._authorization_adapter(platform, profile)
+            if adapter is not None and adapter is not primary:
+                return adapter
+            # Empty maps are startup placeholders for route-only profiles; a
+            # connected secondary on ANY platform establishes an independent
+            # credential boundary and may never fall back to the primary bot.
+            if profile_adapters.get(profile):
                 return None
             from gateway.run import _multiplex_profile_homes
             served = {name for name, _home in _multiplex_profile_homes(config)}
@@ -136,6 +141,9 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
         if route.matches(platform.value, guild_id=guild or route.guild_id, chat_id=chat,
                          thread_id=thread, parent_chat_id=parent or (route.chat_id if thread_like else None)):
             return None
+    profile = owner_profile or primary_profile
+    if profile_adapters.get(profile):
+        return None
     return primary if profile == primary_profile else None
 
 
@@ -152,12 +160,16 @@ class _Collector:
         self.gc_due = gc_due
         self.gc_retention_days = gc_retention_days
         self.deliveries: list[dict] = []
-        self.include_unowned = runner._owns_kanban_dispatcher_lock()
+        config = getattr(runner, "config", None)
+        self.multiplex_profiles = bool(getattr(config, "multiplex_profiles", False))
+        # The singleton owner remains the legacy fallback. A multiplex gateway
+        # may also inspect ownerless rows because exact persisted route anchors
+        # select the authorized profile adapter before the atomic event claim.
+        self.include_unowned = runner._owns_kanban_dispatcher_lock() or self.multiplex_profiles
         self.profile_adapters = getattr(runner, "_profile_adapters", {})
         self.notifier_profiles = {notifier_profile}
         self.notifier_profiles.update(str(p).strip() for p in self.profile_adapters if str(p).strip())
-        config = getattr(runner, "config", None)
-        if getattr(config, "multiplex_profiles", False):
+        if self.multiplex_profiles:
             self.notifier_profiles.update(
                 route.profile for route in config.profile_routes
                 if route.enabled and route.platform in _platform_names(runner.adapters)
@@ -224,7 +236,7 @@ class _Collector:
                          sub.get("task_id"), platform or "<missing>")
             return None
         from gateway.config import Platform
-        if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
+        if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile) is None:
             return None
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
@@ -272,9 +284,10 @@ class _Collector:
 def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool, gc_retention_days: int) -> list[dict]:
     """Claim unseen terminal events for every owned subscription on every board.
 
-    Each gateway polls only subscriptions owned by profiles whose adapters it
-    hosts; legacy rows without a profile stamp are visible only to the process
-    holding the singleton dispatcher lock.
+    Each gateway polls subscriptions owned by profiles whose adapters it hosts.
+    Legacy rows without a profile stamp are visible to the singleton dispatcher
+    owner and to multiplex gateways, where exact persisted route anchors must
+    authorize the adapter before the atomic claim.
     """
     return _Collector(
         runner, kb, notifier_profile=notifier_profile, gc_due=gc_due, gc_retention_days=gc_retention_days,

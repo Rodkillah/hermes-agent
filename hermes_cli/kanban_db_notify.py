@@ -176,6 +176,13 @@ def normalize_default_notify_targets(raw: Any) -> list[dict]:
         except Exception:
             raise ValueError(
                 f"kanban.default_notify_targets[{idx}] has unsupported platform") from None
+        # The API server adapter is request/response only: send() deliberately
+        # returns failure, so a persistent default target could never notify and
+        # would retry forever. Direct ephemeral API wake subscriptions remain
+        # supported; only persisted defaults fail closed here.
+        if platform == Platform.API_SERVER.value:
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] has unsupported platform")
         if delivery_mode not in _NOTIFY_DELIVERY_MODES:
             raise ValueError(
                 f"kanban.default_notify_targets[{idx}] delivery_mode must be one of "

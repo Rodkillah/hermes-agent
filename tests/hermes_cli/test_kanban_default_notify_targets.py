@@ -24,6 +24,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import projects_db as pdb
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +447,55 @@ def test_create_unknown_platform_is_atomic(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_create_uses_opened_board_metadata_and_parent_tenant(
+    kanban_home, monkeypatch, tmp_path
+):
+    target_repo = tmp_path / "target-repo"
+    ambient_repo = tmp_path / "ambient-repo"
+    target_repo.mkdir()
+    ambient_repo.mkdir()
+    with pdb.connect_closing() as conn:
+        target_project = pdb.create_project(
+            conn, name="Target", primary_path=str(target_repo)
+        )
+        ambient_project = pdb.create_project(
+            conn, name="Ambient", primary_path=str(ambient_repo)
+        )
+    kb.create_board("target", project_id=target_project)
+    kb.create_board("ambient", project_id=ambient_project)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("target") / "kanban.db"))
+
+    with kb.scoped_current_board("ambient"), kbc.connect_closing() as conn:
+        parent = kb.create_task(
+            conn, title="target parent", tenant="target-tenant", workspace_kind="scratch"
+        )
+        child_id = kb.create_task(conn, title="target child", parents=[parent])
+        child = kb.get_task(conn, child_id)
+
+    assert child is not None
+    assert child.tenant == "target-tenant"
+    assert child.project_id == target_project
+    assert child.workspace_kind == "worktree"
+    assert child.workspace_path is not None
+    assert child.workspace_path.startswith(str(target_repo))
+    assert ambient_project not in (child.project_id, child.workspace_path)
+
+
+def test_create_rejects_api_server_target_atomically(kanban_home):
+    private_route = "PRIVATE-API-SESSION"
+    _write_config(kanban_home, [
+        _forge_target(
+            board="default", platform="api_server", chat_id=private_route
+        )
+    ])
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError, match="unsupported platform") as exc:
+            kb.create_task(conn, title="must not exist", assignee="w")
+        assert private_route not in str(exc.value)
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
 
 
 def test_concurrent_create_with_duplicate_targets_is_exactly_once(kanban_home):
