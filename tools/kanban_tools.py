@@ -386,13 +386,16 @@ _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
 
-def _goal_gate(conn, task, tid: str, evidence: str) -> None:
+def _goal_gate(
+    conn, task, tid: str, evidence: str, metadata: Optional[dict] = None,
+) -> None:
     """Apply the shared completion policy and durable fail-open audit."""
     from hermes_cli.kanban_goal_gate import GoalGateAuditUnavailable, run_completion_gate
 
     try:
         decision = run_completion_gate(
             conn, task, evidence, run_id=_worker_run_id(tid), judge=judge_goal,
+            attempt_metadata=metadata,
         )
     except GoalGateAuditUnavailable as exc:
         raise _Reject(str(exc)) from exc
@@ -594,7 +597,7 @@ def _handle_complete(args: dict, **kw) -> str:
         # Goal-mode final-completion judge. Unavailable/unparseable verdicts fail open only
         # after the shared policy persists a redacted diagnostic event.
         task = kb.get_task(conn, tid)
-        _goal_gate(conn, task, tid, (summary or result or "").strip())
+        _goal_gate(conn, task, tid, (summary or result or "").strip(), metadata)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,

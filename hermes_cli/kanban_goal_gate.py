@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -86,7 +87,10 @@ def unavailable_decision() -> GateDecision:
     )
 
 
-def run_completion_gate(conn, task, evidence: str, *, run_id: Optional[int], judge) -> GateDecision:
+def run_completion_gate(
+    conn, task, evidence: str, *, run_id: Optional[int], judge,
+    attempt_metadata: Optional[dict] = None,
+) -> GateDecision:
     """Run the final-completion policy once and persist any required override audit."""
     if task is None or not task.goal_mode:
         return GateDecision("allow", "goal_gate_not_applicable")
@@ -128,7 +132,7 @@ def run_completion_gate(conn, task, evidence: str, *, run_id: Optional[int], jud
                 )
     if decision.outcome != "allow_with_diagnostic":
         return decision
-    attempt_id = new_attempt_id(task.id, run_id)
+    attempt_id = new_attempt_id(task.id, run_id, evidence, attempt_metadata)
     try:
         record_unavailable_audit(
             conn, task_id=task.id, run_id=run_id, attempt_id=attempt_id,
@@ -214,9 +218,31 @@ def _readiness_reject(fields: list[str]) -> GateDecision:
     )
 
 
-def new_attempt_id(task_id: str, run_id: Optional[int]) -> str:
-    """Create the key for one explicit logical gate invocation."""
-    return f"{task_id}:{run_id if run_id is not None else 'none'}:{uuid.uuid4().hex}"
+def new_attempt_id(
+    task_id: str,
+    run_id: Optional[int],
+    evidence: str = "",
+    metadata: Optional[dict] = None,
+) -> str:
+    """Derive a stable, non-reversible key for one logical completion attempt.
+
+    Replays and concurrent calls carrying the same run and proof deduplicate, while
+    an explicit retry with corrected evidence or metadata receives a new identity.
+    Only the digest is persisted; raw handoff material never enters the audit event.
+    """
+    logical_metadata = (
+        {key: value for key, value in metadata.items() if key != "worker_session_id"}
+        if isinstance(metadata, dict) else metadata
+    )
+    proof = json.dumps(
+        {"evidence": evidence, "metadata": logical_metadata},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    digest = hashlib.sha256(proof).hexdigest()
+    return f"{task_id}:{run_id if run_id is not None else 'none'}:{digest}"
 
 
 def _identity(value: Any) -> str:

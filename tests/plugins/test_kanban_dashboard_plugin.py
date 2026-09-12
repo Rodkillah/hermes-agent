@@ -274,6 +274,148 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
         )
 
 
+def _goal_task(*, claimed: bool = False):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="goal-mode dashboard transition", assignee="builder", goal_mode=True,
+        )
+        if claimed:
+            kb.claim_task(conn, task_id)
+    return task_id
+
+
+def _review_readiness():
+    return {"review_readiness": {
+        "schema_version": 1,
+        "candidate_kind": "git",
+        "candidate_sha": "a" * 40,
+        "base_sha": "b" * 40,
+        "remote": "rod",
+        "remote_ref": "ironrod/candidate",
+        "changed_files": ["hermes_cli/kanban_goal_gate.py"],
+        "tests_run": [{"command": "pytest -q", "result": "1 passed"}],
+        "rollback": "git revert candidate",
+        "limits": [],
+    }}
+
+
+def test_dashboard_goal_completion_rejects_valid_continue_verdict(client, monkeypatch):
+    task_id = _goal_task(claimed=True)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client", lambda _purpose: (object(), "model"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.goals.judge_goal",
+        lambda **_kwargs: ("continue", "acceptance item missing", False, None, False),
+    )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "candidate proof"},
+    )
+
+    assert response.status_code == 400
+    assert "goal_gate_continue" in response.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+@pytest.mark.parametrize("failure_kind", ["transport", "parse"])
+def test_dashboard_goal_completion_failure_fails_open_once(
+    client, monkeypatch, failure_kind,
+):
+    task_id = _goal_task(claimed=True)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client", lambda _purpose: (object(), "model"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.goals.judge_goal",
+        lambda **_kwargs: (
+            "continue", "raw failure", failure_kind == "parse", None,
+            failure_kind == "transport",
+        ),
+    )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "candidate proof"},
+    )
+
+    assert response.status_code == 200, response.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "done"
+        events = [e for e in kb.list_events(conn, task_id) if e.kind == "goal_gate_unavailable"]
+    assert len(events) == 1
+    assert events[0].payload["classification"] == failure_kind
+
+
+def test_dashboard_goal_review_requires_review_readiness(client, monkeypatch):
+    task_id = _goal_task()
+    monkeypatch.setattr(
+        "hermes_cli.goals.judge_goal",
+        lambda **_kwargs: pytest.fail("review readiness must not call the goal judge"),
+    )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "review", "summary": "candidate ready"},
+    )
+
+    assert response.status_code == 400
+    assert "review_readiness_invalid" in response.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_dashboard_goal_review_accepts_v1_without_llm(client, monkeypatch):
+    task_id = _goal_task()
+    monkeypatch.setattr(
+        "hermes_cli.goals.judge_goal",
+        lambda **_kwargs: pytest.fail("review readiness must not call the goal judge"),
+    )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "review", "summary": "candidate ready",
+            "metadata": _review_readiness(),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "review"
+
+
+@pytest.mark.parametrize("requested_status, expected_code", [
+    ("done", "goal_gate_continue"),
+    ("review", "review_readiness_invalid"),
+])
+def test_dashboard_bulk_goal_transitions_cannot_bypass_shared_policies(
+    client, monkeypatch, requested_status, expected_code,
+):
+    task_id = _goal_task(claimed=True)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client", lambda _purpose: (object(), "model"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.goals.judge_goal",
+        lambda **_kwargs: ("continue", "acceptance item missing", False, None, False),
+    )
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task_id], "status": requested_status, "summary": "candidate proof"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["ok"] is False
+    assert expected_code in result["error"]
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "running"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 
