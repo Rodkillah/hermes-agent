@@ -290,7 +290,7 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
         assert secret not in comments[0].body
 
 
-def test_goal_mode_review_handoff_cannot_bypass_judge(
+def test_goal_mode_review_handoff_requires_readiness_without_calling_judge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -315,27 +315,20 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
 
     from tools import kanban_tools as tools
 
-    monkeypatch.setattr(tools, "_goal_judge_available", lambda: True)
     monkeypatch.setattr(
         tools,
         "judge_goal",
-        lambda *args, **kwargs: (
-            "continue",
-            "acceptance evidence is missing",
-            False,
-            None,
-            False,
-        ),
+        lambda *args, **kwargs: pytest.fail("review readiness must not invoke the judge"),
     )
     rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
     assert "error" in rejected
-    assert "rejected by judge" in rejected["error"]
+    assert "review_readiness_invalid" in rejected["error"]
     with kbc.connect() as conn:
         tool_after = kb.get_task(conn, tool_task)
         assert tool_after is not None
         assert tool_after.status == "running"
 
-    # The shell/CLI path applies the same gate and must not bypass the tool.
+    # The shell/CLI path applies the same deterministic gate.
     with kbc.connect() as conn:
         cli_task = kb.create_task(
             conn,
@@ -359,10 +352,10 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     monkeypatch.setattr(
         goals,
         "judge_goal",
-        lambda *args, **kwargs: ("continue", "tests are missing", False, None, False),
+        lambda *args, **kwargs: pytest.fail("review readiness must not invoke the judge"),
     )
     output = kc.run_slash(f"request-review {cli_task} --summary 'Looks ready.'")
-    assert "rejected by judge" in output
+    assert "review_readiness_invalid" in output
     with kbc.connect() as conn:
         cli_after = kb.get_task(conn, cli_task)
         assert cli_after is not None

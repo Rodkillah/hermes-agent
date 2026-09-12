@@ -241,15 +241,18 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         return "continue", "missing verification evidence", False, None, False
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
-    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _name: (object(), "judge-model"),
+    )
 
     # Attempt to complete should be rejected
     out = kt._handle_complete({"summary": "I did some stuff but not X"})
     d = json.loads(out)
     assert "error" in d
+    assert "goal_gate_continue" in d["error"]
     assert "Goal completion rejected by judge" in d["error"]
     assert "missing verification evidence" in d["error"]
-    assert f"parents=[{goal_task_id}]" in d["error"]
 
     # Verify the task is NOT completed in the DB
     conn2 = kbc.connect()

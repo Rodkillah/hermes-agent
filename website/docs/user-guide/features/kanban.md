@@ -82,6 +82,58 @@ guard, not OS isolation against arbitrary direct database writes. GitHub Enterpr
 is not covered. Related publication/lifecycle work: #91230, #84254, #52311; local
 verification and publication alone are not remote acceptance.
 
+## Goal-mode completion and review readiness
+
+Goal-mode cards have two separate gates:
+
+- `kanban_complete` asks the configured goal judge whether the card is finally
+  complete. A valid `continue`, `wait`, or `blocked` verdict refuses completion;
+  `done` allows it.
+- `kanban_request_review` does **not** call a model. It only validates the
+  deterministic `metadata.review_readiness` V1 dossier. Entering review never
+  requires a review verdict that cannot exist yet.
+
+Judge transport failures (including authentication errors and timeouts), unusable
+or unknown responses, and a judge that cannot be resolved fail open for
+completion. Before the completion transition, Hermes commits one redacted,
+idempotent `goal_gate_unavailable` event classified as `unavailable`, `transport`,
+or `parse`. The event contains only the action, effective provider/model (or
+`unresolved`), policy version, run id, and attempt id—not prompts, responses,
+provider exception text, credentials, or handoff metadata. If this audit cannot
+be written, completion is refused as `goal_gate_audit_unavailable`; Hermes does
+not call the judge again.
+
+For a Git candidate, supply:
+
+```json
+{
+  "review_readiness": {
+    "schema_version": 1,
+    "candidate_kind": "git",
+    "candidate_sha": "<40 hex>",
+    "base_sha": "<different 40 hex>",
+    "remote": "<remote name, never a credentialed URL>",
+    "remote_ref": "<non-empty remote ref>",
+    "changed_files": ["relative/path"],
+    "tests_run": [{"command": "pytest -q", "result": "passed"}],
+    "rollback": "<non-empty command or procedure>",
+    "limits": []
+  }
+}
+```
+
+`changed_files` must be non-empty unless an honest, non-empty `no_diff_reason`
+is supplied alongside `changed_files: []`. `limits` is required; `[]` explicitly
+means no known limits. For an artifact or document, use `candidate_kind:
+"artifact"`, non-empty `candidate_identity` and `candidate_location`, and a
+non-empty `verification` list of `{ "check", "result" }` objects. Either profile
+may replace `rollback` with a non-empty `rollback_not_applicable_reason`.
+Unknown versions or candidate kinds and missing, empty, or wrongly typed fields
+are refused in a stable field order without an LLM fallback. Extra V1 fields are
+retained but do not influence readiness. This gate checks that a review dossier
+exists; the independent reviewer still verifies candidate accessibility, diff,
+test claims, limits, and rollback.
+
 ## Kanban vs. `delegate_task`
 
 They look similar; they are not the same primitive.
@@ -587,7 +639,31 @@ def register(ctx):
 
 ### Goal-mode cards (`--goal`)
 
-By default each worker gets **one shot** at its card — do the work, call `kanban_complete`/`kanban_block`, exit. Pass `--goal` (CLI) or `goal_mode=True` (the `kanban_create` tool / dashboard) to instead run that worker in a **goal loop**, the same Ralph-style engine behind the `/goal` slash command: after every turn an auxiliary judge checks the worker's output against the card's title + body (treated as the acceptance criteria), and if the work isn't done — and the turn budget remains — the worker keeps going **in the same session** until the judge agrees, the worker terminates the task itself, or the budget runs out (which **blocks** the card for human review rather than exiting silently). If the judge rules the goal **unachievable** as written, the card is blocked immediately with the judge's reason — an impossible card is never marked done, and `kanban complete` / `kanban request-review` on such a card are rejected with a pointer to `kanban block` or re-scoping.
+By default each worker gets **one shot** at its card — do the work, call `kanban_complete`/`kanban_block`, exit. Pass `--goal` (CLI) or `goal_mode=True` (the `kanban_create` tool / dashboard) to instead run that worker in a **goal loop**, the same Ralph-style engine behind the `/goal` slash command: after every turn an auxiliary judge checks the worker's output against the card's title + body (treated as the acceptance criteria), and if the work isn't done — and the turn budget remains — the worker keeps going **in the same session** until the judge agrees, the worker terminates the task itself, or the budget runs out (which **blocks** the card for human review rather than exiting silently). If the judge rules the goal **unachievable** as written, the card is blocked immediately with the judge's reason — an impossible card is never marked done, and `kanban complete` is rejected with a pointer to `kanban block` or re-scoping.
+
+Goal-mode lifecycle handoffs deliberately use two different gates:
+
+- **Final completion** (`kanban_complete` / `hermes kanban complete`) asks the auxiliary judge whether the card's acceptance criteria are complete. A valid `continue`, `wait`, or `blocked` verdict rejects completion. If the judge cannot be resolved, its transport fails, or its output cannot be parsed, completion fails open only after Hermes writes a redacted `goal_gate_unavailable` audit event. If that audit write fails, completion is refused with `goal_gate_audit_unavailable`. The gate makes one judge call per attempt and adds no retry or provider fallback.
+- **Review entry** (`kanban_request_review` / `hermes kanban request-review`) never calls the judge. It validates `metadata.review_readiness` V1 deterministically, because a review verdict cannot be a prerequisite for entering review. Non-goal-mode cards keep their existing review behavior.
+
+For a Git candidate, V1 requires `candidate_sha` and distinct `base_sha` (40 hexadecimal characters), a credential-free remote name and remote ref, `changed_files` (or an explicit `no_diff_reason` when empty), at least one `{command, result}` test record, a rollback procedure, and a `limits` list. For an artifact/document candidate, it requires a stable identity and location, at least one `{check, result}` verification record, a rollback procedure or `rollback_not_applicable_reason`, and a `limits` list. Extra fields are retained but do not change the V1 decision. These fields are a review-readiness declaration; the independent reviewer still verifies the remote, diff, tests, and rollback.
+
+```json
+{
+  "review_readiness": {
+    "schema_version": 1,
+    "candidate_kind": "git",
+    "candidate_sha": "0123456789abcdef0123456789abcdef01234567",
+    "base_sha": "89abcdef0123456789abcdef0123456789abcdef",
+    "remote": "origin",
+    "remote_ref": "feature/review-candidate",
+    "changed_files": ["src/example.py"],
+    "tests_run": [{"command": "scripts/run_tests.sh tests/example.py", "result": "passed"}],
+    "rollback": "revert the candidate commit",
+    "limits": []
+  }
+}
+```
 
 ```bash
 hermes kanban create "Translate the docs site to French" \

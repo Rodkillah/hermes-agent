@@ -225,8 +225,29 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
             "type": "object",
             "description": (
                 "Optional structured handoff facts for the reviewer, such "
-                "as changed_files, tests_run, commit, or decisions."
+                "as changed_files, tests_run, commit, or decisions. Goal-mode "
+                "cards require review_readiness V1; this proves only that the "
+                "candidate is ready to inspect, not that review has passed."
             ),
+            "properties": {
+                "review_readiness": {
+                    "type": "object",
+                    "description": (
+                        "Required for goal-mode review entry. Use candidate_kind=git "
+                        "with candidate_sha, base_sha, remote, remote_ref, changed_files "
+                        "(or no_diff_reason), tests_run, rollback, limits; or "
+                        "candidate_kind=artifact with candidate_identity, "
+                        "candidate_location, verification, rollback (or "
+                        "rollback_not_applicable_reason), and limits."
+                    ),
+                    "properties": {
+                        "schema_version": {"type": "integer", "const": 1},
+                        "candidate_kind": {"type": "string", "enum": ["git", "artifact"]},
+                    },
+                    "required": ["schema_version", "candidate_kind"],
+                    "additionalProperties": True,
+                },
+            },
             "additionalProperties": True,
         },
     },
