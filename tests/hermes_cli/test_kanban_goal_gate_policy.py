@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
+import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +15,8 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli.kanban_goal_gate import (
+    ATTEMPT_JUDGE_TIMEOUT_SECONDS,
+    GoalGateAuditUnavailable,
     POLICY_VERSION,
     completion_decision,
     new_attempt_id,
@@ -18,6 +24,17 @@ from hermes_cli.kanban_goal_gate import (
     review_readiness_decision,
     run_completion_gate,
 )
+
+
+_GOAL_EVENT_KINDS = {
+    "goal_gate_attempt_reserved",
+    "goal_gate_attempt_result",
+    "goal_gate_unavailable",
+}
+
+
+def _goal_events(conn, task_id):
+    return [event for event in kb.list_events(conn, task_id) if event.kind in _GOAL_EVENT_KINDS]
 
 
 @pytest.mark.parametrize("classification", ["transport", "parse"])
@@ -159,7 +176,8 @@ def test_unavailable_audit_is_redacted_and_idempotent(audit_board):
         events = [e for e in kb.list_events(conn, tid) if e.kind == "goal_gate_unavailable"]
     assert len(events) == 1
     payload = events[0].payload
-    assert payload["action"] == "kanban_complete"
+    assert payload is not None
+    assert set(payload) == {"attempt_id", "classification", "policy_version"}
     assert payload["policy_version"] == POLICY_VERSION
     assert payload["attempt_id"] == attempt_id
     encoded = json.dumps(payload)
@@ -289,8 +307,13 @@ def test_completion_gate_recovers_abandoned_reservation_without_rejudging(
                 judge=interrupted_judge,
             )
 
-    monkeypatch.setattr("hermes_cli.kanban_goal_gate.ATTEMPT_RESERVATION_TTL_SECONDS", 0)
     with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload=json_set(payload, '$.lease_expires_at', ?) "
+                "WHERE task_id=? AND kind='goal_gate_attempt_reserved'",
+                (time.time() - 1, tid),
+            )
         decision = run_completion_gate(
             conn, kb.get_task(conn, tid), "same proof", run_id=run_id,
             judge=interrupted_judge,
@@ -309,3 +332,298 @@ def test_attempt_identity_ignores_surface_injected_session_metadata():
     assert new_attempt_id("t_same", 7, "proof", base) == new_attempt_id(
         "t_same", 7, "proof", stamped,
     )
+
+
+def test_attempt_identity_is_fully_hashed_and_changes_with_proof():
+    first = new_attempt_id("t_secret_task", 7, "proof-one")
+    replay = new_attempt_id("t_secret_task", 7, "proof-one")
+    changed = new_attempt_id("t_secret_task", 7, "proof-two")
+    assert first == replay
+    assert first != changed
+    assert "t_secret_task" not in first
+    assert len(first) <= 80
+
+
+def test_judge_timeout_has_margin_before_reservation_lease():
+    from hermes_cli.kanban_goal_gate import ATTEMPT_RESERVATION_TTL_SECONDS
+
+    assert ATTEMPT_JUDGE_TIMEOUT_SECONDS > 0
+    assert ATTEMPT_JUDGE_TIMEOUT_SECONDS <= ATTEMPT_RESERVATION_TTL_SECONDS - 15
+
+
+def test_missing_event_storage_fails_closed_without_judge():
+    task = SimpleNamespace(
+        id="t1", goal_mode=True, status="running", current_run_id=1,
+        title="goal", body="criteria",
+    )
+    conn = sqlite3.connect(":memory:")
+    calls = 0
+
+    def judge(**_kwargs):
+        nonlocal calls
+        calls += 1
+
+    with pytest.raises(GoalGateAuditUnavailable, match="goal_gate_audit_unavailable"):
+        run_completion_gate(conn, task, "proof", run_id=1, judge=judge)
+    assert calls == 0
+
+
+def test_result_persistence_failure_fails_closed_after_one_judge_call(
+    audit_board, monkeypatch,
+):
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
+    )
+    real_append = kb.append_idempotent_event
+
+    def fail_result(conn, task_id, kind, payload, **kwargs):
+        if kind == "goal_gate_attempt_result":
+            raise sqlite3.OperationalError("forced persistence failure with raw secret")
+        return real_append(conn, task_id, kind, payload, **kwargs)
+
+    monkeypatch.setattr(kb, "append_idempotent_event", fail_result)
+    calls = 0
+
+    def judge(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return "done", "private reason", False, None, False
+
+    with kbc.connect() as conn:
+        with pytest.raises(GoalGateAuditUnavailable) as raised:
+            run_completion_gate(
+                conn, kb.get_task(conn, tid), "proof", run_id=run_id, judge=judge,
+            )
+    assert calls == 1
+    assert "secret" not in str(raised.value).lower()
+    assert "goal_gate_audit_unavailable" in str(raised.value)
+
+
+def test_task_event_payloads_are_bounded_and_expurged(audit_board, monkeypatch):
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (
+            SimpleNamespace(_hermes_aux_effective_provider="https://user:credential@host"),
+            "Bearer model-secret",
+        ),
+    )
+
+    def judge(**kwargs):
+        assert kwargs["timeout"] == ATTEMPT_JUDGE_TIMEOUT_SECONDS
+        return "blocked", "raw judge reason sk-forbidden", False, None, False
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        decision = run_completion_gate(
+            conn, task, "proof https://user:password@host", run_id=run_id,
+            judge=judge, attempt_metadata={"handoff": "credential-freeform"},
+        )
+        events = _goal_events(conn, tid)
+
+    assert decision.code == "goal_gate_blocked"
+    allowed = {
+        "attempt_id", "policy_version", "reserved_at", "lease_expires_at",
+        "outcome", "code", "classification",
+    }
+    assert events
+    assert all(set((event.payload or {})) <= allowed for event in events)
+    encoded = json.dumps([event.payload for event in events]).lower()
+    for forbidden in (
+        "raw judge reason", "sk-forbidden", "password", "credential-freeform",
+        "bearer", "user:credential", "proof https", "handoff", "provider", "model",
+        "message", "reason", "prompt", "response", "exception", "metadata", "action",
+    ):
+        assert forbidden not in encoded
+
+
+def test_goal_attempt_events_are_collected_for_terminal_tasks(audit_board, monkeypatch):
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
+    )
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        decision = run_completion_gate(
+            conn, task, "proof", run_id=run_id,
+            judge=lambda **_: ("done", "", False, None, False),
+        )
+        assert decision.outcome == "allow"
+        assert kb.complete_task(conn, tid, summary="done", expected_run_id=run_id)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at=0 WHERE task_id=? AND kind LIKE 'goal_gate_%'",
+                (tid,),
+            )
+        kb.gc_events(conn)
+        assert _goal_events(conn, tid) == []
+
+
+def test_multiprocess_single_flight_replay_and_changed_proof(audit_board, monkeypatch):
+    """Distinct processes and SQLite connections share exactly one judge call."""
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
+    )
+    ctx = multiprocessing.get_context("fork")
+    calls = ctx.Value("i", 0)
+    entered = ctx.Event()
+    release = ctx.Event()
+    results = ctx.Queue()
+
+    def worker(proof, wait):
+        def judge(**_kwargs):
+            with calls.get_lock():
+                calls.value += 1
+            entered.set()
+            if wait:
+                assert release.wait(5)
+            return "done", "private reason", False, None, False
+
+        with kbc.connect() as conn:
+            decision = run_completion_gate(
+                conn, kb.get_task(conn, tid), proof, run_id=run_id, judge=judge,
+            )
+        results.put((decision.outcome, decision.code))
+
+    first = ctx.Process(target=worker, args=("same proof", True))
+    first.start()
+    assert entered.wait(5)
+    second = ctx.Process(target=worker, args=("same proof", False))
+    second.start()
+    second.join(5)
+    assert second.exitcode == 0
+    release.set()
+    first.join(5)
+    assert first.exitcode == 0
+    concurrent = sorted([results.get(timeout=2), results.get(timeout=2)])
+    assert concurrent == [
+        ("allow", "goal_gate_done"),
+        ("reject", "goal_gate_attempt_in_progress"),
+    ]
+    assert calls.value == 1
+
+    worker("same proof", False)
+    assert results.get(timeout=2) == ("allow", "goal_gate_done")
+    assert calls.value == 1
+    worker("changed proof", False)
+    assert results.get(timeout=2) == ("allow", "goal_gate_done")
+    assert calls.value == 2
+    with kbc.connect() as conn:
+        result_events = [
+            event for event in _goal_events(conn, tid)
+            if event.kind == "goal_gate_attempt_result"
+        ]
+    assert len(result_events) == 2
+    assert len({event.payload["attempt_id"] for event in result_events}) == 2
+
+
+def test_multiprocess_crash_recovers_after_lease_without_second_judge(
+    audit_board, monkeypatch,
+):
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
+    )
+    ctx = multiprocessing.get_context("fork")
+
+    def crash_worker():
+        with kbc.connect() as conn:
+            run_completion_gate(
+                conn, kb.get_task(conn, tid), "crash proof", run_id=run_id,
+                judge=lambda **_: os._exit(23),
+            )
+
+    crashed = ctx.Process(target=crash_worker)
+    crashed.start()
+    crashed.join(5)
+    assert crashed.exitcode == 23
+    recovery_decisions = ctx.Queue()
+
+    def recover_worker():
+        with kbc.connect() as conn:
+            decision = run_completion_gate(
+                conn, kb.get_task(conn, tid), "crash proof", run_id=run_id,
+                judge=lambda **_: os._exit(24),
+            )
+        recovery_decisions.put((decision.outcome, decision.classification))
+
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload=json_set(payload, '$.lease_expires_at', ?) "
+                "WHERE task_id=? AND kind='goal_gate_attempt_reserved'",
+                (time.time() - 1, tid),
+            )
+    recoverers = [ctx.Process(target=recover_worker) for _ in range(2)]
+    for process in recoverers:
+        process.start()
+    for process in recoverers:
+        process.join(5)
+        assert process.exitcode == 0
+    assert [recovery_decisions.get(timeout=2) for _ in recoverers] == [
+        ("allow_with_diagnostic", "unavailable"),
+        ("allow_with_diagnostic", "unavailable"),
+    ]
+    with kbc.connect() as conn:
+        result_events = [
+            event for event in _goal_events(conn, tid)
+            if event.kind == "goal_gate_attempt_result"
+        ]
+    assert len(result_events) == 1
+
+
+def test_late_judge_cannot_overwrite_expiry_recovery(audit_board, monkeypatch):
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
+    )
+    ctx = multiprocessing.get_context("fork")
+    entered = ctx.Event()
+    release = ctx.Event()
+    decisions = ctx.Queue()
+
+    def late_worker():
+        def judge(**_kwargs):
+            entered.set()
+            assert release.wait(5)
+            return "blocked", "must never become canonical", False, None, False
+
+        with kbc.connect() as conn:
+            decision = run_completion_gate(
+                conn, kb.get_task(conn, tid), "race proof", run_id=run_id, judge=judge,
+            )
+        decisions.put((decision.outcome, decision.code, decision.classification))
+
+    late = ctx.Process(target=late_worker)
+    late.start()
+    assert entered.wait(5)
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload=json_set(payload, '$.lease_expires_at', ?) "
+                "WHERE task_id=? AND kind='goal_gate_attempt_reserved'",
+                (time.time() - 1, tid),
+            )
+        recovered = run_completion_gate(
+            conn, kb.get_task(conn, tid), "race proof", run_id=run_id,
+            judge=lambda **_: pytest.fail("recovery must not call judge"),
+        )
+    release.set()
+    late.join(5)
+    assert late.exitcode == 0
+    canonical = ("allow_with_diagnostic", "goal_gate_unavailable", "unavailable")
+    assert (recovered.outcome, recovered.code, recovered.classification) == canonical
+    assert decisions.get(timeout=2) == canonical
+    with kbc.connect() as conn:
+        result_events = [
+            event for event in _goal_events(conn, tid)
+            if event.kind == "goal_gate_attempt_result"
+        ]
+    assert len(result_events) == 1

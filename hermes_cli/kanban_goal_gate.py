@@ -17,12 +17,20 @@ _SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
 _CREDENTIAL_REMOTE = re.compile(
     r"(?:^[a-z][a-z0-9+.-]*://|@|\bbearer\b|\btoken\b|\bpassword\b)", re.IGNORECASE,
 )
-_SAFE_IDENTITY = re.compile(r"^[A-Za-z0-9._/-]{1,160}$")
-_SENSITIVE_IDENTITY = re.compile(r"(?:bearer|token|password|secret|credential|auth)", re.IGNORECASE)
 _ATTEMPT_ID = re.compile(r"^[A-Za-z0-9_:-]{1,200}$")
 ATTEMPT_RESERVATION_TTL_SECONDS = 120
+ATTEMPT_JUDGE_TIMEOUT_SECONDS = 90
 _ATTEMPT_RESERVED_KIND = "goal_gate_attempt_reserved"
 _ATTEMPT_RESULT_KIND = "goal_gate_attempt_result"
+_PERSISTED_RESULTS = frozenset({
+    ("allow", "goal_gate_done", None),
+    ("reject", "goal_gate_continue", None),
+    ("reject", "goal_gate_wait", None),
+    ("reject", "goal_gate_blocked", None),
+    ("allow_with_diagnostic", "goal_gate_unavailable", "unavailable"),
+    ("allow_with_diagnostic", "goal_gate_unavailable", "transport"),
+    ("allow_with_diagnostic", "goal_gate_unavailable", "parse"),
+})
 
 
 @dataclass(frozen=True)
@@ -109,7 +117,12 @@ def run_completion_gate(
             "Worker run is stale; completion was not evaluated.",
         )
 
-    attempt_id = new_attempt_id(task.id, run_id, evidence, attempt_metadata)
+    try:
+        attempt_id = new_attempt_id(task.id, run_id, evidence, attempt_metadata)
+    except Exception as exc:
+        raise GoalGateAuditUnavailable(
+            "goal_gate_audit_unavailable: completion attempt identity could not be derived"
+        ) from exc
     try:
         reserved = _reserve_attempt(conn, task.id, run_id, attempt_id)
     except Exception as exc:
@@ -117,18 +130,31 @@ def run_completion_gate(
             "goal_gate_audit_unavailable: completion attempt could not be durably reserved"
         ) from exc
     if not reserved:
-        decision = _load_attempt_result(conn, task.id, attempt_id)
-        if decision is None:
-            reserved_at = _reservation_time(conn, task.id, attempt_id)
-            if reserved_at is not None and time.time() - reserved_at >= ATTEMPT_RESERVATION_TTL_SECONDS:
-                decision = unavailable_decision()
-                decision = _persist_or_load_result(conn, task.id, run_id, attempt_id, decision)
-            else:
-                return GateDecision(
-                    "reject", "goal_gate_attempt_in_progress", None,
-                    "This completion attempt is already being evaluated; retry shortly.",
-                )
-        return _audit_if_required(conn, task.id, run_id, attempt_id, decision, None, None)
+        try:
+            decision = _load_attempt_result(conn, task.id, attempt_id)
+            if decision is None:
+                lease_expires_at = _reservation_lease_expires_at(conn, task.id, attempt_id)
+                if lease_expires_at is None:
+                    raise RuntimeError("goal gate reservation is unreadable")
+                if time.time() >= lease_expires_at:
+                    decision = unavailable_decision()
+                    decision = _persist_or_load_result(
+                        conn, task.id, run_id, attempt_id, decision,
+                    )
+                else:
+                    return GateDecision(
+                        "reject", "goal_gate_attempt_in_progress", None,
+                        "This completion attempt is already being evaluated; retry shortly.",
+                    )
+            return _audit_if_required(
+                conn, task.id, run_id, attempt_id, decision, None, None,
+            )
+        except GoalGateAuditUnavailable:
+            raise
+        except Exception as exc:
+            raise GoalGateAuditUnavailable(
+                "goal_gate_audit_unavailable: completion attempt state could not be durably resolved"
+            ) from exc
 
     client = model = None
     try:
@@ -145,6 +171,7 @@ def run_completion_gate(
                 verdict, reason, parse_failed, _, transport_failed = judge(
                     goal=f"{task.title}\n\n{task.body or ''}".strip(),
                     last_response=evidence.strip(),
+                    timeout=ATTEMPT_JUDGE_TIMEOUT_SECONDS,
                 )
             except Exception:
                 decision = GateDecision(
@@ -201,17 +228,28 @@ def _attempt_payload(conn, task_id: str, kind: str, attempt_id: str) -> Optional
 def _reserve_attempt(conn, task_id: str, run_id: Optional[int], attempt_id: str) -> bool:
     from hermes_cli import kanban_db as kb
 
+    reserved_at = time.time()
     return kb.append_idempotent_event(
         conn, task_id, _ATTEMPT_RESERVED_KIND,
-        {"attempt_id": attempt_id, "reserved_at": time.time(), "policy_version": POLICY_VERSION},
+        {
+            "attempt_id": attempt_id,
+            "reserved_at": reserved_at,
+            "lease_expires_at": reserved_at + ATTEMPT_RESERVATION_TTL_SECONDS,
+            "policy_version": POLICY_VERSION,
+        },
         idempotency_field="attempt_id", run_id=run_id,
     )
 
 
-def _reservation_time(conn, task_id: str, attempt_id: str) -> Optional[float]:
+def _reservation_lease_expires_at(conn, task_id: str, attempt_id: str) -> Optional[float]:
     payload = _attempt_payload(conn, task_id, _ATTEMPT_RESERVED_KIND, attempt_id)
     try:
-        return float(payload["reserved_at"]) if payload is not None else None
+        if payload is None:
+            return None
+        if "lease_expires_at" in payload:
+            return float(payload["lease_expires_at"])
+        # Candidate reservations written before the bounded lease field existed.
+        return float(payload["reserved_at"]) + ATTEMPT_RESERVATION_TTL_SECONDS
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -223,12 +261,30 @@ def _load_attempt_result(conn, task_id: str, attempt_id: str) -> Optional[GateDe
     outcome = payload.get("outcome")
     code = payload.get("code")
     classification = payload.get("classification")
-    message = payload.get("message", "")
     if not isinstance(outcome, str) or not isinstance(code, str):
         return None
     if classification is not None and not isinstance(classification, str):
         return None
-    return GateDecision(outcome, code, classification, message if isinstance(message, str) else "")
+    if (outcome, code, classification) not in _PERSISTED_RESULTS:
+        return None
+    return GateDecision(outcome, code, classification, _persisted_message(code))
+
+
+def _persisted_message(code: str) -> str:
+    """Rebuild actionable UX without persisting free-form judge text."""
+    if code == "goal_gate_blocked":
+        return (
+            "Goal completion rejected: judge ruled the goal unachievable. "
+            "Re-scope the task or record the external block with kanban_block "
+            "(`kanban block` on the CLI)."
+        )
+    if code == "goal_gate_wait":
+        return "Goal completion rejected by judge (wait). Keep the task open and retry later."
+    if code == "goal_gate_continue":
+        return "Goal completion rejected by judge. Provide evidence matching the acceptance criteria."
+    if code == "goal_gate_unavailable":
+        return "Goal judge could not be resolved; completion may proceed with an audit event."
+    return ""
 
 
 def _persist_or_load_result(
@@ -236,6 +292,9 @@ def _persist_or_load_result(
 ) -> GateDecision:
     from hermes_cli import kanban_db as kb
 
+    result_key = (decision.outcome, decision.code, decision.classification)
+    if result_key not in _PERSISTED_RESULTS:
+        raise ValueError("invalid goal gate attempt result")
     inserted = kb.append_idempotent_event(
         conn, task_id, _ATTEMPT_RESULT_KIND,
         {
@@ -243,7 +302,6 @@ def _persist_or_load_result(
             "outcome": decision.outcome,
             "code": decision.code,
             "classification": decision.classification,
-            "message": decision.message,
             "policy_version": POLICY_VERSION,
         },
         idempotency_field="attempt_id", run_id=run_id,
@@ -349,17 +407,12 @@ def new_attempt_id(
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        default=str,
     ).encode("utf-8")
     digest = hashlib.sha256(proof).hexdigest()
-    return f"{task_id}:{run_id if run_id is not None else 'none'}:{digest}"
-
-
-def _identity(value: Any) -> str:
-    safe = _safe_text(value)
-    if not safe or not _SAFE_IDENTITY.fullmatch(safe) or _SENSITIVE_IDENTITY.search(safe):
-        return "unresolved"
-    return safe
+    identity = hashlib.sha256(
+        f"{task_id}\0{run_id if run_id is not None else 'none'}\0{digest}".encode("utf-8")
+    ).hexdigest()
+    return f"gga:v{POLICY_VERSION}:{identity}"
 
 
 def record_unavailable_audit(
@@ -379,11 +432,7 @@ def record_unavailable_audit(
         raise ValueError("invalid goal gate attempt id")
     from hermes_cli import kanban_db as kb
 
-    provider = getattr(client, "_hermes_aux_effective_provider", None) if client is not None else None
     payload = {
-        "action": "kanban_complete",
-        "provider": _identity(provider),
-        "model": _identity(model),
         "classification": classification,
         "policy_version": POLICY_VERSION,
         "attempt_id": attempt_id,

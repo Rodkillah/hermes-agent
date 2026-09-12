@@ -148,36 +148,10 @@ class TestCLIJudgeGate:
     def _run(self, monkeypatch, *, goal_mode=True, judge_available=True,
              verdict="done", reason="", complete_ok=True, summary="done"):
         import argparse
-        import types
-        from unittest.mock import MagicMock
+        import tempfile
         from hermes_cli.kanban import _cmd_complete
 
-        fake_task = types.SimpleNamespace(
-            id="t1",
-            goal_mode=goal_mode,
-            status="running",
-            current_run_id=None,
-            title="Finish report",
-            body="acceptance: criteria",
-        )
-        fake_conn = MagicMock()
         complete_calls: list = []
-
-        def fake_connect_closing():
-            from contextlib import contextmanager
-            @contextmanager
-            def _cm():
-                yield fake_conn
-            return _cm()
-
-        def fake_complete_task(conn, tid, **kw):
-            complete_calls.append(tid)
-            return complete_ok
-
-        monkeypatch.setattr("hermes_cli.kanban.kb.get_task", lambda conn, tid: fake_task)
-        monkeypatch.setattr("hermes_cli.kanban.kb.complete_task", fake_complete_task)
-        monkeypatch.setattr("hermes_cli.kanban.kbc.connect_closing", fake_connect_closing)
-        monkeypatch.setattr("hermes_cli.kanban._worker_run_id_for", lambda _: None)
 
         _aux_client = (object(), "judge-model") if judge_available else (None, None)
         monkeypatch.setattr(
@@ -190,9 +164,28 @@ class TestCLIJudgeGate:
             "hermes_cli.goals.judge_goal",
             lambda **kw: (verdict, reason, False, None, False),
         )
+        with tempfile.TemporaryDirectory() as temp_home:
+            monkeypatch.setenv("HERMES_HOME", temp_home)
+            kb._INITIALIZED_PATHS.clear()
+            kb.init_db()
+            with kbc.connect() as conn:
+                task_id = kb.create_task(
+                    conn, title="Finish report", body="acceptance: criteria",
+                    goal_mode=goal_mode,
+                )
+            real_complete_task = kb.complete_task
 
-        args = argparse.Namespace(task_ids=["t1"], summary=summary, result=None, metadata=None)
-        return _cmd_complete(args), complete_calls
+            def tracked_complete_task(conn, tid, **kw):
+                complete_calls.append(tid)
+                return real_complete_task(conn, tid, **kw) if complete_ok else False
+
+            monkeypatch.setattr("hermes_cli.kanban.kb.complete_task", tracked_complete_task)
+            monkeypatch.setattr("hermes_cli.kanban._worker_run_id_for", lambda _: None)
+            args = argparse.Namespace(
+                task_ids=[task_id], summary=summary, result=None, metadata=None,
+            )
+            rc = _cmd_complete(args)
+        return rc, complete_calls
 
     def test_judge_rejects_premature_completion(self, monkeypatch):
         rc, complete_calls = self._run(
@@ -208,7 +201,7 @@ class TestCLIJudgeGate:
         """Plain (non-goal_mode) tasks are never sent to the judge."""
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
-        assert complete_calls == ["t1"]
+        assert len(complete_calls) == 1
 
     def test_judge_blocked_verdict_rejects_completion(self, monkeypatch, capsys):
         """#100954: an unachievable goal must not complete silently.
