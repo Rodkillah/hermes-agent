@@ -935,3 +935,58 @@ def test_default_notify_target_delivers_blocked_needs_input(tmp_path, monkeypatc
     assert len(adapter.sent) == 1
     assert tid in adapter.sent[0]["text"]
     assert "blocked" in adapter.sent[0]["text"]
+
+
+def test_default_notify_target_delivers_all_terminal_kinds(tmp_path, monkeypatch):
+    """Criterion 4: a default-target subscription delivers every terminal kind the
+    notifier observes — blocked, crashed, timed_out, changes_requested, completed —
+    with notify+wake, and the cursor advances so none is replayed."""
+    db_path = tmp_path / "default-target-all-kinds.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: telegram\n"
+        "      chat_id: forge-chat\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: forge\n"
+        "      delivery_mode: notify+wake\n"
+    )
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="all kinds", assignee="worker")
+        assert len(kbn.list_notify_subs(conn, tid)) == 1
+        # Emit each terminal kind the notifier observes (TERMINAL_KINDS).
+        kb._append_event(conn, tid, kind="crashed")
+        kb._append_event(conn, tid, kind="timed_out")
+        kb._append_event(conn, tid, kind="changes_requested", payload={"reason": "rework"})
+        kb._append_event(conn, tid, kind="blocked", payload={"reason": "needs input", "kind": "needs_input"})
+        kb._append_event(conn, tid, kind="completed", payload={"summary": "done"})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # All five terminal kinds delivered exactly once, in order.
+    assert len(adapter.sent) == 5
+    texts = [d["text"].lower() for d in adapter.sent]
+    assert any("crashed" in t for t in texts)
+    assert any("timed out" in t or "timed_out" in t for t in texts)
+    assert any("changes" in t for t in texts)
+    assert any("blocked" in t for t in texts)
+    assert any("done" in t for t in texts)
+
+    # Second tick: cursor advanced past all five, nothing replayed.
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 5
