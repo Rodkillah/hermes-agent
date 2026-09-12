@@ -1315,15 +1315,42 @@ def _load_default_notify_targets() -> list[dict]:
     return _kbn.normalize_default_notify_targets(raw)
 
 
-def _resolve_board_slug(board: Optional[str]) -> str:
-    """Resolve the board slug with the same priority as the connection path
-    (``_board_path``): explicit ``board`` -> ``get_current_board()`` (context/env
-    -> current symlink -> default). Used to match ``default_notify_targets``
-    entries against the board a task is actually created on."""
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    return slug
+def _canonical_board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """Canonical board whose standard DB path matches ``conn``, if known.
+
+    Compare standard locations directly: ``kanban_db_path`` honors
+    ``HERMES_KANBAN_DB`` and would otherwise make every slug appear to own the
+    override. Unknown/custom DB paths return ``None`` for caller fallback.
+    """
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        resolved = str(Path(row[2]).resolve()) if row and row[2] else ""
+        for meta in list_boards(include_archived=True):
+            slug = _normalize_board_slug(meta.get("slug"))
+            if not slug:
+                continue
+            expected = (
+                kanban_home() / "kanban.db"
+                if slug == DEFAULT_BOARD
+                else board_dir(slug) / "kanban.db"
+            )
+            if str(expected.resolve()) == resolved:
+                return slug
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_board_slug(conn: sqlite3.Connection, board: Optional[str]) -> str:
+    """Board identity for a write: use an explicitly propagated slug when one
+    was supplied; otherwise identify the DB actually opened before consulting
+    ambient state. This respects ``HERMES_KANBAN_DB`` priority and prevents an
+    omitted slug from matching a different current board's targets."""
+    explicit = _normalize_board_slug(board)
+    if explicit:
+        return explicit
+    opened = _canonical_board_for_connection(conn)
+    return opened or get_current_board()
 
 
 def create_task(
@@ -1412,7 +1439,7 @@ def create_task(
     # Resolve + validate configured default notify targets once, before the write
     # txn, so a non-empty invalid config fails creation before any row is written
     # (fail-closed: no silent un-notified card). Board filtering happens at insert.
-    board_slug = _resolve_board_slug(board)
+    board_slug = _resolve_board_slug(conn, board)
     default_targets = _load_default_notify_targets()
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -4380,31 +4407,9 @@ def _normalise_production_receipt(receipt: Mapping[str, Any]) -> tuple[dict, lis
 
 def _board_for_connection(conn: sqlite3.Connection) -> str:
     """Resolve the board owning an open connection, not the ambient board."""
-    try:
-        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
-        resolved = str(Path(db_file).resolve()) if db_file else ""
-        for meta in list_boards(include_archived=True):
-            slug = meta.get("slug")
-            if not slug:
-                continue
-            # ``kanban_db_path`` deliberately honors HERMES_KANBAN_DB, so it
-            # cannot be used to identify the owner of an already-open
-            # connection: an incoherent ambient override would make every
-            # board appear to point at the override. Compare against the
-            # canonical per-board location instead.
-            expected = (
-                kanban_home() / "kanban.db"
-                if slug == DEFAULT_BOARD
-                else board_dir(slug) / "kanban.db"
-            )
-            if str(expected.resolve()) == resolved:
-                return slug
-    except Exception:
-        # Production promotion must never fall back to the ambient board when
-        # connection ownership cannot be established.
-        raise ProductionLifecycleError(
-            "cannot resolve the board owning the production connection"
-        ) from None
+    slug = _canonical_board_for_connection(conn)
+    if slug:
+        return slug
     raise ProductionLifecycleError(
         "cannot resolve the board owning the production connection"
     )

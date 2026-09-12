@@ -17,6 +17,8 @@ Covers the acceptance criteria:
 from __future__ import annotations
 
 import json
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -88,6 +90,23 @@ def test_normalize_valid_target():
     assert t["chat_type"] == "dm"
     assert t["notifier_profile"] == "forge"
     assert t["delivery_mode"] == "notify+wake"
+
+
+def test_normalize_uses_canonical_board_slug_and_platform():
+    out = kbn.normalize_default_notify_targets([
+        _forge_target(board=" Iron-Rod ", platform=" TELEGRAM ")
+    ])
+    assert out[0]["board"] == "iron-rod"
+    assert out[0]["platform"] == "telegram"
+
+
+def test_normalize_rejects_unknown_platform_without_echoing_route():
+    secret_platform = "SECRET-UNRESOLVABLE-PLATFORM"
+    with pytest.raises(ValueError, match="unsupported platform") as exc:
+        kbn.normalize_default_notify_targets([
+            _forge_target(platform=secret_platform)
+        ])
+    assert secret_platform not in str(exc.value)
 
 
 def test_normalize_optional_fields_default_to_none():
@@ -335,3 +354,95 @@ def test_create_respects_auto_subscribe_gate(kanban_home):
         assert _subs(conn, tid) == []
     finally:
         conn.close()
+
+
+def test_create_uses_opened_db_board_when_slug_omitted(kanban_home, monkeypatch):
+    """HERMES_KANBAN_DB wins over an unrelated ambient board: matching and
+    insertion are both scoped to the DB that was actually opened."""
+    kb.create_board("iron-rod")
+    kb.create_board("other-board")
+    _write_config(kanban_home, [
+        _forge_target(board=" Iron-Rod ", chat_id="iron-chat"),
+        _forge_target(board="other-board", chat_id="other-chat"),
+    ])
+    iron_db = kb.board_dir("iron-rod") / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(iron_db))
+
+    with kb.scoped_current_board("other-board"), kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="db-pinned", assignee="w")
+        subs = _subs(conn, tid)
+        assert [(s["platform"], s["chat_id"], s["thread_id"])
+                for s in subs] == [("telegram", "iron-chat", "forge-thread")]
+
+    with kbc.connect_closing(db_path=kb.board_dir("other-board") / "kanban.db") as conn:
+        assert kb.get_task(conn, tid) is None
+        assert kbn.list_notify_subs(conn) == []
+
+
+def test_create_unknown_platform_is_atomic(kanban_home):
+    secret_platform = "SECRET-UNRESOLVABLE-PLATFORM"
+    _write_config(kanban_home, [
+        _forge_target(board="default", platform=secret_platform)
+    ])
+    conn = kbc.connect()
+    try:
+        with pytest.raises(ValueError, match="unsupported platform") as exc:
+            kb.create_task(conn, title="must not exist", assignee="w")
+        assert secret_platform not in str(exc.value)
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_concurrent_create_with_duplicate_targets_is_exactly_once(kanban_home):
+    duplicate = _forge_target(board="default", chat_id="one-route")
+    _write_config(kanban_home, [duplicate, dict(duplicate)])
+    worker_count = 2
+    barrier = threading.Barrier(worker_count)
+    created: list[str] = []
+    failures: list[BaseException] = []
+
+    def worker(index: int) -> None:
+        try:
+            with kbc.connect_closing() as conn:
+                barrier.wait(timeout=5)
+                created.append(kb.create_task(conn, title=f"concurrent-{index}", assignee="w"))
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert failures == []
+    assert len(created) == worker_count
+    with kbc.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == worker_count
+        rows = conn.execute(
+            "SELECT task_id, COUNT(*) AS n FROM kanban_notify_subs GROUP BY task_id"
+        ).fetchall()
+        assert {row["task_id"]: row["n"] for row in rows} == {
+            task_id: 1 for task_id in created
+        }
+
+
+def test_real_cli_create_applies_default_target(kanban_home):
+    from hermes_cli import kanban as kc
+
+    _write_config(kanban_home, [_forge_target(board="default")])
+    output = kc.run_slash("create 'cli configured target' --assignee worker")
+    task_id = output.split()[1]
+    with kbc.connect_closing() as conn:
+        assert len(_subs(conn, task_id)) == 1
+
+
+def test_docs_include_config_example_and_rollback():
+    doc = (Path(__file__).resolve().parents[2]
+           / "website/docs/user-guide/features/kanban.md").read_text()
+    assert "default_notify_targets:\n    - board: iron-rod" in doc
+    assert "Rollback `default_notify_targets`" in doc
+    assert "default_notify_targets: []" in doc

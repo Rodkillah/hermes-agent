@@ -88,7 +88,7 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
         resolved = resolver(str(sub.get("chat_id") or ""))
     except Exception as exc:
         # An adapter-side lookup failure yields no scope, never an error.
-        logger.debug("kanban notifier: scope lookup failed for chat %s: %s", sub.get("chat_id"), exc, exc_info=True)
+        logger.debug("kanban notifier: scope lookup failed (%s)", type(exc).__name__)
         return None
     return str(resolved) if resolved else None
 
@@ -522,8 +522,8 @@ class _KanbanNotification:
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
 
     def _log_woke(self) -> None:
-        logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                    self.task_id, self.platform_str, self.sub["chat_id"], self.sub_profile or "default", self.wake_kinds)
+        logger.info("kanban notifier: woke agent for %s on %s profile=%s events=%s",
+                    self.task_id, self.platform_str, self.sub_profile or "default", self.wake_kinds)
 
     def _owner_scope(self):
         """Runtime scope of the subscription's profile under multiplex, else a no-op context."""
@@ -584,8 +584,8 @@ class _KanbanNotification:
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
-        logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                     ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
+        logger.debug("kanban notifier: delivered %s event for %s via %s on board %s",
+                     ev.kind, self.task_id, self.platform_str, self.board_slug)
         # Upload artifact paths from the completion payload / legacy result as
         # native files. Only on ``completed`` so retries never spam attachments.
         if ev.kind == "completed":
