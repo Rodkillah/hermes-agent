@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -25,6 +26,11 @@ class RecordingAdapter:
     async def handle_message(self, event):
         self.handled.append(event)
         event._gateway_accepted = True
+
+
+class FailingScopeAdapter(RecordingAdapter):
+    def scope_id_for_chat(self, chat_id):
+        raise RuntimeError(f"scope unavailable for {chat_id}")
 
 
 class DisconnectedAdapters(dict):
@@ -67,6 +73,32 @@ def _create_completed_subscription(summary="done once"):
         return tid
     finally:
         conn.close()
+
+
+def test_notifier_logs_never_expose_route_ids(tmp_path, monkeypatch, caplog):
+    route_sentinel = "CHAT-ID-MUST-NOT-APPEAR"
+    db_path = tmp_path / "confidential-log-route.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="confidential route", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=route_sentinel,
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = FailingScopeAdapter()
+    runner = _make_runner(adapter)
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert route_sentinel not in caplog.text
 
 
 def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):

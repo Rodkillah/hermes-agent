@@ -163,13 +163,19 @@ def normalize_default_notify_targets(raw: Any) -> list[dict]:
             raise ValueError(
                 f"kanban.default_notify_targets[{idx}] missing required key(s): "
                 f"{', '.join(missing)}")
-        board = str(entry["board"]).strip()
-        platform = str(entry["platform"]).strip()
+        board = _kb._normalize_board_slug(entry["board"])
+        platform = str(entry["platform"]).strip().lower()
         chat_id = str(entry["chat_id"]).strip()
         delivery_mode = str(entry["delivery_mode"]).strip()
         if not board or not platform or not chat_id:
             raise ValueError(
                 f"kanban.default_notify_targets[{idx}] board/platform/chat_id must be non-empty")
+        try:
+            from gateway.config import Platform
+            platform = Platform(platform).value
+        except Exception:
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] has unsupported platform") from None
         if delivery_mode not in _NOTIFY_DELIVERY_MODES:
             raise ValueError(
                 f"kanban.default_notify_targets[{idx}] delivery_mode must be one of "
