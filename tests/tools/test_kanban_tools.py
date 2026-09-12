@@ -1017,6 +1017,43 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_create_subscribed_true_with_default_target_no_session(monkeypatch, worker_env, tmp_path):
+    """A configured default notify target, applied by create_task even without a
+    session channel, must surface ``subscribed=true`` in the tool response."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    home = tmp_path / ".hermes"
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: telegram\n"
+        "      chat_id: forge-chat\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: forge\n"
+        "      delivery_mode: notify+wake\n"
+    )
+
+    out = kt._handle_create({
+        "title": "default target sub",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["chat_id"] == "forge-chat"
+    assert subs[0]["notifier_profile"] == "forge"
+    assert subs[0]["delivery_mode"] == "notify+wake"
+
+
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery

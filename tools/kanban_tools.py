@@ -950,7 +950,12 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
-    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create."""
+    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create.
+
+    Also returns True when the task already carries at least one subscription — e.g. a
+    configured ``kanban.default_notify_targets`` row applied by ``create_task`` — even if
+    this session has no persistent channel of its own, so the ``subscribed`` flag reflects
+    the real delivery state rather than only the creator's auto-subscription."""
     try:
         if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
             return False
@@ -960,7 +965,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     try:
         target = _resolve_notify_target()
         if target is None:
-            return False  # CLI / cron / test — no persistent channel
+            # CLI / cron / test — no persistent channel. A configured default target
+            # may still have subscribed the task inside create_task; reflect that.
+            from hermes_cli import kanban_db_notify as _kbn
+            return bool(_kbn.list_notify_subs(conn, task_id))
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
         # Auto-subscribe must not turn a passive destination into an agent wake.

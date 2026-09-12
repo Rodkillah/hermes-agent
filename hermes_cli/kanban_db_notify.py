@@ -129,6 +129,139 @@ def add_notify_sub(
             )
 
 
+# --- Configured default notify targets (kanban.default_notify_targets) ---
+
+_DEFAULT_TARGET_REQUIRED = ("board", "platform", "chat_id", "delivery_mode")
+_DEFAULT_TARGET_OPTIONAL = (
+    "thread_id", "chat_type", "user_id", "user_id_alt",
+    "notifier_profile", "delivery_metadata",
+)
+
+
+def normalize_default_notify_targets(raw: Any) -> list[dict]:
+    """Validate/normalize ``kanban.default_notify_targets`` into a list of
+    ``add_notify_sub``-shaped target dicts. ``None``/``[]`` -> ``[]`` (historical
+    behaviour: no implicit destination). A non-empty invalid value raises
+    :class:`ValueError` whose message never contains ``chat_id``/``thread_id``/
+    user ids or any other private routing data — only indexes and key names.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("kanban.default_notify_targets must be a list of target mappings")
+    out: list[dict] = []
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"kanban.default_notify_targets[{idx}] must be a mapping")
+        unknown = set(entry) - set(_DEFAULT_TARGET_REQUIRED) - set(_DEFAULT_TARGET_OPTIONAL)
+        if unknown:
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] has unknown key(s): "
+                f"{', '.join(sorted(unknown))}")
+        missing = [k for k in _DEFAULT_TARGET_REQUIRED if not entry.get(k)]
+        if missing:
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] missing required key(s): "
+                f"{', '.join(missing)}")
+        board = str(entry["board"]).strip()
+        platform = str(entry["platform"]).strip()
+        chat_id = str(entry["chat_id"]).strip()
+        delivery_mode = str(entry["delivery_mode"]).strip()
+        if not board or not platform or not chat_id:
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] board/platform/chat_id must be non-empty")
+        if delivery_mode not in _NOTIFY_DELIVERY_MODES:
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] delivery_mode must be one of "
+                f"{sorted(_NOTIFY_DELIVERY_MODES)}")
+        notifier_profile = entry.get("notifier_profile")
+        if notifier_profile is not None:
+            notifier_profile = str(notifier_profile).strip() or None
+        if delivery_mode in ("wake", "notify+wake") and not notifier_profile:
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] notifier_profile is required for "
+                f"delivery_mode={delivery_mode!r}")
+        thread_id = entry.get("thread_id")
+        if thread_id is not None:
+            thread_id = str(thread_id).strip() or None
+        chat_type = entry.get("chat_type")
+        if chat_type is not None:
+            chat_type = str(chat_type).strip() or None
+        user_id = entry.get("user_id")
+        if user_id is not None:
+            user_id = str(user_id).strip() or None
+        user_id_alt = entry.get("user_id_alt")
+        if user_id_alt is not None:
+            user_id_alt = str(user_id_alt).strip() or None
+        delivery_metadata = entry.get("delivery_metadata")
+        if delivery_metadata is not None and not isinstance(delivery_metadata, Mapping):
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] delivery_metadata must be a mapping")
+        out.append({
+            "board": board,
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "chat_type": chat_type,
+            "user_id": user_id,
+            "user_id_alt": user_id_alt,
+            "notifier_profile": notifier_profile,
+            "delivery_mode": delivery_mode,
+            "delivery_metadata": dict(delivery_metadata) if delivery_metadata else None,
+        })
+    return out
+
+
+def apply_default_notify_targets(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    board: str,
+    targets: list[dict],
+) -> int:
+    """Insert configured default notify targets whose ``board`` equals ``board``
+    onto ``task_id``, idempotently under the existing
+    ``(task_id, platform, chat_id, thread_id)`` identity via ``INSERT OR IGNORE``
+    (no read-then-insert race, no destructive upsert). Runs inside the caller's
+    ``create_task`` transaction — no nested ``write_txn`` — mirroring
+    ``_inherit_notify_subs``. ``last_event_id`` is caught up to the task's current
+    cursor so the ``created`` event is never replayed as an alert. Returns the
+    number of rows inserted.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    cursor = int(row["cursor"] if row is not None else 0)
+    inserted = 0
+    for target in targets:
+        if target["board"] != board:
+            continue
+        key = _sub_key(task_id, target["platform"], target["chat_id"], target["thread_id"])
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+                 chat_type, notifier_profile, delivery_mode, delivery_metadata,
+                 created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                *key,
+                target["user_id"],
+                target["user_id_alt"],
+                target["chat_type"] or "dm",
+                target["notifier_profile"],
+                target["delivery_mode"],
+                _encode_notify_delivery_metadata(target["delivery_metadata"]),
+                int(time.time()),
+                cursor,
+            ),
+        )
+        inserted += int(cur.rowcount or 0)
+    return inserted
+
+
 def _notify_profile_filter(
     notifier_profiles: Optional[Iterable[str]],
     *,
