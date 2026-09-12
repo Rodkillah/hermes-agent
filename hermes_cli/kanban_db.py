@@ -1342,15 +1342,19 @@ def _canonical_board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
 
 
 def _resolve_board_slug(conn: sqlite3.Connection, board: Optional[str]) -> str:
-    """Board identity for a write: use an explicitly propagated slug when one
-    was supplied; otherwise identify the DB actually opened before consulting
-    ambient state. This respects ``HERMES_KANBAN_DB`` priority and prevents an
-    omitted slug from matching a different current board's targets."""
-    explicit = _normalize_board_slug(board)
-    if explicit:
-        return explicit
+    """Resolve the board identity for a write from the opened database.
+
+    A known canonical DB is authoritative.  Reject a divergent explicit slug
+    rather than selecting another board's notification targets for that DB.
+    Custom DB paths fall back to the explicit slug, then ambient state.
+    """
     opened = _canonical_board_for_connection(conn)
-    return opened or get_current_board()
+    explicit = _normalize_board_slug(board)
+    if opened:
+        if explicit and explicit != opened:
+            raise ValueError("explicit board does not match the opened board")
+        return opened
+    return explicit or get_current_board()
 
 
 def create_task(
