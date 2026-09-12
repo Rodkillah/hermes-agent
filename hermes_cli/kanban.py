@@ -820,54 +820,32 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
-    """Goal judge for every terminal worker handoff (including review).
-
-    Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
-    unachievable; ``"continue"``/``"wait"`` reject with the judge's reason. Judge failures allow
-    the handoff (logged).
-
-    See #100954.
-    ``{"done", None}`` means the judge allows the handoff; anything else is a rejection whose verdict
-    disambiguates the guidance the caller gives the worker (``continue`` = not done yet, ``blocked`` =
-    judged unachievable — see #100954).
-    """
-    if task is None or not task.goal_mode:
-        return ("done", None)
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        client, model = None, None
-    if client is None or not model:
-        return ("done", None)
-
+def _goal_completion_gate_error(conn, tid: str, evidence: str) -> Optional[str]:
+    """Adapt the shared completion policy to the CLI error envelope."""
     from hermes_cli.goals import judge_goal
+    from hermes_cli.kanban_goal_gate import GoalGateAuditUnavailable, run_completion_gate
 
-    verdict, reason = "done", ""
     try:
-        verdict, reason, _, _, _ = judge_goal(goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                                              last_response=evidence.strip())
-    except Exception as judge_exc:
-        import logging as _logging
+        decision = run_completion_gate(
+            conn, kb.get_task(conn, tid), evidence,
+            run_id=_worker_run_id_for(tid), judge=judge_goal,
+        )
+    except GoalGateAuditUnavailable as exc:
+        return f"kanban: {exc}"
+    if decision.outcome == "reject":
+        return f"kanban: {decision.code}: {decision.message}"
+    return None
 
-        _logging.getLogger(__name__).warning("goal judge check failed, allowing lifecycle handoff: %s",
-                                             judge_exc, exc_info=True)
-    return (verdict, None if verdict == "done" else reason)
 
+def _goal_review_readiness_error(task: Optional[kb.Task], metadata: Optional[dict]) -> Optional[str]:
+    """Adapt deterministic goal-mode review readiness to the CLI envelope."""
+    if task is None or not task.goal_mode:
+        return None
+    from hermes_cli.kanban_goal_gate import review_readiness_decision
 
-def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: str,
-                     continue_hint: str) -> Optional[str]:
-    """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
-    applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
-    None to allow."""
-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
-    if verdict == "blocked":
-        return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
-                f"the goal unachievable — {rejection}. {blocked_hint}")
-    if rejection is not None:
-        return f"kanban: goal {handoff} of {tid} rejected by judge: {rejection}. {continue_hint}"
+    decision = review_readiness_decision(metadata)
+    if decision.outcome == "reject":
+        return f"kanban: {decision.code}: {decision.message}"
     return None
 
 
@@ -889,10 +867,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
-            gate_err = _goal_gate_error(
-                conn, tid, (summary or args.result or "").strip(), "completion",
-                "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
-                "Provide evidence matching the task's acceptance criteria.")
+            gate_err = _goal_completion_gate_error(
+                conn, tid, (summary or args.result or "").strip())
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
@@ -1035,10 +1011,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        gate_err = _goal_gate_error(
-            conn, tid, summary or "", "review handoff",
-            "Record the block with kanban block instead of requesting review.",
-            "Provide acceptance evidence matching the task.")
+        gate_err = _goal_review_readiness_error(kb.get_task(conn, tid), metadata)
         if gate_err:
             return _err(gate_err)
         ok, reason = kb.request_review(

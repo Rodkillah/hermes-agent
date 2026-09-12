@@ -1956,6 +1956,38 @@ def _append_event(
     )
 
 
+def append_idempotent_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: dict,
+    *,
+    idempotency_field: str,
+    run_id: Optional[int] = None,
+) -> bool:
+    """Atomically append an event unless its payload key already exists for the task/kind."""
+    key_value = payload.get(idempotency_field)
+    if not isinstance(key_value, str) or not key_value:
+        raise ValueError(f"event payload requires non-empty {idempotency_field}")
+    with write_txn(conn):
+        cursor = conn.execute(
+            """
+            INSERT INTO task_events (task_id, run_id, kind, payload, created_at)
+            SELECT ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM task_events
+                WHERE task_id = ? AND kind = ?
+                  AND json_extract(payload, ?) = ?
+            )
+            """,
+            (
+                task_id, run_id, kind, _json_or_null(payload), int(time.time()),
+                task_id, kind, f"$.{idempotency_field}", key_value,
+            ),
+        )
+        return cursor.rowcount == 1
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,

@@ -385,56 +385,30 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
-def _goal_judge_available() -> bool:
-    """``judge_goal`` fails open (no auxiliary model -> ``"continue"``), which is
-    indistinguishable from "not done yet" and would wedge every goal_mode
-    worker; so the gate is enforced only when a judge is actually reachable."""
+
+def _goal_gate(conn, task, tid: str, evidence: str) -> None:
+    """Apply the shared completion policy and durable fail-open audit."""
+    from hermes_cli.kanban_goal_gate import GoalGateAuditUnavailable, run_completion_gate
+
     try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return False
-    return client is not None and bool(model)
+        decision = run_completion_gate(
+            conn, task, evidence, run_id=_worker_run_id(tid), judge=judge_goal,
+        )
+    except GoalGateAuditUnavailable as exc:
+        raise _Reject(str(exc)) from exc
+    if decision.outcome == "reject":
+        raise _Reject(f"{decision.code}: {decision.message}")
 
 
-# Per-tool guidance for a judge rejection: verdict -> message. ``{reason}``/``{tid}`` are filled in.
-_GOAL_GATE_MESSAGES = {
-    "kanban_complete": {
-        "blocked": (
-            "Goal completion rejected: judge ruled the goal unachievable — {reason}. The task "
-            "will NOT complete silently. Either re-scope the task with kanban_edit, or record "
-            "the block with kanban_block and hand the decision to a human / reviewer."),
-        "continue": (
-            "Goal completion rejected by judge: {reason}. To proceed, either: (1) provide "
-            "explicit acceptance evidence in your summary matching the task's criteria, or (2) "
-            "create continuation tasks with parents=[{tid}] and keep this task alive.")},
-    "kanban_request_review": {
-        "blocked": (
-            "Goal review handoff rejected: judge ruled the goal unachievable — {reason}. "
-            "Record the block with kanban_block instead of requesting review."),
-        "continue": (
-            "Goal review handoff rejected by judge: {reason}. Provide acceptance evidence "
-            "matching the card before requesting review.")}}
-
-
-def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
-    """Goal-mode pre-handoff judge gate: a worker must not complete / request
-    review before acceptance criteria are met. ``blocked`` gets its own
-    guidance; any other non-``done`` verdict gets the ``continue`` guidance.
-    A broken judge fails open (logged) so it cannot permanently wedge work."""
-    if not task or not task.goal_mode or not _goal_judge_available():
+def _review_readiness_gate(task, metadata: Optional[dict]) -> None:
+    """Goal-mode review entry is deterministic and never invokes the judge."""
+    if not task or not task.goal_mode:
         return
-    try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
-    except Exception as judge_exc:
-        logger.warning(
-            "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
-        return
-    if verdict == "done":
-        return
-    key = "blocked" if verdict == "blocked" else "continue"
-    raise _Reject(_GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid))
+    from hermes_cli.kanban_goal_gate import review_readiness_decision
+
+    decision = review_readiness_decision(metadata)
+    if decision.outcome == "reject":
+        raise _Reject(f"{decision.code}: {decision.message}")
 
 
 # --- Runtime-activity → board bridges (auto-heartbeat, live comment injection) ---
@@ -617,11 +591,10 @@ def _handle_complete(args: dict, **kw) -> str:
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
-        # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
-        # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
-        # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
+        # Goal-mode final-completion judge. Unavailable/unparseable verdicts fail open only
+        # after the shared policy persists a redacted diagnostic event.
         task = kb.get_task(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        _goal_gate(conn, task, tid, (summary or result or "").strip())
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
@@ -709,7 +682,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        _review_readiness_gate(kb.get_task(conn, tid), metadata)
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=_worker_run_id(tid), with_reason=True)
