@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -191,7 +192,11 @@ def test_completion_gate_replay_uses_stable_attempt_identity(audit_board, monkey
         lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
     )
 
+    judge_calls = 0
+
     def unavailable_judge(**_kwargs):
+        nonlocal judge_calls
+        judge_calls += 1
         return "continue", "raw provider failure", False, None, True
 
     def run_once(evidence):
@@ -201,9 +206,9 @@ def test_completion_gate_replay_uses_stable_attempt_identity(audit_board, monkey
                 conn, task, evidence, run_id=run_id, judge=unavailable_judge,
             )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        decisions = list(pool.map(lambda _index: run_once("same proof"), range(2)))
+    decisions = [run_once("same proof"), run_once("same proof")]
     assert all(item.outcome == "allow_with_diagnostic" for item in decisions)
+    assert judge_calls == 1
 
     with kbc.connect() as conn:
         events = [e for e in kb.list_events(conn, tid) if e.kind == "goal_gate_unavailable"]
@@ -213,10 +218,89 @@ def test_completion_gate_replay_uses_stable_attempt_identity(audit_board, monkey
     assert "same proof" not in events[0].payload["attempt_id"]
 
     run_once("corrected proof")
+    assert judge_calls == 2
     with kbc.connect() as conn:
         events = [e for e in kb.list_events(conn, tid) if e.kind == "goal_gate_unavailable"]
     assert len(events) == 2
     assert len({event.payload["attempt_id"] for event in events}) == 2
+
+
+def test_completion_gate_concurrency_calls_judge_once(audit_board, monkeypatch):
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
+    )
+    judge_entered = threading.Event()
+    release_judge = threading.Event()
+    judge_calls = 0
+
+    def unavailable_judge(**_kwargs):
+        nonlocal judge_calls
+        judge_calls += 1
+        judge_entered.set()
+        assert release_judge.wait(timeout=5)
+        return "continue", "raw provider failure", False, None, True
+
+    def run_once():
+        with kbc.connect() as conn:
+            return run_completion_gate(
+                conn, kb.get_task(conn, tid), "same proof", run_id=run_id,
+                judge=unavailable_judge,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(run_once)
+        assert judge_entered.wait(timeout=5)
+        second = pool.submit(run_once)
+        second_decision = second.result(timeout=5)
+        release_judge.set()
+        first_decision = first.result(timeout=5)
+
+    assert judge_calls == 1
+    assert first_decision.outcome == "allow_with_diagnostic"
+    assert second_decision.code == "goal_gate_attempt_in_progress"
+    with kbc.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "goal_gate_unavailable"]
+    assert len(events) == 1
+    assert run_once().outcome == "allow_with_diagnostic"
+    assert judge_calls == 1
+
+
+def test_completion_gate_recovers_abandoned_reservation_without_rejudging(
+    audit_board, monkeypatch,
+):
+    tid, run_id = audit_board
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _purpose: (SimpleNamespace(_hermes_aux_effective_provider="provider"), "model"),
+    )
+    judge_calls = 0
+
+    def interrupted_judge(**_kwargs):
+        nonlocal judge_calls
+        judge_calls += 1
+        raise KeyboardInterrupt("simulated process death")
+
+    with pytest.raises(KeyboardInterrupt, match="simulated process death"):
+        with kbc.connect() as conn:
+            run_completion_gate(
+                conn, kb.get_task(conn, tid), "same proof", run_id=run_id,
+                judge=interrupted_judge,
+            )
+
+    monkeypatch.setattr("hermes_cli.kanban_goal_gate.ATTEMPT_RESERVATION_TTL_SECONDS", 0)
+    with kbc.connect() as conn:
+        decision = run_completion_gate(
+            conn, kb.get_task(conn, tid), "same proof", run_id=run_id,
+            judge=interrupted_judge,
+        )
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "goal_gate_unavailable"]
+
+    assert decision.outcome == "allow_with_diagnostic"
+    assert decision.classification == "unavailable"
+    assert judge_calls == 1
+    assert len(events) == 1
 
 
 def test_attempt_identity_ignores_surface_injected_session_metadata():

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -19,6 +20,9 @@ _CREDENTIAL_REMOTE = re.compile(
 _SAFE_IDENTITY = re.compile(r"^[A-Za-z0-9._/-]{1,160}$")
 _SENSITIVE_IDENTITY = re.compile(r"(?:bearer|token|password|secret|credential|auth)", re.IGNORECASE)
 _ATTEMPT_ID = re.compile(r"^[A-Za-z0-9_:-]{1,200}$")
+ATTEMPT_RESERVATION_TTL_SECONDS = 120
+_ATTEMPT_RESERVED_KIND = "goal_gate_attempt_reserved"
+_ATTEMPT_RESULT_KIND = "goal_gate_attempt_result"
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,27 @@ def run_completion_gate(
             "Worker run is stale; completion was not evaluated.",
         )
 
+    attempt_id = new_attempt_id(task.id, run_id, evidence, attempt_metadata)
+    try:
+        reserved = _reserve_attempt(conn, task.id, run_id, attempt_id)
+    except Exception as exc:
+        raise GoalGateAuditUnavailable(
+            "goal_gate_audit_unavailable: completion attempt could not be durably reserved"
+        ) from exc
+    if not reserved:
+        decision = _load_attempt_result(conn, task.id, attempt_id)
+        if decision is None:
+            reserved_at = _reservation_time(conn, task.id, attempt_id)
+            if reserved_at is not None and time.time() - reserved_at >= ATTEMPT_RESERVATION_TTL_SECONDS:
+                decision = unavailable_decision()
+                decision = _persist_or_load_result(conn, task.id, run_id, attempt_id, decision)
+            else:
+                return GateDecision(
+                    "reject", "goal_gate_attempt_in_progress", None,
+                    "This completion attempt is already being evaluated; retry shortly.",
+                )
+        return _audit_if_required(conn, task.id, run_id, attempt_id, decision, None, None)
+
     client = model = None
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
@@ -130,12 +155,24 @@ def run_completion_gate(
                 decision = completion_decision(
                     verdict, reason, bool(transport_failed), bool(parse_failed),
                 )
+    try:
+        decision = _persist_or_load_result(conn, task.id, run_id, attempt_id, decision)
+    except Exception as exc:
+        raise GoalGateAuditUnavailable(
+            "goal_gate_audit_unavailable: completion decision could not be durably recorded"
+        ) from exc
+    return _audit_if_required(conn, task.id, run_id, attempt_id, decision, client, model)
+
+
+def _audit_if_required(
+    conn, task_id: str, run_id: Optional[int], attempt_id: str,
+    decision: GateDecision, client: Any, model: Any,
+) -> GateDecision:
     if decision.outcome != "allow_with_diagnostic":
         return decision
-    attempt_id = new_attempt_id(task.id, run_id, evidence, attempt_metadata)
     try:
         record_unavailable_audit(
-            conn, task_id=task.id, run_id=run_id, attempt_id=attempt_id,
+            conn, task_id=task_id, run_id=run_id, attempt_id=attempt_id,
             classification=decision.classification or "parse", client=client, model=model,
         )
     except Exception as exc:
@@ -144,6 +181,79 @@ def run_completion_gate(
             "fail-open override could not be durably audited; completion was not attempted"
         ) from exc
     return decision
+
+
+def _attempt_payload(conn, task_id: str, kind: str, attempt_id: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "AND json_extract(payload, '$.attempt_id') = ? ORDER BY id LIMIT 1",
+        (task_id, kind, attempt_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _reserve_attempt(conn, task_id: str, run_id: Optional[int], attempt_id: str) -> bool:
+    from hermes_cli import kanban_db as kb
+
+    return kb.append_idempotent_event(
+        conn, task_id, _ATTEMPT_RESERVED_KIND,
+        {"attempt_id": attempt_id, "reserved_at": time.time(), "policy_version": POLICY_VERSION},
+        idempotency_field="attempt_id", run_id=run_id,
+    )
+
+
+def _reservation_time(conn, task_id: str, attempt_id: str) -> Optional[float]:
+    payload = _attempt_payload(conn, task_id, _ATTEMPT_RESERVED_KIND, attempt_id)
+    try:
+        return float(payload["reserved_at"]) if payload is not None else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _load_attempt_result(conn, task_id: str, attempt_id: str) -> Optional[GateDecision]:
+    payload = _attempt_payload(conn, task_id, _ATTEMPT_RESULT_KIND, attempt_id)
+    if payload is None:
+        return None
+    outcome = payload.get("outcome")
+    code = payload.get("code")
+    classification = payload.get("classification")
+    message = payload.get("message", "")
+    if not isinstance(outcome, str) or not isinstance(code, str):
+        return None
+    if classification is not None and not isinstance(classification, str):
+        return None
+    return GateDecision(outcome, code, classification, message if isinstance(message, str) else "")
+
+
+def _persist_or_load_result(
+    conn, task_id: str, run_id: Optional[int], attempt_id: str, decision: GateDecision,
+) -> GateDecision:
+    from hermes_cli import kanban_db as kb
+
+    inserted = kb.append_idempotent_event(
+        conn, task_id, _ATTEMPT_RESULT_KIND,
+        {
+            "attempt_id": attempt_id,
+            "outcome": decision.outcome,
+            "code": decision.code,
+            "classification": decision.classification,
+            "message": decision.message,
+            "policy_version": POLICY_VERSION,
+        },
+        idempotency_field="attempt_id", run_id=run_id,
+    )
+    if inserted:
+        return decision
+    persisted = _load_attempt_result(conn, task_id, attempt_id)
+    if persisted is None:
+        raise RuntimeError("goal gate attempt result is unreadable")
+    return persisted
 
 
 def _nonempty(value: Any) -> bool:
