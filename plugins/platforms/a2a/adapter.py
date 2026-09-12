@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
-from gateway.platforms._shared import coerce_port as _to_int, profile_scoped as _profile_scoped
+from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
 
 from . import protocol, security
 
@@ -103,7 +103,7 @@ def _positive_float(value: Any, default: float) -> float:
 
 def _default_agent_name() -> str:
     # Scope-aware: a secondary multiplex profile must not borrow the default profile's A2A_AGENT_NAME.
-    name = "" if _profile_scoped() else os.getenv("A2A_AGENT_NAME", "").strip()
+    name = _get_scoped_secret("A2A_AGENT_NAME", "").strip()
     if name:
         return name
     try:
@@ -326,7 +326,7 @@ class A2AAdapter(BasePlatformAdapter):
         # config-over-env precedence, while preserving None (dynamic registry
         # discovery) and [] (an intentional empty allowlist) as distinct values.
         self._security_context = security.A2ASecurityContext.capture()
-        _port_env = None if _profile_scoped() else os.getenv("A2A_PORT")
+        _port_env = _get_scoped_secret("A2A_PORT")
         self.port = int(_port_env or extra.get("port", _DEFAULT_PORT))
         self.host = self._security_context.resolve_bind_host()
         self.agent_name = _default_agent_name()
@@ -335,11 +335,9 @@ class A2AAdapter(BasePlatformAdapter):
             advertised = extra.get("advertised_toolsets")
         elif self._iron_rod_mode:
             advertised = []
-        elif _profile_scoped():
-            advertised = None
         else:
-            raw_advertised = os.getenv("A2A_ADVERTISED_TOOLSETS")
-            advertised = None if raw_advertised is None else raw_advertised.split(",")
+            raw_advertised = _get_scoped_secret("A2A_ADVERTISED_TOOLSETS", "")
+            advertised = None if raw_advertised == "" else raw_advertised.split(",")
         advertised_values = advertised if isinstance(advertised, (list, tuple)) else [advertised]
         self._advertised_toolsets = None if advertised is None else [
             str(t).strip() for t in advertised_values if str(t).strip()
@@ -368,6 +366,7 @@ class A2AAdapter(BasePlatformAdapter):
             threading.BoundedSemaphore(_bounded_int(concurrency, 1))
             if concurrency is not None else None
         )
+
         self._active_profile = _active_profile_name()
         self._agents = self._load_served_agents(extra)
         self._httpd: Optional[ThreadingHTTPServer] = None
@@ -459,7 +458,7 @@ class A2AAdapter(BasePlatformAdapter):
             cfg = cfg if isinstance(cfg, dict) else {}
             raw = cfg.get("a2a_served_agents") or (cfg.get("a2a") or {}).get("served_agents")
         # Scope-aware like port: a secondary profile must not inherit A2A_AGENT_DESCRIPTION.
-        default_desc = _DEFAULT_DESCRIPTION if _profile_scoped() else os.getenv("A2A_AGENT_DESCRIPTION", _DEFAULT_DESCRIPTION)
+        default_desc = _get_scoped_secret("A2A_AGENT_DESCRIPTION", _DEFAULT_DESCRIPTION)
         agents: dict[str, dict] = {"": {
             "slug": "", "path": "", "tenant": "", "profile": self._active_profile,
             "local": not _bool_setting(extra.get("forward_active_profile")),
