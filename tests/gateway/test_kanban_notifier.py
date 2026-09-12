@@ -897,3 +897,41 @@ def test_default_notify_target_delivers_terminal_event(tmp_path, monkeypatch):
     runner._active_profile_name = lambda: "forge"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 1
+
+
+def test_default_notify_target_delivers_blocked_needs_input(tmp_path, monkeypatch):
+    """The exact original bug: a card created without a session channel must still
+    notify Forge on a ``blocked/needs_input`` event via the configured default target."""
+    db_path = tmp_path / "default-target-blocked.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: telegram\n"
+        "      chat_id: forge-chat\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: forge\n"
+        "      delivery_mode: notify+wake\n"
+    )
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="forge blocked", assignee="worker")
+        assert len(kbn.list_notify_subs(conn, tid)) == 1
+        kb.block_task(conn, tid, reason="needs human decision", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "blocked" in adapter.sent[0]["text"]
