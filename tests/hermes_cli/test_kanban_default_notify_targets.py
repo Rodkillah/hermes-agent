@@ -483,6 +483,29 @@ def test_create_uses_opened_board_metadata_and_parent_tenant(
     assert ambient_project not in (child.project_id, child.workspace_path)
 
 
+def test_create_uses_opened_board_default_workdir_when_ambient_differs(
+    kanban_home, monkeypatch, tmp_path
+):
+    target_workdir = tmp_path / "target-workdir"
+    ambient_workdir = tmp_path / "ambient-workdir"
+    target_workdir.mkdir()
+    ambient_workdir.mkdir()
+    kb.create_board("target", default_workdir=str(target_workdir))
+    kb.create_board("ambient", default_workdir=str(ambient_workdir))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("target") / "kanban.db"))
+
+    with kb.scoped_current_board("ambient"), kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="target directory", workspace_kind="dir"
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    workspace_path = task.workspace_path
+    assert workspace_path == str(target_workdir)
+    assert str(ambient_workdir) not in (workspace_path or "")
+
+
 def test_create_rejects_api_server_target_atomically(kanban_home):
     private_route = "PRIVATE-API-SESSION"
     _write_config(kanban_home, [

@@ -117,6 +117,55 @@ def test_unowned_routed_subscription_delivers_once_without_dispatch_lock(tmp_pat
     assert not collect(runner)
 
 
+def test_ownerless_route_uses_declared_bot_profile_transport(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    other = RecordingAdapter()
+    runner._profile_adapters["other"] = {Platform.DISCORD: other}  # type: ignore[dict-item]
+    runner.config.profile_routes = parse_profile_routes([
+        dict(
+            platform="discord", guild_id="guild", chat_id="parent",
+            profile="yuki", bot_profile="other",
+        ),
+    ])
+    task = completion(profile=None, mode="notify")
+
+    rows = collect(runner)
+    assert [row["task"].id for row in rows] == [task]
+    asyncio.run(deliver(runner, rows))
+
+    assert getattr(primary, "sent") == []
+    assert len(other.sent) == 1
+    assert not unseen(task)
+
+
+def test_ownerless_wake_uses_routed_profile_and_runtime_scope(tmp_path, monkeypatch):
+    from hermes_constants import get_hermes_home
+
+    runner = setup_runner(tmp_path, monkeypatch)
+    home = tmp_path / ".hermes"
+    observed = []
+
+    class ScopedAdapter(RecordingAdapter):
+        async def handle_message(self, event):
+            await asyncio.sleep(0)
+            observed.append((event.source.profile, get_hermes_home()))
+            await super().handle_message(event)
+
+    primary = ScopedAdapter()
+    runner.adapters[Platform.DISCORD] = primary  # type: ignore[assignment]
+    task = completion(profile=None)
+
+    rows = collect(runner)
+    assert [row["task"].id for row in rows] == [task]
+    asyncio.run(deliver(runner, rows))
+
+    assert len(primary.sent) == len(primary.handled) == 1
+    assert observed == [("yuki", home / "profiles" / "yuki")]
+    assert not unseen(task)
+    assert not collect(runner)
+
+
 def test_route_denials_leave_events_retryable_at_claim_and_send(tmp_path, monkeypatch):
     runner = setup_runner(tmp_path, monkeypatch)
     primary = runner.adapters[Platform.DISCORD]

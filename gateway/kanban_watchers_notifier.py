@@ -98,17 +98,25 @@ def _platform_names(mapping: Any) -> set[str]:
     return {getattr(platform, "value", str(platform)).lower() for platform in mapping}
 
 
-def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profile: Optional[str]) -> Any:
-    """Resolve a durable route without turning a missing secondary bot into primary authority."""
+def _resolve_subscription_route(
+    runner: Any, platform: Any, sub: dict, owner_profile: Optional[str]
+) -> Optional[tuple[Any, Optional[str], Optional[str]]]:
+    """Return ``(adapter, runtime profile, adapter profile)`` for one durable row.
+
+    Ownerless rows carry no transport identity. Under multiplex, derive it from
+    the canonical profile-route matcher and require exactly one viable bot; a
+    missing anchor or competing bot leaves the claim retryable.
+    """
     config = getattr(runner, "config", None)
     adapter = runner._authorization_adapter(platform, owner_profile)
     if not getattr(config, "multiplex_profiles", False):
-        return adapter
+        return (adapter, owner_profile, None) if adapter is not None else None
+
     primary = runner.adapters.get(platform)
     if owner_profile and adapter is not None and adapter is not primary:
-        return adapter
-    profile_adapters = getattr(runner, "_profile_adapters", {}) or {}
-    primary_profile = getattr(runner, "_primary_profile_name", None) or runner._active_profile_name()
+        registered, adapter_profile = runner._owning_profile(adapter, platform)
+        return (adapter, owner_profile, adapter_profile) if registered else None
+
     metadata = sub.get("delivery_metadata") or {}
     guild = metadata.get("scope_id") or metadata.get("guild_id")
     parent = metadata.get("parent_chat_id")
@@ -116,35 +124,69 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     thread_like = bool(thread) or (sub.get("chat_type") or metadata.get("chat_type")) in {
         "thread", "forum", "forum_post", "forum-post", "topic",
     }
-    # Preserve canonical route order, including equal-specificity ties. An older
-    # row missing an anchor must not skip a potentially winning route. Reuse the
-    # route's matcher (including platform-specific identity aliases), not a second
-    # hand-maintained equality implementation. Ownerless rows derive authority
-    # from the exact route rather than whichever profile happens to poll first.
+    # For each receiving bot, only its highest-priority exact (or potentially
+    # exact, when the persisted row lacks an anchor) route matters.
+    route_states: dict[Optional[str], tuple[str, Any]] = {}
     for route in getattr(config, "profile_routes", None) or []:
-        if route.matches(platform.value, guild_id=guild, chat_id=chat,
-                         thread_id=thread, parent_chat_id=parent):
-            if owner_profile and route.profile != owner_profile:
-                return None
-            profile = owner_profile or route.profile
-            adapter = runner._authorization_adapter(platform, profile)
-            if adapter is not None and adapter is not primary:
-                return adapter
-            # Empty maps are startup placeholders for route-only profiles; a
-            # connected secondary on ANY platform establishes an independent
-            # credential boundary and may never fall back to the primary bot.
-            if profile_adapters.get(profile):
-                return None
+        bot_profile = route.bot_profile or None
+        if bot_profile in route_states:
+            continue
+        args = dict(
+            platform=platform.value, guild_id=guild, chat_id=chat,
+            thread_id=thread, parent_chat_id=parent, adapter_profile=bot_profile,
+        )
+        if route.matches(**args):
+            route_states[bot_profile] = ("exact", route)
+            continue
+        args["guild_id"] = guild or route.guild_id
+        args["parent_chat_id"] = parent or (route.chat_id if thread_like else None)
+        if route.matches(**args):
+            route_states[bot_profile] = ("uncertain", route)
+
+    if route_states:
+        applicable = [
+            (bot_profile, state, route)
+            for bot_profile, (state, route) in route_states.items()
+            if not owner_profile or route.profile == owner_profile
+        ]
+        if len(applicable) != 1 or applicable[0][1] != "exact":
+            return None
+        bot_profile, _state, route = applicable[0]
+        try:
             from gateway.run import _multiplex_profile_homes
             served = {name for name, _home in _multiplex_profile_homes(config)}
-            return primary if profile in served else None
-        if route.matches(platform.value, guild_id=guild or route.guild_id, chat_id=chat,
-                         thread_id=thread, parent_chat_id=parent or (route.chat_id if thread_like else None)):
+        except Exception:
             return None
-    profile = owner_profile or primary_profile
-    if profile_adapters.get(profile):
+        if route.profile not in served:
+            return None
+        # Shared-bot routes resolve through the runtime profile so
+        # _is_shared_bot_satellite enforces credential-boundary failures.
+        transport_profile = bot_profile or route.profile
+        adapter = runner._authorization_adapter(platform, transport_profile)
+        if adapter is None:
+            return None
+        registered, actual_profile = runner._owning_profile(adapter, platform)
+        actual_profile = actual_profile if actual_profile not in ("", "default") else None
+        if not registered or actual_profile != bot_profile:
+            return None
+        return adapter, route.profile, bot_profile
+
+    # No profile route covers this destination: preserve the legacy owner
+    # subscription, or the primary transport for an ownerless singleton row.
+    adapter = runner._authorization_adapter(platform, owner_profile)
+    if adapter is None:
         return None
-    return primary if profile == primary_profile else None
+    if owner_profile and adapter is primary:
+        primary_profile = (
+            getattr(runner, "_primary_profile_name", None)
+            or runner._active_profile_name()
+        )
+        if owner_profile not in ("default", primary_profile):
+            return None
+    registered, adapter_profile = runner._owning_profile(adapter, platform)
+    if not registered:
+        return None
+    return adapter, owner_profile, adapter_profile
 
 
 # --- Collection (runs in a worker thread) ---
@@ -236,8 +278,12 @@ class _Collector:
                          sub.get("task_id"), platform or "<missing>")
             return None
         from gateway.config import Platform
-        if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile) is None:
+        resolved = _resolve_subscription_route(
+            self.runner, Platform(platform), sub, owner_profile
+        )
+        if resolved is None:
             return None
+        _adapter, runtime_profile, adapter_profile = resolved
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
@@ -247,7 +293,12 @@ class _Collector:
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {
+            "sub": sub, "old_cursor": old_cursor, "cursor": cursor,
+            "events": events, "task": task, "board": slug,
+            "resolved_profile": runtime_profile,
+            "resolved_adapter_profile": adapter_profile,
+        }
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -417,7 +468,9 @@ class _KanbanNotification:
         self.board_slug = d.get("board")
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
-        self.sub_profile = sub.get("notifier_profile") or ""
+        self.persisted_profile = sub.get("notifier_profile") or None
+        self.sub_profile = d.get("resolved_profile") or self.persisted_profile or ""
+        self.adapter_profile = d.get("resolved_adapter_profile")
         self.title = (task.title if task else sub["task_id"])[:120]
         self.board_tag = f"[{self.board_slug}] " if self.board_slug else ""
         # Attribute the ping to the worker that did the work.
@@ -658,12 +711,19 @@ class _KanbanNotification:
             await self.advance()
             return
         # Recheck the exact route after claiming: config/adapters can change between ticks.
-        adapter = _adapter_for_subscription(self.runner, self.plat, self.sub, self.sub_profile or None)
-        if adapter is None:
+        resolved = _resolve_subscription_route(
+            self.runner, self.plat, self.sub, self.persisted_profile
+        )
+        if (
+            resolved is None
+            or (resolved[1] or "") != self.sub_profile
+            or resolved[2] != self.adapter_profile
+        ):
             logger.debug("kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
                          self.platform_str, self.task_id)
             await self.rewind()
             return
+        adapter = resolved[0]
         self.adapter = adapter
         from gateway.wake import adapter_supports_push
         self.is_push_adapter = adapter_supports_push(adapter)
