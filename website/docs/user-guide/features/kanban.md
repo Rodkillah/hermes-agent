@@ -699,7 +699,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
-| `default_notify_targets` | `[]` | Explicit per-board default notification targets applied to every new task created on a matching board (tool + CLI + dashboard), in addition to the creator's auto-subscription. Each entry is a mapping: `board` (required), `platform` (required), `chat_id` (required), `delivery_mode` (required: `notify`/`wake`/`notify+wake`), `notifier_profile` (required for `wake`/`notify+wake`), and optional `thread_id`/`chat_type`/`user_id`/`user_id_alt`/`delivery_metadata`. Empty by default — other installs gain no implicit destination. A non-empty invalid list fails task creation (fail-closed) rather than silently creating an un-notified card. Gated by `auto_subscribe_on_create`. |
+| `default_notify_targets` | `[]` | Explicit per-board default notification targets applied to every new task created on a matching board (tool + CLI + dashboard), in addition to the creator's auto-subscription. Each entry is a mapping: `board` (required), `platform` (required), `chat_id` (required), `delivery_mode` (required: `notify`/`wake`/`notify+wake`), `notifier_profile` (required for `wake`/`notify+wake` and every v2 authority), and optional `bot_profile`/`ping_priority`/`thread_id`/`chat_type`/`user_id`/`user_id_alt`/`delivery_metadata`. Setting `bot_profile` uses the v2 model: one physical route can retain several explicit bot/runtime authorities, while `ping_priority` elects one ping sender. Targets without `bot_profile` retain legacy behavior. Empty by default — other installs gain no implicit destination. A non-empty invalid list fails task creation (fail-closed) rather than silently creating an un-notified card. Gated by `auto_subscribe_on_create`. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 
 Configure a default target with the native config command. Keep private route
@@ -708,7 +708,7 @@ variable instead:
 
 ```bash
 export FORGE_CHAT_ID='<forge-chat-id>'
-hermes config set kanban.default_notify_targets "[{\"board\":\"iron-rod\",\"platform\":\"telegram\",\"chat_id\":\"${FORGE_CHAT_ID}\",\"chat_type\":\"dm\",\"notifier_profile\":\"forge\",\"delivery_mode\":\"notify+wake\"}]"
+hermes config set kanban.default_notify_targets "[{\"board\":\"iron-rod\",\"platform\":\"telegram\",\"chat_id\":\"${FORGE_CHAT_ID}\",\"chat_type\":\"dm\",\"bot_profile\":\"forge\",\"notifier_profile\":\"forge\",\"delivery_mode\":\"notify+wake\",\"ping_priority\":100}]"
 unset FORGE_CHAT_ID
 hermes config get kanban.default_notify_targets --json
 ```
@@ -719,6 +719,25 @@ creation fails before writing a task or subscription. `api_server` is excluded
 from persistent default targets because its request/response adapter cannot push
 a notification; direct ephemeral API wake subscriptions remain supported.
 
+Before enabling v2 defaults on a board with legacy subscriptions, map each
+backfilled legacy `subscription_id` to the gateway profile proven to own its
+transport credential. The local mapping contains no credential, but it can reveal
+routing ownership, so keep it mode `0600`. Migration is additive, transactional,
+and idempotent; dry-run and apply output only aggregate counts.
+
+```bash
+umask 077
+printf '%s\n' '[{"subscription_id":"<legacy-subscription-id>","bot_profile":"forge"}]' > /tmp/kanban-notify-authorities.json
+chmod 600 /tmp/kanban-notify-authorities.json
+hermes kanban notify-migrate-authorities --board iron-rod --mapping-file /tmp/kanban-notify-authorities.json --dry-run --json
+hermes kanban notify-migrate-authorities --board iron-rod --mapping-file /tmp/kanban-notify-authorities.json --apply --json
+```
+
+Do not apply until `unmapped` and `ambiguous` are both zero. An ownerless legacy
+row additionally needs an explicit `notifier_profile` in its mapping entry. Once
+linked, the legacy row remains as an inert rollback projection while the notifier
+uses the v2 route and authority tables.
+
 Rollback default targets for future task creation without disabling creator-session
 auto-subscription:
 
@@ -728,8 +747,14 @@ hermes config set kanban.auto_subscribe_on_create true
 hermes config get kanban.default_notify_targets --json
 ```
 
-Existing subscriptions are intentionally retained; remove one explicitly with
-`hermes kanban notify-unsubscribe <task-id> --platform telegram --chat-id <forge-chat-id>`.
+Existing authorities are intentionally retained. Inspect them with
+`hermes kanban --board iron-rod notify-list <task-id> --json`. Remove one v2
+authority by its complete bot/runtime identity (omitting both profile options
+keeps the legacy unsubscribe behavior):
+
+```bash
+hermes kanban --board iron-rod notify-unsubscribe <task-id> --platform telegram --chat-id <forge-chat-id> --bot-profile forge --notifier-profile forge
+```
 
 And the two auxiliary LLM slots:
 

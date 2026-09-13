@@ -1050,6 +1050,51 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- v2 keeps the physical destination separate from the bots/runtimes allowed to
+-- use it.  The legacy table above remains an inert rollback projection once its
+-- subscription_id is linked from an authority; there are deliberately no
+-- triggers or cascading foreign keys between the two generations.
+CREATE TABLE IF NOT EXISTS kanban_notify_routes (
+    task_id              TEXT NOT NULL,
+    platform             TEXT NOT NULL,
+    chat_id              TEXT NOT NULL,
+    thread_id            TEXT NOT NULL DEFAULT '',
+    route_id              TEXT NOT NULL UNIQUE,
+    ping_subscription_id  TEXT,
+    last_ping_event_id    INTEGER NOT NULL DEFAULT 0,
+    claim_event_id        INTEGER,
+    claim_token           TEXT,
+    claim_expires_at      INTEGER,
+    created_at            INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_notify_authorities (
+    task_id                TEXT NOT NULL,
+    platform               TEXT NOT NULL,
+    chat_id                TEXT NOT NULL,
+    thread_id              TEXT NOT NULL DEFAULT '',
+    bot_profile            TEXT NOT NULL CHECK (bot_profile <> ''),
+    notifier_profile       TEXT NOT NULL CHECK (notifier_profile <> ''),
+    subscription_id        TEXT NOT NULL UNIQUE,
+    legacy_subscription_id TEXT UNIQUE,
+    delivery_mode          TEXT NOT NULL CHECK (delivery_mode IN ('notify', 'notify+wake', 'wake')),
+    ping_priority          INTEGER NOT NULL DEFAULT 0 CHECK (typeof(ping_priority) = 'integer'),
+    source_kind            TEXT NOT NULL CHECK (source_kind IN ('default', 'creator', 'inherited', 'manual', 'legacy')),
+    user_id                TEXT,
+    user_id_alt            TEXT,
+    chat_type              TEXT,
+    delivery_metadata      TEXT,
+    last_wake_event_id      INTEGER NOT NULL DEFAULT 0,
+    claim_event_id          INTEGER,
+    claim_token             TEXT,
+    claim_expires_at        INTEGER,
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (
+        task_id, platform, chat_id, thread_id, bot_profile, notifier_profile
+    )
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1093,6 +1138,19 @@ CREATE TABLE IF NOT EXISTS production_probes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_routes_task    ON kanban_notify_routes(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_routes_claim   ON kanban_notify_routes(claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_notify_authorities_task ON kanban_notify_authorities(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_authorities_bot ON kanban_notify_authorities(bot_profile);
+CREATE INDEX IF NOT EXISTS idx_notify_authorities_runtime ON kanban_notify_authorities(notifier_profile);
+CREATE INDEX IF NOT EXISTS idx_notify_authorities_claim ON kanban_notify_authorities(claim_expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_authorities_legacy
+    ON kanban_notify_authorities(legacy_subscription_id)
+    WHERE legacy_subscription_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_authorities_wake_runtime
+    ON kanban_notify_authorities(
+        task_id, platform, chat_id, thread_id, notifier_profile
+    ) WHERE delivery_mode IN ('wake', 'notify+wake');
 CREATE INDEX IF NOT EXISTS idx_production_probes_receipt ON production_probes(receipt_id, ordinal);
 """
 
@@ -1534,12 +1592,18 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                from hermes_cli import kanban_db_notify as _kbn
+                _kbn.inherit_notify_authorities(
+                    conn,
+                    task_id=task_id,
+                    creator_task_id=creator_task_id,
+                    parent_ids=parents,
+                )
                 # Configured default notify targets (kanban.default_notify_targets),
                 # applied in the same transaction after creator/parent inheritance so
                 # an identical route already owned by the creator/parent wins and the
                 # default target is treated as satisfied (no destructive overwrite).
                 if default_targets:
-                    from hermes_cli import kanban_db_notify as _kbn
                     _kbn.apply_default_notify_targets(
                         conn, task_id=task_id, board=board_slug, targets=default_targets)
             return task_id
@@ -3708,7 +3772,14 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in (
+        "kanban_notify_authorities",
+        "kanban_notify_routes",
+        "task_comments",
+        "task_events",
+        "task_runs",
+        "kanban_notify_subs",
+    ):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
     receipt = conn.execute(
         "SELECT id FROM production_receipts WHERE task_id = ?", (task_id,)

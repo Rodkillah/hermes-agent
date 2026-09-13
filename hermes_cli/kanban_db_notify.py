@@ -25,6 +25,11 @@ if TYPE_CHECKING:
 # Notifier reaction to a terminal event: "notify" = passive adapter.send only
 # (default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
 _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
+_V2_DEFAULT_EVENT_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "archived", "unblocked", "block_loop_detected", "block_loop_resolved",
+    "review_requested", "changes_requested", "production_promoted",
+)
 
 _SCALAR_TYPES = (str, int, float, bool)
 
@@ -147,12 +152,850 @@ def add_notify_sub(
             )
 
 
+# --- v2 physical routes + explicit bot/runtime authorities ---
+
+_V2_SOURCE_KINDS = ("default", "creator", "inherited", "manual", "legacy")
+_V2_ROUTE_WHERE = "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
+_V2_AUTHORITY_WHERE = (
+    _V2_ROUTE_WHERE + " AND bot_profile = ? AND notifier_profile = ?"
+)
+
+
+def _v2_route_key(
+    task_id: str, platform: str, chat_id: str, thread_id: Optional[str]
+) -> tuple[str, str, str, str]:
+    return task_id, platform, chat_id, thread_id or ""
+
+
+def _normalize_v2_platform(platform: Any, delivery_mode: str) -> str:
+    try:
+        from gateway.config import Platform
+        normalized = Platform(str(platform).strip().lower()).value
+    except Exception:
+        raise ValueError("notification authority has unsupported platform") from None
+    if normalized == Platform.API_SERVER.value and delivery_mode != "wake":
+        raise ValueError("notification authority platform cannot push notifications")
+    return normalized
+
+
+def _validate_v2_authority(
+    *, platform: Any, bot_profile: Any, notifier_profile: Any,
+    delivery_mode: Any, ping_priority: Any, source_kind: Any,
+) -> tuple[str, str, str, str, int, str]:
+    mode = str(delivery_mode or "").strip()
+    if mode not in _NOTIFY_DELIVERY_MODES:
+        raise ValueError("notification authority has unsupported delivery_mode")
+    normalized_platform = _normalize_v2_platform(platform, mode)
+    bot = str(bot_profile or "").strip()
+    runtime = str(notifier_profile or "").strip()
+    if not bot or not runtime:
+        raise ValueError("notification authority requires bot_profile and notifier_profile")
+    if isinstance(ping_priority, bool):
+        raise ValueError("notification authority ping_priority must be an integer")
+    try:
+        priority = int(ping_priority)
+    except (TypeError, ValueError):
+        raise ValueError("notification authority ping_priority must be an integer") from None
+    source = str(source_kind or "").strip()
+    if source not in _V2_SOURCE_KINDS:
+        raise ValueError("notification authority has unsupported source_kind")
+    return normalized_platform, bot, runtime, mode, priority, source
+
+
+def _current_task_event_id(conn: sqlite3.Connection, task_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return int(row["cursor"] if row is not None else 0)
+
+
+def _refresh_ping_election(conn: sqlite3.Connection, route_key: tuple) -> None:
+    route = conn.execute(
+        "SELECT route_id, ping_subscription_id FROM kanban_notify_routes "
+        + _V2_ROUTE_WHERE,
+        route_key,
+    ).fetchone()
+    if route is None:
+        return
+    candidates = conn.execute(
+        "SELECT subscription_id, ping_priority FROM kanban_notify_authorities "
+        + _V2_ROUTE_WHERE
+        + " AND delivery_mode IN ('notify', 'notify+wake') "
+        "ORDER BY ping_priority DESC",
+        route_key,
+    ).fetchall()
+    elected = None
+    if candidates:
+        highest = int(candidates[0]["ping_priority"])
+        winners = [row for row in candidates if int(row["ping_priority"]) == highest]
+        if len(winners) == 1:
+            elected = winners[0]["subscription_id"]
+    if route["ping_subscription_id"] == elected:
+        return
+    conn.execute(
+        "UPDATE kanban_notify_routes SET route_id = ?, ping_subscription_id = ?, "
+        "claim_event_id = NULL, claim_token = NULL, claim_expires_at = NULL "
+        + _V2_ROUTE_WHERE,
+        (uuid.uuid4().hex, elected, *route_key),
+    )
+
+
+def _assert_v2_authority_constraints(
+    conn: sqlite3.Connection,
+    *,
+    route_key: tuple[str, str, str, str],
+    bot_profile: str,
+    notifier_profile: str,
+    delivery_mode: str,
+    ping_priority: int,
+) -> None:
+    """Validate the proposed authority against the route's future state."""
+    others = conn.execute(
+        "SELECT bot_profile, notifier_profile, delivery_mode, ping_priority "
+        "FROM kanban_notify_authorities " + _V2_ROUTE_WHERE
+        + " AND NOT (bot_profile = ? AND notifier_profile = ?)",
+        (*route_key, bot_profile, notifier_profile),
+    ).fetchall()
+    if delivery_mode in ("wake", "notify+wake") and any(
+        row["notifier_profile"] == notifier_profile
+        and row["delivery_mode"] in ("wake", "notify+wake")
+        for row in others
+    ):
+        raise ValueError("notification wake runtime already has an authority on this route")
+
+    priorities = [
+        int(row["ping_priority"])
+        for row in others
+        if row["delivery_mode"] in ("notify", "notify+wake")
+    ]
+    if delivery_mode in ("notify", "notify+wake"):
+        priorities.append(ping_priority)
+    if priorities:
+        highest = max(priorities)
+        if priorities.count(highest) > 1:
+            raise ValueError("notification route has ambiguous ping priority")
+
+
+def add_notify_authority(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    bot_profile: str,
+    notifier_profile: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    delivery_mode: str = "notify",
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+    ping_priority: int = 0,
+    source_kind: str = "manual",
+    legacy_subscription_id: Optional[str] = None,
+    start_ping_cursor: Optional[int] = None,
+    start_wake_cursor: Optional[int] = None,
+) -> str:
+    """Create or update one explicit v2 authority and return its durable lease.
+
+    The route remains unique at the physical destination.  A byte-identical call
+    preserves both route and authority leases; a durable authority change rotates
+    the authority lease and, when election changes, the route lease.  A legacy
+    row on the same route must be explicitly linked before v2 can share it.
+    """
+    platform, bot_profile, notifier_profile, delivery_mode, ping_priority, source_kind = (
+        _validate_v2_authority(
+            platform=platform, bot_profile=bot_profile,
+            notifier_profile=notifier_profile, delivery_mode=delivery_mode,
+            ping_priority=ping_priority, source_kind=source_kind,
+        )
+    )
+    chat_id = str(chat_id or "").strip()
+    if not task_id or not chat_id:
+        raise ValueError("notification authority requires task_id and chat_id")
+    route_key = _v2_route_key(task_id, platform, chat_id, thread_id)
+    authority_key = (*route_key, bot_profile, notifier_profile)
+    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+    legacy_subscription_id = str(legacy_subscription_id or "").strip() or None
+    now = int(time.time())
+
+    with _kb.write_txn(conn, allow_nested=True):
+        unlinked = conn.execute(
+            "SELECT s.subscription_id FROM kanban_notify_subs s "
+            + _V2_ROUTE_WHERE.replace("WHERE", "WHERE s.", 1)
+            .replace(" AND ", " AND s.")
+            + " AND NOT EXISTS (SELECT 1 FROM kanban_notify_authorities a "
+            "WHERE a.legacy_subscription_id = s.subscription_id)",
+            route_key,
+        ).fetchone()
+        if unlinked is not None and unlinked["subscription_id"] != legacy_subscription_id:
+            raise ValueError("notification route has an unlinked legacy subscription")
+        _assert_v2_authority_constraints(
+            conn,
+            route_key=route_key,
+            bot_profile=bot_profile,
+            notifier_profile=notifier_profile,
+            delivery_mode=delivery_mode,
+            ping_priority=ping_priority,
+        )
+
+        current_cursor = _current_task_event_id(conn, task_id)
+        ping_cursor = current_cursor if start_ping_cursor is None else int(start_ping_cursor)
+        wake_cursor = current_cursor if start_wake_cursor is None else int(start_wake_cursor)
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_notify_routes "
+            "(task_id, platform, chat_id, thread_id, route_id, created_at, last_ping_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (*route_key, uuid.uuid4().hex, now, ping_cursor),
+        )
+        if start_ping_cursor is not None:
+            conn.execute(
+                "UPDATE kanban_notify_routes SET last_ping_event_id = "
+                "MAX(last_ping_event_id, ?) " + _V2_ROUTE_WHERE,
+                (ping_cursor, *route_key),
+            )
+
+        existing = conn.execute(
+            "SELECT * FROM kanban_notify_authorities " + _V2_AUTHORITY_WHERE,
+            authority_key,
+        ).fetchone()
+        durable = (
+            delivery_mode, ping_priority, source_kind, user_id, user_id_alt,
+            chat_type or "dm", metadata_json, legacy_subscription_id,
+        )
+        if existing is None:
+            subscription_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO kanban_notify_authorities "
+                "(task_id, platform, chat_id, thread_id, bot_profile, notifier_profile, "
+                "subscription_id, legacy_subscription_id, delivery_mode, ping_priority, "
+                "source_kind, user_id, user_id_alt, chat_type, delivery_metadata, "
+                "last_wake_event_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*authority_key, subscription_id, legacy_subscription_id, delivery_mode,
+                 ping_priority, source_kind, user_id, user_id_alt, chat_type or "dm",
+                 metadata_json, wake_cursor, now),
+            )
+        else:
+            old_durable = (
+                existing["delivery_mode"], int(existing["ping_priority"]),
+                existing["source_kind"], existing["user_id"], existing["user_id_alt"],
+                existing["chat_type"], existing["delivery_metadata"],
+                existing["legacy_subscription_id"],
+            )
+            subscription_id = existing["subscription_id"]
+            if old_durable != durable:
+                subscription_id = uuid.uuid4().hex
+                conn.execute(
+                    "UPDATE kanban_notify_authorities SET subscription_id = ?, "
+                    "legacy_subscription_id = ?, delivery_mode = ?, ping_priority = ?, "
+                    "source_kind = ?, user_id = ?, user_id_alt = ?, chat_type = ?, "
+                    "delivery_metadata = ?, claim_event_id = NULL, claim_token = NULL, "
+                    "claim_expires_at = NULL " + _V2_AUTHORITY_WHERE,
+                    (subscription_id, legacy_subscription_id, delivery_mode, ping_priority,
+                     source_kind, user_id, user_id_alt, chat_type or "dm", metadata_json,
+                     *authority_key),
+                )
+        _refresh_ping_election(conn, route_key)
+        return str(subscription_id)
+
+
+def list_notify_routes(
+    conn: sqlite3.Connection, task_id: Optional[str] = None
+) -> list[dict]:
+    sql = "SELECT * FROM kanban_notify_routes"
+    params: tuple = ()
+    if task_id is not None:
+        sql += " WHERE task_id = ?"
+        params = (task_id,)
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def list_notify_authorities(
+    conn: sqlite3.Connection, task_id: Optional[str] = None
+) -> list[dict]:
+    sql = "SELECT * FROM kanban_notify_authorities"
+    params: tuple = ()
+    if task_id is not None:
+        sql += " WHERE task_id = ?"
+        params = (task_id,)
+    out = []
+    for row in conn.execute(sql, params).fetchall():
+        item = dict(row)
+        item["delivery_metadata"] = _decode_notify_delivery_metadata(
+            item.get("delivery_metadata")
+        )
+        out.append(item)
+    return out
+
+
+def remove_notify_authority(
+    conn: sqlite3.Connection, *, subscription_id: str
+) -> bool:
+    """Remove exactly one current authority lease and collect an empty route."""
+    with _kb.write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT * FROM kanban_notify_authorities WHERE subscription_id = ?",
+            (subscription_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        route_key = _v2_route_key(
+            row["task_id"], row["platform"], row["chat_id"], row["thread_id"]
+        )
+        cur = conn.execute(
+            "DELETE FROM kanban_notify_authorities WHERE subscription_id = ?",
+            (subscription_id,),
+        )
+        legacy_id = row["legacy_subscription_id"]
+        if legacy_id:
+            conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE subscription_id = ?",
+                (legacy_id,),
+            )
+        remaining = conn.execute(
+            "SELECT 1 FROM kanban_notify_authorities " + _V2_ROUTE_WHERE + " LIMIT 1",
+            route_key,
+        ).fetchone()
+        if remaining is None:
+            conn.execute(
+                "DELETE FROM kanban_notify_routes " + _V2_ROUTE_WHERE,
+                route_key,
+            )
+        else:
+            _refresh_ping_election(conn, route_key)
+        return bool(cur.rowcount)
+
+
+def remove_notify_authority_by_identity(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    bot_profile: str,
+    notifier_profile: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Remove one v2 authority by its complete public identity."""
+    platform, bot_profile, notifier_profile, _mode, _priority, _source = (
+        _validate_v2_authority(
+            platform=platform,
+            bot_profile=bot_profile,
+            notifier_profile=notifier_profile,
+            delivery_mode="wake",
+            ping_priority=0,
+            source_kind="manual",
+        )
+    )
+    key = (
+        *_v2_route_key(task_id, platform, str(chat_id or "").strip(), thread_id),
+        bot_profile,
+        notifier_profile,
+    )
+    with _kb.write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT subscription_id FROM kanban_notify_authorities "
+            + _V2_AUTHORITY_WHERE,
+            key,
+        ).fetchone()
+        if row is None:
+            return False
+        return remove_notify_authority(
+            conn, subscription_id=str(row["subscription_id"])
+        )
+
+
+def _next_v2_event(
+    conn: sqlite3.Connection, *, task_id: str, after_id: int,
+    event_kinds: Optional[Iterable[str]] = None,
+) -> Optional[dict]:
+    kinds = tuple(event_kinds or _V2_DEFAULT_EVENT_KINDS)
+    if not kinds:
+        return None
+    placeholders = ",".join("?" for _ in kinds)
+    row = conn.execute(
+        "SELECT id, task_id, kind, payload, created_at FROM task_events "
+        f"WHERE task_id = ? AND id > ? AND kind IN ({placeholders}) "
+        "ORDER BY id ASC LIMIT 1",
+        (task_id, int(after_id), *kinds),
+    ).fetchone()
+    if row is None:
+        return None
+    event = dict(row)
+    try:
+        event["payload"] = json.loads(event["payload"] or "{}")
+    except (TypeError, ValueError):
+        event["payload"] = {}
+    return event
+
+
+def claim_notify_ping(
+    conn: sqlite3.Connection,
+    *,
+    route_id: str,
+    event_kinds: Optional[Iterable[str]] = None,
+    now: Optional[int] = None,
+    lease_seconds: int = 60,
+) -> Optional[dict]:
+    """Atomically claim the next event for one elected physical ping route."""
+    claimed_at = int(time.time()) if now is None else int(now)
+    expires_at = claimed_at + max(1, int(lease_seconds))
+    with _kb.write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT r.*, a.bot_profile, a.notifier_profile, a.delivery_mode, "
+            "a.subscription_id, a.user_id, a.user_id_alt, a.chat_type, "
+            "a.delivery_metadata FROM kanban_notify_routes r "
+            "JOIN kanban_notify_authorities a "
+            "ON a.subscription_id = r.ping_subscription_id "
+            "WHERE r.route_id = ? AND a.delivery_mode IN ('notify', 'notify+wake')",
+            (route_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["claim_token"] and int(row["claim_expires_at"] or 0) > claimed_at:
+            return None
+        event = _next_v2_event(
+            conn,
+            task_id=row["task_id"],
+            after_id=int(row["last_ping_event_id"] or 0),
+            event_kinds=event_kinds,
+        )
+        if event is None:
+            return None
+        token = uuid.uuid4().hex
+        cur = conn.execute(
+            "UPDATE kanban_notify_routes SET claim_event_id = ?, claim_token = ?, "
+            "claim_expires_at = ? WHERE route_id = ? "
+            "AND ping_subscription_id = ? "
+            "AND (claim_token IS NULL OR claim_expires_at <= ?)",
+            (event["id"], token, expires_at, route_id,
+             row["ping_subscription_id"], claimed_at),
+        )
+        if cur.rowcount != 1:
+            return None
+        claim = dict(row)
+        claim["delivery_metadata"] = _decode_notify_delivery_metadata(
+            claim.get("delivery_metadata")
+        )
+        claim.update({"flow": "ping", "claim_token": token, "event": event})
+        return claim
+
+
+def claim_notify_wake(
+    conn: sqlite3.Connection,
+    *,
+    subscription_id: str,
+    event_kinds: Optional[Iterable[str]] = None,
+    now: Optional[int] = None,
+    lease_seconds: int = 60,
+) -> Optional[dict]:
+    """Atomically claim the next event for one runtime wake authority."""
+    claimed_at = int(time.time()) if now is None else int(now)
+    expires_at = claimed_at + max(1, int(lease_seconds))
+    with _kb.write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT a.*, r.route_id FROM kanban_notify_authorities a "
+            "JOIN kanban_notify_routes r USING (task_id, platform, chat_id, thread_id) "
+            "WHERE a.subscription_id = ? "
+            "AND a.delivery_mode IN ('wake', 'notify+wake')",
+            (subscription_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["claim_token"] and int(row["claim_expires_at"] or 0) > claimed_at:
+            return None
+        event = _next_v2_event(
+            conn,
+            task_id=row["task_id"],
+            after_id=int(row["last_wake_event_id"] or 0),
+            event_kinds=event_kinds,
+        )
+        if event is None:
+            return None
+        token = uuid.uuid4().hex
+        cur = conn.execute(
+            "UPDATE kanban_notify_authorities SET claim_event_id = ?, "
+            "claim_token = ?, claim_expires_at = ? WHERE subscription_id = ? "
+            "AND (claim_token IS NULL OR claim_expires_at <= ?)",
+            (event["id"], token, expires_at, subscription_id, claimed_at),
+        )
+        if cur.rowcount != 1:
+            return None
+        claim = dict(row)
+        claim["delivery_metadata"] = _decode_notify_delivery_metadata(
+            claim.get("delivery_metadata")
+        )
+        claim.update({"flow": "wake", "claim_token": token, "event": event})
+        return claim
+
+
+def notify_v2_claim_is_current(
+    conn: sqlite3.Connection,
+    *,
+    flow: str,
+    lease_id: str,
+    claim_token: str,
+    event_id: int,
+    now: Optional[int] = None,
+) -> bool:
+    checked_at = int(time.time()) if now is None else int(now)
+    if flow == "ping":
+        table, lease_column = "kanban_notify_routes", "route_id"
+    elif flow == "wake":
+        table, lease_column = "kanban_notify_authorities", "subscription_id"
+    else:
+        return False
+    row = conn.execute(
+        f"SELECT 1 FROM {table} WHERE {lease_column} = ? "
+        "AND claim_token = ? AND claim_event_id = ? AND claim_expires_at > ?",
+        (lease_id, claim_token, int(event_id), checked_at),
+    ).fetchone()
+    return row is not None
+
+
+def _settle_v2_claim(
+    conn: sqlite3.Connection, *, flow: str, lease_id: str,
+    claim_token: str, event_id: int,
+) -> bool:
+    if flow == "ping":
+        table, lease_column, cursor = (
+            "kanban_notify_routes", "route_id", "last_ping_event_id"
+        )
+    elif flow == "wake":
+        table, lease_column, cursor = (
+            "kanban_notify_authorities", "subscription_id", "last_wake_event_id"
+        )
+    else:
+        return False
+    with _kb.write_txn(conn, allow_nested=True):
+        cur = conn.execute(
+            f"UPDATE {table} SET {cursor} = MAX({cursor}, ?), "
+            "claim_event_id = NULL, claim_token = NULL, claim_expires_at = NULL "
+            f"WHERE {lease_column} = ? AND claim_token = ? AND claim_event_id = ?",
+            (int(event_id), lease_id, claim_token, int(event_id)),
+        )
+    return cur.rowcount == 1
+
+
+def _release_v2_claim(
+    conn: sqlite3.Connection, *, flow: str, lease_id: str,
+    claim_token: str, event_id: int,
+) -> bool:
+    if flow == "ping":
+        table, lease_column = "kanban_notify_routes", "route_id"
+    elif flow == "wake":
+        table, lease_column = "kanban_notify_authorities", "subscription_id"
+    else:
+        return False
+    with _kb.write_txn(conn, allow_nested=True):
+        cur = conn.execute(
+            f"UPDATE {table} SET claim_event_id = NULL, claim_token = NULL, "
+            f"claim_expires_at = NULL WHERE {lease_column} = ? "
+            "AND claim_token = ? AND claim_event_id = ?",
+            (lease_id, claim_token, int(event_id)),
+        )
+    return cur.rowcount == 1
+
+
+def settle_notify_ping(
+    conn: sqlite3.Connection, *, route_id: str, claim_token: str, event_id: int
+) -> bool:
+    return _settle_v2_claim(
+        conn, flow="ping", lease_id=route_id,
+        claim_token=claim_token, event_id=event_id,
+    )
+
+
+def settle_notify_wake(
+    conn: sqlite3.Connection, *, subscription_id: str,
+    claim_token: str, event_id: int,
+) -> bool:
+    return _settle_v2_claim(
+        conn, flow="wake", lease_id=subscription_id,
+        claim_token=claim_token, event_id=event_id,
+    )
+
+
+def release_notify_ping(
+    conn: sqlite3.Connection, *, route_id: str, claim_token: str, event_id: int
+) -> bool:
+    return _release_v2_claim(
+        conn, flow="ping", lease_id=route_id,
+        claim_token=claim_token, event_id=event_id,
+    )
+
+
+def release_notify_wake(
+    conn: sqlite3.Connection, *, subscription_id: str,
+    claim_token: str, event_id: int,
+) -> bool:
+    return _release_v2_claim(
+        conn, flow="wake", lease_id=subscription_id,
+        claim_token=claim_token, event_id=event_id,
+    )
+
+
+def inherit_notify_authorities(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    creator_task_id: Optional[str] = None,
+    parent_ids: Iterable[str] = (),
+) -> int:
+    """Copy explicit authorities from creator then parents without overwriting.
+
+    Each copied authority receives a child-local lease and starts after the
+    child's current event cursor. Repeated source identities are first-wins, so
+    creator, parent, and later configured defaults cannot replace each other.
+    """
+    sources: list[tuple[str, str]] = []
+    if creator_task_id:
+        sources.append((creator_task_id, "inherited"))
+    sources.extend((parent_id, "inherited") for parent_id in parent_ids)
+    seen_sources: set[str] = set()
+    seen_keys: set[tuple] = set()
+    inserted = 0
+    cursor = _current_task_event_id(conn, task_id)
+    for source_task_id, source_kind in sources:
+        if not source_task_id or source_task_id in seen_sources:
+            continue
+        seen_sources.add(source_task_id)
+        for authority in list_notify_authorities(conn, source_task_id):
+            key = (
+                task_id, authority["platform"], authority["chat_id"],
+                authority["thread_id"] or "", authority["bot_profile"],
+                authority["notifier_profile"],
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if conn.execute(
+                "SELECT 1 FROM kanban_notify_authorities " + _V2_AUTHORITY_WHERE,
+                key,
+            ).fetchone() is not None:
+                continue
+            add_notify_authority(
+                conn,
+                task_id=task_id,
+                platform=authority["platform"],
+                chat_id=authority["chat_id"],
+                thread_id=authority["thread_id"],
+                user_id=authority["user_id"],
+                user_id_alt=authority["user_id_alt"],
+                chat_type=authority["chat_type"],
+                bot_profile=authority["bot_profile"],
+                notifier_profile=authority["notifier_profile"],
+                delivery_mode=authority["delivery_mode"],
+                delivery_metadata=authority["delivery_metadata"],
+                ping_priority=int(authority["ping_priority"]),
+                source_kind=source_kind,
+                start_ping_cursor=cursor,
+                start_wake_cursor=cursor,
+            )
+            inserted += 1
+    return inserted
+
+
+def migrate_notify_authorities(
+    conn: sqlite3.Connection, *, mappings: Iterable[Mapping[str, Any]], apply: bool = False
+) -> dict[str, int]:
+    """Plan or atomically link every unlinked legacy row to an explicit v2 authority.
+
+    ``mappings`` contains only ``subscription_id``, ``bot_profile`` and, for an
+    ownerless legacy row, ``notifier_profile``.  Counts are intentionally the
+    only result so private route identities never reach dry-run output or logs.
+    Missing or duplicate candidates make the whole apply a no-op.
+    """
+    by_subscription: dict[str, list[Mapping[str, Any]]] = {}
+    for raw in mappings:
+        if not isinstance(raw, Mapping):
+            continue
+        subscription_id = str(raw.get("subscription_id") or "").strip()
+        if subscription_id:
+            by_subscription.setdefault(subscription_id, []).append(raw)
+
+    rows = conn.execute(
+        "SELECT s.* FROM kanban_notify_subs s ORDER BY s.subscription_id"
+    ).fetchall()
+    planned: list[tuple[sqlite3.Row, Mapping[str, Any], str, str]] = []
+    result = {
+        "mappable": 0,
+        "unmapped": 0,
+        "ambiguous": 0,
+        "already_migrated": 0,
+        "applied": 0,
+    }
+    for row in rows:
+        subscription_id = str(row["subscription_id"] or "")
+        linked = conn.execute(
+            "SELECT subscription_id FROM kanban_notify_authorities "
+            "WHERE legacy_subscription_id = ?",
+            (subscription_id,),
+        ).fetchone()
+        if linked is not None:
+            result["already_migrated"] += 1
+            continue
+        candidates = by_subscription.get(subscription_id, [])
+        if len(candidates) > 1:
+            result["ambiguous"] += 1
+            continue
+        if not candidates:
+            result["unmapped"] += 1
+            continue
+        candidate = candidates[0]
+        bot_profile = str(candidate.get("bot_profile") or "").strip()
+        notifier_profile = str(
+            row["notifier_profile"] or candidate.get("notifier_profile") or ""
+        ).strip()
+        if not bot_profile or not notifier_profile:
+            result["unmapped"] += 1
+            continue
+        planned.append((row, candidate, bot_profile, notifier_profile))
+        result["mappable"] += 1
+
+    if not apply or result["unmapped"] or result["ambiguous"]:
+        return result
+
+    with _kb.write_txn(conn):
+        for row, _candidate, bot_profile, notifier_profile in planned:
+            mode = row["delivery_mode"] or "notify"
+            add_notify_authority(
+                conn,
+                task_id=row["task_id"],
+                platform=row["platform"],
+                chat_id=row["chat_id"],
+                thread_id=row["thread_id"] or "",
+                user_id=row["user_id"],
+                user_id_alt=row["user_id_alt"],
+                chat_type=row["chat_type"],
+                bot_profile=bot_profile,
+                notifier_profile=notifier_profile,
+                delivery_mode=mode,
+                delivery_metadata=_decode_notify_delivery_metadata(
+                    row["delivery_metadata"]
+                ),
+                ping_priority=0,
+                source_kind="legacy",
+                legacy_subscription_id=row["subscription_id"],
+                start_ping_cursor=int(row["last_ping_event_id"] or 0),
+                start_wake_cursor=(
+                    int(row["last_event_id"] or 0)
+                    if mode in ("wake", "notify+wake") else 0
+                ),
+            )
+        result["applied"] = len(planned)
+    return result
+
+
+def project_notify_authority_to_legacy(
+    conn: sqlite3.Connection, *, subscription_id: str
+) -> str:
+    """Project one explicitly selected v2 authority for a legacy rollback."""
+    row = conn.execute(
+        "SELECT a.*, r.last_ping_event_id FROM kanban_notify_authorities a "
+        "JOIN kanban_notify_routes r USING (task_id, platform, chat_id, thread_id) "
+        "WHERE a.subscription_id = ?",
+        (subscription_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("notification authority lease is not current")
+    mode = str(row["delivery_mode"])
+    ping_cursor = int(row["last_ping_event_id"] or 0)
+    wake_cursor = int(row["last_wake_event_id"] or 0)
+    if mode == "notify+wake":
+        event_cursor = min(ping_cursor, wake_cursor)
+    elif mode == "wake":
+        event_cursor = wake_cursor
+    else:
+        event_cursor = ping_cursor
+    existing = conn.execute(
+        "SELECT subscription_id FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+        _v2_route_key(row["task_id"], row["platform"], row["chat_id"], row["thread_id"]),
+    ).fetchone()
+    legacy_id = (
+        str(row["legacy_subscription_id"] or "")
+        or (str(existing["subscription_id"]) if existing is not None else uuid.uuid4().hex)
+    )
+    now = int(time.time())
+    with _kb.write_txn(conn, allow_nested=True):
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, user_id, user_id_alt, chat_type, "
+            "notifier_profile, delivery_mode, delivery_metadata, last_event_id, "
+            "last_ping_event_id, subscription_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, platform, chat_id, thread_id) DO UPDATE SET "
+            "user_id=excluded.user_id, user_id_alt=excluded.user_id_alt, "
+            "chat_type=excluded.chat_type, notifier_profile=excluded.notifier_profile, "
+            "delivery_mode=excluded.delivery_mode, delivery_metadata=excluded.delivery_metadata, "
+            "last_event_id=excluded.last_event_id, "
+            "last_ping_event_id=excluded.last_ping_event_id, "
+            "subscription_id=excluded.subscription_id",
+            (
+                row["task_id"], row["platform"], row["chat_id"], row["thread_id"],
+                row["user_id"], row["user_id_alt"], row["chat_type"],
+                row["notifier_profile"], mode, row["delivery_metadata"],
+                event_cursor, ping_cursor, legacy_id, now,
+            ),
+        )
+        conn.execute(
+            "UPDATE kanban_notify_authorities SET legacy_subscription_id = ? "
+            "WHERE subscription_id = ?",
+            (legacy_id, subscription_id),
+        )
+    return legacy_id
+
+
+def reconcile_notify_authority_from_legacy(
+    conn: sqlite3.Connection, *, subscription_id: str
+) -> bool:
+    """Catch v2 cursors up from its rollback projection without rewinding."""
+    authority = conn.execute(
+        "SELECT * FROM kanban_notify_authorities WHERE subscription_id = ?",
+        (subscription_id,),
+    ).fetchone()
+    if authority is None:
+        return False
+    legacy_id = str(authority["legacy_subscription_id"] or "")
+    legacy = conn.execute(
+        "SELECT * FROM kanban_notify_subs WHERE subscription_id = ?",
+        (legacy_id,),
+    ).fetchone() if legacy_id else None
+    if legacy is None:
+        project_notify_authority_to_legacy(conn, subscription_id=subscription_id)
+        return True
+    route_key = _v2_route_key(
+        authority["task_id"], authority["platform"],
+        authority["chat_id"], authority["thread_id"],
+    )
+    mode = str(authority["delivery_mode"])
+    with _kb.write_txn(conn, allow_nested=True):
+        if mode in ("notify", "notify+wake"):
+            conn.execute(
+                "UPDATE kanban_notify_routes SET last_ping_event_id = "
+                "MAX(last_ping_event_id, ?), claim_event_id=NULL, claim_token=NULL, "
+                "claim_expires_at=NULL " + _V2_ROUTE_WHERE,
+                (int(legacy["last_ping_event_id"] or 0), *route_key),
+            )
+        if mode in ("wake", "notify+wake"):
+            conn.execute(
+                "UPDATE kanban_notify_authorities SET last_wake_event_id = "
+                "MAX(last_wake_event_id, ?), claim_event_id=NULL, claim_token=NULL, "
+                "claim_expires_at=NULL WHERE subscription_id = ?",
+                (int(legacy["last_event_id"] or 0), subscription_id),
+            )
+    return True
+
+
 # --- Configured default notify targets (kanban.default_notify_targets) ---
 
 _DEFAULT_TARGET_REQUIRED = ("board", "platform", "chat_id", "delivery_mode")
 _DEFAULT_TARGET_OPTIONAL = (
     "thread_id", "chat_type", "user_id", "user_id_alt",
-    "notifier_profile", "delivery_metadata",
+    "bot_profile", "notifier_profile", "delivery_metadata",
+    "ping_priority", "source_kind",
 )
 
 
@@ -208,10 +1051,30 @@ def normalize_default_notify_targets(raw: Any) -> list[dict]:
         notifier_profile = entry.get("notifier_profile")
         if notifier_profile is not None:
             notifier_profile = str(notifier_profile).strip() or None
+        bot_profile = entry.get("bot_profile")
+        if bot_profile is not None:
+            bot_profile = str(bot_profile).strip() or None
+        if bot_profile and not notifier_profile:
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] notifier_profile is required "
+                "with bot_profile")
         if delivery_mode in ("wake", "notify+wake") and not notifier_profile:
             raise ValueError(
                 f"kanban.default_notify_targets[{idx}] notifier_profile is required for "
                 f"delivery_mode={delivery_mode!r}")
+        ping_priority = entry.get("ping_priority", 0)
+        if isinstance(ping_priority, bool):
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] ping_priority must be an integer")
+        try:
+            ping_priority = int(ping_priority)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] ping_priority must be an integer") from None
+        source_kind = str(entry.get("source_kind") or "default").strip()
+        if source_kind != "default":
+            raise ValueError(
+                f"kanban.default_notify_targets[{idx}] source_kind must be 'default'")
         thread_id = entry.get("thread_id")
         if thread_id is not None:
             thread_id = str(thread_id).strip() or None
@@ -236,9 +1099,12 @@ def normalize_default_notify_targets(raw: Any) -> list[dict]:
             "chat_type": chat_type,
             "user_id": user_id,
             "user_id_alt": user_id_alt,
+            "bot_profile": bot_profile,
             "notifier_profile": notifier_profile,
             "delivery_mode": delivery_mode,
             "delivery_metadata": dict(delivery_metadata) if delivery_metadata else None,
+            "ping_priority": ping_priority,
+            "source_kind": source_kind,
         })
     return out
 
@@ -250,14 +1116,11 @@ def apply_default_notify_targets(
     board: str,
     targets: list[dict],
 ) -> int:
-    """Insert configured default notify targets whose ``board`` equals ``board``
-    onto ``task_id``, idempotently under the existing
-    ``(task_id, platform, chat_id, thread_id)`` identity via ``INSERT OR IGNORE``
-    (no read-then-insert race, no destructive upsert). Runs inside the caller's
-    ``create_task`` transaction — no nested ``write_txn`` — mirroring
-    ``_inherit_notify_subs``. ``last_event_id`` is caught up to the task's current
-    cursor so the ``created`` event is never replayed as an alert. Returns the
-    number of rows inserted.
+    """Apply configured defaults after inherited authorities, atomically.
+
+    Targets carrying ``bot_profile`` use the v2 route/authority model. Historical
+    configurations without that field retain the legacy row shape until an
+    explicit migration maps the owning credential.
     """
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
@@ -267,6 +1130,38 @@ def apply_default_notify_targets(
     inserted = 0
     for target in targets:
         if target["board"] != board:
+            continue
+        if target.get("bot_profile"):
+            authority_key = (
+                task_id, target["platform"], target["chat_id"],
+                target["thread_id"] or "", target["bot_profile"],
+                target["notifier_profile"],
+            )
+            existed = conn.execute(
+                "SELECT 1 FROM kanban_notify_authorities " + _V2_AUTHORITY_WHERE,
+                authority_key,
+            ).fetchone()
+            if existed is not None:
+                continue
+            add_notify_authority(
+                conn,
+                task_id=task_id,
+                platform=target["platform"],
+                chat_id=target["chat_id"],
+                thread_id=target["thread_id"],
+                user_id=target["user_id"],
+                user_id_alt=target["user_id_alt"],
+                chat_type=target["chat_type"],
+                bot_profile=target["bot_profile"],
+                notifier_profile=target["notifier_profile"],
+                delivery_mode=target["delivery_mode"],
+                delivery_metadata=target["delivery_metadata"],
+                ping_priority=target["ping_priority"],
+                source_kind=target["source_kind"],
+                start_ping_cursor=cursor,
+                start_wake_cursor=cursor,
+            )
+            inserted += int(existed is None)
             continue
         key = _sub_key(task_id, target["platform"], target["chat_id"], target["thread_id"])
         cur = conn.execute(
@@ -322,6 +1217,7 @@ def list_notify_subs(
     *,
     notifier_profiles: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
+    include_linked: bool = False,
 ) -> list[dict]:
     """List subscriptions, optionally restricted to notifier profile owners.
 
@@ -340,6 +1236,11 @@ def list_notify_subs(
     if owner_where:
         where.append(owner_where)
         params.extend(owner_params)
+    if not include_linked:
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM kanban_notify_authorities a "
+            "WHERE a.legacy_subscription_id = kanban_notify_subs.subscription_id)"
+        )
     sql = "SELECT * FROM kanban_notify_subs"
     if where:
         sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
@@ -350,6 +1251,28 @@ def list_notify_subs(
             item["delivery_metadata"] = _decode_notify_delivery_metadata(item.get("delivery_metadata"))
         out.append(item)
     return out
+
+
+def count_notify_authorities(
+    db_path: Optional[Path] = None, *, board: Optional[str] = None
+) -> int:
+    """Cheap read-only v2-authority probe used before the notifier write open."""
+    path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    if not path.exists():
+        return 0
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM kanban_notify_authorities"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return 0
+            raise
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
 
 
 def count_notify_subs(
@@ -466,19 +1389,46 @@ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int 
     if days <= 0:
         return 0
     cutoff = int(time.time()) - days * 86400
+    stale_rows = conn.execute(
+        "SELECT t.id FROM tasks t WHERE t.status IN ('done', 'blocked') "
+        "AND COALESCE((SELECT MAX(e.created_at) FROM task_events e "
+        "WHERE e.task_id = t.id), t.completed_at, t.created_at, 0) < ?",
+        (cutoff,),
+    ).fetchall()
+    task_ids = [str(row["id"]) for row in stale_rows]
+    if not task_ids:
+        return 0
+    marks = ",".join("?" for _ in task_ids)
     with _kb.write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE task_id IN ("
-            " SELECT t.id FROM tasks t"
-            " WHERE t.status IN ('done', 'blocked')"
-            " AND COALESCE("
-            "  (SELECT MAX(e.created_at) FROM task_events e"
-            "   WHERE e.task_id = t.id),"
-            "  t.completed_at, t.created_at, 0"
-            " ) < ?)",
-            (cutoff,),
+        projection_rows = conn.execute(
+            "SELECT legacy_subscription_id FROM kanban_notify_authorities "
+            f"WHERE task_id IN ({marks}) AND legacy_subscription_id IS NOT NULL",
+            task_ids,
+        ).fetchall()
+        projection_ids = [str(row["legacy_subscription_id"]) for row in projection_rows]
+        if projection_ids:
+            projection_marks = ",".join("?" for _ in projection_ids)
+            conn.execute(
+                f"DELETE FROM kanban_notify_subs WHERE subscription_id IN ({projection_marks})",
+                projection_ids,
+            )
+        legacy_cur = conn.execute(
+            f"DELETE FROM kanban_notify_subs WHERE task_id IN ({marks})",
+            task_ids,
         )
-    return int(cur.rowcount or 0)
+        authority_cur = conn.execute(
+            f"DELETE FROM kanban_notify_authorities WHERE task_id IN ({marks})",
+            task_ids,
+        )
+        conn.execute(
+            "DELETE FROM kanban_notify_routes WHERE NOT EXISTS ("
+            " SELECT 1 FROM kanban_notify_authorities a"
+            " WHERE a.task_id = kanban_notify_routes.task_id"
+            " AND a.platform = kanban_notify_routes.platform"
+            " AND a.chat_id = kanban_notify_routes.chat_id"
+            " AND a.thread_id = kanban_notify_routes.thread_id)"
+        )
+    return int(legacy_cur.rowcount or 0) + int(authority_cur.rowcount or 0)
 
 
 def _notify_cursor(

@@ -72,6 +72,88 @@ def unseen(task):
                                          thread_id="post", kinds=["completed"])[1]
 
 
+def test_two_authorities_emit_one_ping_and_two_independent_wakes(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    secondary = RecordingAdapter()
+    runner._profile_adapters["other"] = {Platform.DISCORD: secondary}  # type: ignore[dict-item]
+    metadata = {"guild_id": "guild", "scope_id": "guild", "parent_chat_id": "parent"}
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="v2 completion", assignee="worker")
+        kbn.add_notify_authority(
+            conn,
+            task_id=task,
+            platform="discord",
+            chat_id="post",
+            thread_id="post",
+            chat_type="thread",
+            user_id="creator",
+            bot_profile="default",
+            notifier_profile="yuki",
+            delivery_mode="notify+wake",
+            delivery_metadata=metadata,
+            ping_priority=100,
+        )
+        kbn.add_notify_authority(
+            conn,
+            task_id=task,
+            platform="discord",
+            chat_id="post",
+            thread_id="post",
+            chat_type="thread",
+            user_id="creator",
+            bot_profile="other",
+            notifier_profile="other",
+            delivery_mode="notify+wake",
+            delivery_metadata=metadata,
+            ping_priority=10,
+        )
+        kb.complete_task(conn, task, result="finished")
+
+    rows = collect(runner)
+    assert [(row["sub"]["flow"], row["sub"]["notifier_profile"]) for row in rows] == [
+        ("ping", "yuki"),
+        ("wake", "other"),
+        ("wake", "yuki"),
+    ]
+    asyncio.run(deliver(runner, rows))
+
+    assert len(getattr(primary, "sent")) == 1
+    assert len(getattr(primary, "handled")) == 1
+    assert secondary.sent == []
+    assert len(secondary.handled) == 1
+    assert not collect(runner)
+
+
+def test_ping_authority_is_owned_by_bot_not_wake_runtime(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="transport-only authority", assignee="worker")
+        kbn.add_notify_authority(
+            conn,
+            task_id=task,
+            platform="discord",
+            chat_id="post",
+            thread_id="post",
+            chat_type="thread",
+            bot_profile="default",
+            notifier_profile="offline-runtime",
+            delivery_mode="notify",
+            ping_priority=100,
+        )
+        kb.complete_task(conn, task, result="finished")
+
+    rows = collect(runner)
+    assert [(row["sub"]["flow"], row["sub"]["bot_profile"]) for row in rows] == [
+        ("ping", "default")
+    ]
+    asyncio.run(deliver(runner, rows))
+    assert len(primary.sent) == 1
+    assert primary.handled == []
+    assert not collect(runner)
+
+
 def test_exact_routed_profile_delivers_once_on_its_authorized_transport(tmp_path, monkeypatch):
     runner = setup_runner(tmp_path, monkeypatch)
     primary = runner.adapters[Platform.DISCORD]

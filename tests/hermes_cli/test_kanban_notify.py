@@ -723,6 +723,8 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
+    adapter = SimpleNamespace()
+    runner.adapters = {Platform.TELEGRAM: adapter}
     source = SimpleNamespace(
         platform=Platform.TELEGRAM,
         chat_id="chat1",
@@ -730,6 +732,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         thread_id="20197",
         user_id="u1",
     )
+    source._transport_adapter_ref = lambda: adapter
     event = SimpleNamespace(
         text='/kanban --board projx create "hello" --assignee alice',
         source=source,
@@ -743,7 +746,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
     conn = kbc.connect(board="projx")
     try:
-        subs = kbn.list_notify_subs(conn)
+        subs = kbn.list_notify_authorities(conn)
         tasks = kb.list_tasks(conn)
     finally:
         conn.close()
@@ -799,6 +802,8 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
+    adapter = SimpleNamespace()
+    runner.adapters = {Platform.TELEGRAM: adapter}
     # user_id != user_id_alt is the whole point: the alt id is the canonical
     # participant, so dropping it silently corrupts the session key.
     source = SimpleNamespace(
@@ -809,6 +814,7 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
         user_id="open-id",
         user_id_alt="union-id",
     )
+    source._transport_adapter_ref = lambda: adapter
     event = SimpleNamespace(
         text='/kanban create "hello" --assignee alice',
         source=source,
@@ -819,7 +825,7 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
     conn = kbc.connect()
     try:
-        subs = kbn.list_notify_subs(conn)
+        subs = kbn.list_notify_authorities(conn)
     finally:
         conn.close()
     assert len(subs) == 1

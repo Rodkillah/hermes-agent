@@ -40,6 +40,46 @@ def test_worker_create_keeps_durable_origin(tmp_path, monkeypatch, linked, expli
         assert bool(conn.execute("SELECT 1 FROM task_links WHERE child_id = ?", (child.id,)).fetchone()) == linked
 
 
+def test_creator_subscription_preserves_matching_default_authority(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kn
+    from tools import kanban_tools as kt
+    from gateway.session_context import set_session_vars, clear_session_vars
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kt, "_check_kanban_creator_mode", lambda: True)
+    (tmp_path / "config.yaml").write_text(
+        "kanban:\n"
+        "  can_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: discord\n"
+        "      chat_id: thread\n"
+        "      bot_profile: default\n"
+        "      notifier_profile: default\n"
+        "      delivery_mode: notify+wake\n"
+        "      ping_priority: 100\n"
+    )
+    kb.init_db()
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="thread",
+        chat_type="thread",
+        profile="default",
+        bot_profile="default",
+    )
+    try:
+        result = json.loads(kt._handle_create(dict(title="default creator", assignee="default")))
+    finally:
+        clear_session_vars(tokens)
+    assert result["ok"], result
+    with kbc.connect_closing() as conn:
+        authorities = kn.list_notify_authorities(conn, result["task_id"])
+    assert len(authorities) == 1
+    assert authorities[0]["source_kind"] == "default"
+    assert authorities[0]["ping_priority"] == 100
+
+
 def test_tool_subscription_captures_conversation_anchors(tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kn
     from tools import kanban_tools as kt
@@ -47,15 +87,24 @@ def test_tool_subscription_captures_conversation_anchors(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kt, "load_config", lambda: {"kanban": {"can_create": True}})
+    monkeypatch.setattr(kt, "_check_kanban_creator_mode", lambda: True)
     kb.init_db()
-    tokens = set_session_vars(platform="discord", chat_id="thread", chat_type="thread",
-                             scope_id="guild", parent_chat_id="forum", profile="default")
+    tokens = set_session_vars(
+        platform="discord", chat_id="thread", chat_type="thread",
+        scope_id="guild", parent_chat_id="forum", profile="default",
+        bot_profile="default",
+    )
     try:
         result = json.loads(kt._handle_create(dict(title="direct", assignee="default")))
     finally:
         clear_session_vars(tokens)
     assert result["ok"], result
     with kbc.connect_closing() as conn:
-        metadata = kn.list_notify_subs(conn, result["task_id"])[0]["delivery_metadata"]
+        authority = kn.list_notify_authorities(conn, result["task_id"])[0]
+        assert kn.list_notify_subs(conn, result["task_id"]) == []
+        metadata = authority["delivery_metadata"]
+        assert authority["bot_profile"] == "default"
+        assert authority["notifier_profile"] == "default"
         assert metadata["scope_id"] == "guild"
         assert metadata["parent_chat_id"] == "forum"
