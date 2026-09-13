@@ -89,11 +89,17 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         lei = {r["name"]: r for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
         assert lei["last_event_id"]["type"].upper() == "INTEGER"
         assert "delivery_metadata" in lei
+        assert "subscription_id" in lei
 
-        # Data preserved across the rebuild.
+        # Data preserved across the rebuild, with a durable lease backfilled for
+        # the pre-lease notification row.
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
         assert conn.execute("SELECT body FROM task_comments").fetchone()["body"] == "hi"
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
+        subscription_id = conn.execute(
+            "SELECT subscription_id FROM kanban_notify_subs"
+        ).fetchone()["subscription_id"]
+        assert len(subscription_id) == 32
         # Non-numeric legacy cursor ("e-1") casts to 0.
         assert conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()["last_event_id"] == 0
 

@@ -157,7 +157,7 @@ def _resolve_subscription_route(
             served = {name for name, _home in _multiplex_profile_homes(config)}
         except Exception:
             return None
-        if route.profile not in served:
+        if route.profile not in served or (bot_profile and bot_profile not in served):
             return None
         # Shared-bot routes resolve through the runtime profile so
         # _is_shared_bot_satellite enforces credential-boundary failures.
@@ -271,6 +271,11 @@ class _Collector:
 
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
         """Claim one subscription's unseen events; None when skipped or nothing new."""
+        # Every row loaded through connect() is migrated to a durable lease.
+        # Refuse a hand-written post-migration row that omitted it rather than
+        # claiming without rebind protection.
+        if not sub.get("subscription_id"):
+            return None
         owner_profile = sub.get("notifier_profile") or None
         platform = (sub.get("platform") or "").lower()
         if platform not in self.active_platforms:
@@ -287,6 +292,7 @@ class _Collector:
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
+            subscription_id=sub.get("subscription_id") or None,
         )
         if not events:
             return None
@@ -601,14 +607,16 @@ class _KanbanNotification:
         source = SessionSource(platform=self.plat, chat_id=self.sub["chat_id"], profile=self.sub_profile)
         return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
 
-    async def wake(self) -> None:
-        """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
+    async def wake(self) -> bool:
+        """Wake the creator session; False when delivery authority went stale."""
         from gateway.wake import deliver_wake
         sub = self.sub
         if not self.is_push_adapter:
+            if await self._current_route() is None:
+                return False
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key)
             self._log_woke()
-            return
+            return True
         from gateway.session import SessionSource
         # Rebuild the creator's real session scope from the persisted chat_type:
         # build_session_key() keys DMs differently from group/thread, so a
@@ -634,8 +642,11 @@ class _KanbanNotification:
             if not profile_exists(self.sub_profile):
                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
+            if await self._current_route() is None:
+                return False
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source)
         self._log_woke()
+        return True
 
     async def _send_event(self, ev: Any, msg: str) -> None:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
@@ -689,6 +700,9 @@ class _KanbanNotification:
                 continue
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
+            if await self._current_route() is None:
+                await self._rewind_stale_authority()
+                return False
             try:
                 await self._send_event(ev, msg)
                 await _to_thread_process_service(partial(
@@ -704,24 +718,44 @@ class _KanbanNotification:
                 return False
         return True
 
-    async def deliver(self) -> None:
-        try:
-            self.plat = self.platform_cls(self.platform_str)
-        except ValueError:
-            await self.advance()
-            return
-        # Recheck the exact route after claiming: config/adapters can change between ticks.
+    async def _current_route(self) -> Optional[tuple[Any, Optional[str], Optional[str]]]:
+        """Revalidate both the durable row lease and live route authority."""
+        current = await _to_thread_process_service(
+            self.runner._kanban_sub_current, self.sub, self.board_slug,
+        )
+        if not current:
+            return None
         resolved = _resolve_subscription_route(
-            self.runner, self.plat, self.sub, self.persisted_profile
+            self.runner, self.plat, self.sub, self.persisted_profile,
         )
         if (
             resolved is None
             or (resolved[1] or "") != self.sub_profile
             or resolved[2] != self.adapter_profile
         ):
-            logger.debug("kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
-                         self.platform_str, self.task_id)
-            await self.rewind()
+            return None
+        if self.adapter is not None and resolved[0] is not self.adapter:
+            return None
+        return resolved
+
+    async def _rewind_stale_authority(self) -> None:
+        logger.debug(
+            "kanban notifier: delivery authority changed for %s on %s; rewinding claim",
+            self.task_id, self.platform_str,
+        )
+        await self.rewind()
+
+    async def deliver(self) -> None:
+        try:
+            self.plat = self.platform_cls(self.platform_str)
+        except ValueError:
+            await self.advance()
+            return
+        # Recheck both the exact durable row and its route after claiming:
+        # subscriptions, config and adapters can all change between ticks.
+        resolved = await self._current_route()
+        if resolved is None:
+            await self._rewind_stale_authority()
             return
         adapter = resolved[0]
         self.adapter = adapter
@@ -730,19 +764,34 @@ class _KanbanNotification:
 
         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
-        async with self._owner_scope():
-            if not await self._send_pings():
-                return
-            # All text pings delivered (or skipped for non-push / wake-only).
-            self.build_wake_text()
+        from gateway.profile_routing import ProfileRouteRejected
+        try:
+            async with self._owner_scope():
+                # Secret/config hydration yields to the event loop. Revalidate after
+                # that boundary and immediately before any external emission.
+                if await self._current_route() is None:
+                    await self._rewind_stale_authority()
+                    return
+                if not await self._send_pings():
+                    return
+                # All text pings delivered (or skipped for non-push / wake-only).
+                self.build_wake_text()
+        except ProfileRouteRejected:
+            await self._rewind_stale_authority()
+            return
         wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 
         # A requested wake is required even when its passive ping already landed.
         if wake_kinds:
             try:
-                await self.wake()
+                if not await self.wake():
+                    await self._rewind_stale_authority()
+                    return
                 self.clear_failures()
+            except ProfileRouteRejected:
+                await self._rewind_stale_authority()
+                return
             except WakeNotAccepted:
                 # Startup / full queue is not a dead destination. Keep the durable
                 # subscription alive regardless of how long admission takes.

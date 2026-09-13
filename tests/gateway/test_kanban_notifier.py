@@ -432,6 +432,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     """Done is reversible; archive alone ends notification ownership."""
     db_path = tmp_path / "done-reopen-archive.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    from hermes_cli.profiles import get_profile_dir
+    get_profile_dir("reviewer").mkdir(parents=True, exist_ok=True)
     kb.init_db()
 
     conn = kbc.connect()

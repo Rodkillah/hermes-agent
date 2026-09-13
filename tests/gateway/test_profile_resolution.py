@@ -86,20 +86,19 @@ class TestMissingProfileWarning:
             with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
                 mock_get_dir.return_value = Path("/hermes/profiles/nonexistent")
                 with patch("hermes_cli.profiles.profile_exists", return_value=False):
-                    with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
+                    with patch("hermes_constants.get_hermes_home") as get_global:
                         with caplog.at_level(logging.WARNING):
-                            result = mock_runner._resolve_profile_home_for_source(discord_source)
-                            
-                            # Should fall back to global HERMES_HOME
-                            assert result == Path("/hermes")
-                            
-                            # Should have logged a warning
-                            assert len(caplog.records) == 1
-                            assert caplog.records[0].levelname == "WARNING"
-                            assert "nonexistent" in caplog.records[0].message
-                            assert "does not exist" in caplog.records[0].message
-                            assert "discord" in caplog.records[0].message
-                            assert "123456" in caplog.records[0].message
+                            with pytest.raises(ProfileRouteRejected):
+                                mock_runner._resolve_profile_home_for_source(discord_source)
+
+                        get_global.assert_not_called()
+                        assert len(caplog.records) == 1
+                        assert caplog.records[0].levelname == "WARNING"
+                        assert "nonexistent" in caplog.records[0].message
+                        assert "does not exist" in caplog.records[0].message
+                        assert "refusing global" in caplog.records[0].message
+                        assert "discord" in caplog.records[0].message
+                        assert "123456" in caplog.records[0].message
     
     
     
@@ -114,18 +113,17 @@ class TestExceptionHandling:
         
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
             with patch("hermes_cli.profiles.get_profile_dir", side_effect=ValueError("Invalid profile name")):
-                with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
+                with patch("hermes_constants.get_hermes_home") as get_global:
                     with caplog.at_level(logging.WARNING):
-                        result = mock_runner._resolve_profile_home_for_source(discord_source)
-                        
-                        # Should fall back to global HERMES_HOME
-                        assert result == Path("/hermes")
-                        
-                        # Should have logged a warning with exception info
-                        assert len(caplog.records) == 1
-                        assert caplog.records[0].levelname == "WARNING"
-                        assert "bad-profile" in caplog.records[0].message
-                        assert "Failed to resolve profile directory" in caplog.records[0].message
+                        with pytest.raises(ProfileRouteRejected):
+                            mock_runner._resolve_profile_home_for_source(discord_source)
+
+                    get_global.assert_not_called()
+                    assert len(caplog.records) == 1
+                    assert caplog.records[0].levelname == "WARNING"
+                    assert "bad-profile" in caplog.records[0].message
+                    assert "Failed to resolve explicit profile directory" in caplog.records[0].message
+                    assert "refusing global" in caplog.records[0].message
     
 
 
@@ -139,10 +137,11 @@ class TestRoutingConsultation:
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
             with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
                 mock_get_dir.return_value = Path("/hermes/profiles/routed")
-                
+
                 mock_runner._profile_name_for_source = MagicMock(return_value="routed")
-                
-                mock_runner._resolve_profile_home_for_source(discord_source)
+
+                with patch("hermes_cli.profiles.profile_exists", return_value=True):
+                    mock_runner._resolve_profile_home_for_source(discord_source)
                 
                 # Should have called routing
                 mock_runner._profile_name_for_source.assert_called_once_with(discord_source)
