@@ -105,7 +105,7 @@ def add_notify_sub(
     subscription_id = uuid.uuid4().hex
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
-        conn.execute(
+        inserted = conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
@@ -118,9 +118,10 @@ def add_notify_sub(
                 *key, user_id, user_id_alt, chat_type or "dm", notifier_profile,
                 insert_mode, metadata_json, subscription_id, int(time.time()), task_id,
             ),
-        )
+        ).rowcount > 0
         # chat_type / delivery_mode / delivery_metadata are last-write-wins;
         # user_id_alt and notifier_profile only self-heal legacy rows lacking one.
+        changed = False
         for column, value, fill_only in (
             ("chat_type", chat_type, False),
             ("user_id_alt", user_id_alt, True),
@@ -130,17 +131,20 @@ def add_notify_sub(
         ):
             if not value:
                 continue
-            guard = f" AND ({column} IS NULL OR {column} = '')" if fill_only else ""
-            conn.execute(
+            guard = f" AND ({column} IS NULL OR {column} = '')" if fill_only else f" AND {column} IS NOT ?"
+            cur = conn.execute(
                 f"UPDATE kanban_notify_subs SET {column} = ? " + _SUB_KEY_WHERE + guard,
-                (value, *key),
+                (value, *key) if fill_only else (value, *key, value),
             )
-        # Re-subscribing the same logical route starts a new durable lease. Any
-        # in-flight delivery holding the previous token must fail closed.
-        conn.execute(
-            "UPDATE kanban_notify_subs SET subscription_id = ? " + _SUB_KEY_WHERE,
-            (subscription_id, *key),
-        )
+            changed = changed or cur.rowcount > 0
+        # A real rebind starts a new durable lease so in-flight delivery under
+        # the prior authority fails closed. A byte-for-byte idempotent call must
+        # preserve the lease or it can strand an event already claimed by it.
+        if changed and not inserted:
+            conn.execute(
+                "UPDATE kanban_notify_subs SET subscription_id = ? " + _SUB_KEY_WHERE,
+                (subscription_id, *key),
+            )
 
 
 # --- Configured default notify targets (kanban.default_notify_targets) ---

@@ -134,6 +134,34 @@ def test_rebound_subscription_rejects_the_stale_claim(tmp_path, monkeypatch):
     assert current["last_event_id"] == rebound_cursor
 
 
+def test_identical_resubscribe_preserves_claim_and_delivers_once(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    task = completion()
+    rows = collect(runner)
+    assert len(rows) == 1
+    claimed_sub = rows[0]["sub"]
+
+    with kbc.connect() as conn:
+        kbn.add_notify_sub(
+            conn, task_id=task, platform="discord", chat_id="post",
+            thread_id="post", user_id="creator", chat_type="thread",
+            notifier_profile="yuki", delivery_mode="notify+wake",
+            delivery_metadata={
+                "guild_id": "guild", "scope_id": "guild",
+                "parent_chat_id": "parent",
+            },
+        )
+        current = kbn.list_notify_subs(conn, task)[0]
+    assert current["subscription_id"] == claimed_sub["subscription_id"]
+
+    asyncio.run(deliver(runner, rows))
+
+    assert len(primary.sent) == len(primary.handled) == 1
+    assert not unseen(task)
+    assert not collect(runner)
+
+
 def test_unowned_routed_subscription_delivers_once_without_dispatch_lock(tmp_path, monkeypatch):
     runner = setup_runner(tmp_path, monkeypatch)
     runner._kanban_dispatcher_lock_handle = None
