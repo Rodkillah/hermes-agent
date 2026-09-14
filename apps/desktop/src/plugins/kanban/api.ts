@@ -221,10 +221,12 @@ export const patchTask = (id: string, patch: Record<string, unknown>) =>
 /** Production is a proof-bearing transition; it must never use optimistic
  * PATCH/drag semantics. */
 export const promoteTaskToProd = (id: string, receipt: Record<string, unknown>, idempotencyKey: string) =>
-  nudged(call(withBoard(`/tasks/${id}/prod`), {
-    method: 'POST',
-    body: { receipt, idempotency_key: idempotencyKey }
-  }))
+  nudged(
+    call(withBoard(`/tasks/${id}/prod`), {
+      method: 'POST',
+      body: { receipt, idempotency_key: idempotencyKey }
+    })
+  )
 
 export const createTask = (body: Record<string, unknown>) =>
   nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))

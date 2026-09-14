@@ -15,7 +15,12 @@ describe('latestBlockLoopEventId', () => {
   })
 
   it('returns null when no block-loop detection is present', () => {
-    expect(latestBlockLoopEventId([{ id: 1, kind: 'created' }, { id: 2, kind: 'blocked' }])).toBeNull()
+    expect(
+      latestBlockLoopEventId([
+        { id: 1, kind: 'created' },
+        { id: 2, kind: 'blocked' }
+      ])
+    ).toBeNull()
   })
 
   it('does not offer a historical detection after a newer state transition', () => {
