@@ -87,28 +87,32 @@
   }
 
   // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "prod"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
     review: "Review",
     done: "Done",
+    prod: "Prod",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Waiting until its scheduled wake-up",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
     review: "Implementation complete — awaiting review",
     done: "Completed",
+    prod: "Production deployment verified with an immutable receipt",
     archived: "Archived",
   };
   const FALLBACK_DESTRUCTIVE = {
@@ -172,11 +176,13 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
     review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
+    prod: "hermes-kanban-dot-prod",
     archived: "hermes-kanban-dot-archived",
   };
 
@@ -823,6 +829,10 @@
     //           — ignored when count >  1 (bulk endpoint uses selectedIds)
     //   summary — completion summary string, or null/undefined to skip
     const performMoveTask = useCallback(function (taskId, newStatus, count, summary) {
+      if (newStatus === "prod") {
+        setError("Production promotion requires an audited receipt; use the task action instead.");
+        return;
+      }
       const patch = { status: newStatus };
       const finalPatch = summary
         ? Object.assign({}, patch, { result: summary, summary: summary })
@@ -3564,6 +3574,38 @@
       return Object.assign({}, patch, { result: summary, summary: summary });
     }
 
+    // Production is deliberately not a PATCH. The operator supplies the
+    // immutable receipt; the backend verifies it before changing the card.
+    const doPromote = function () {
+      const task = data && data.task;
+      if (!task || task.status !== "done") return Promise.resolve();
+      const raw = window.prompt(
+        "Production receipt JSON (include candidate_sha, backup_ref, rollback_ref and probes):",
+        '{"schema_version":1,"environment":"production","target":"","deployed_at_utc":"","candidate_sha":"","deployed_identity_kind":"git_sha","deployed_identity_value":"","backup_ref":"","rollback_ref":"","verification_mode":"system_verified","probes":[]}'
+      );
+      if (raw === null) return Promise.resolve();
+      const key = window.prompt("Unique idempotency key:");
+      if (!key || !key.trim()) {
+        setPatchErr("An idempotency key is required.");
+        return Promise.resolve();
+      }
+      let receipt;
+      try {
+        receipt = JSON.parse(raw);
+        if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) throw new Error("receipt must be an object");
+      } catch (e) {
+        setPatchErr("Invalid production receipt: " + (e.message || String(e)));
+        return Promise.resolve();
+      }
+      setPatchErr(null);
+      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/prod`, boardSlug), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ receipt: receipt, idempotency_key: key.trim() }),
+      }).then(function () { load(); props.onRefresh(); })
+        .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); });
+    };
+
     // Triage specifier — calls the auxiliary LLM to flesh out a rough
     // idea in the Triage column into a concrete spec (title + body with
     // goal, approach, acceptance criteria) and promotes it to todo.
@@ -3917,6 +3959,7 @@
       h(StatusActions, {
         task: t,
         onPatch: props.onPatch,
+        onPromote: doPromote,
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
       }),
@@ -4621,6 +4664,12 @@
         size: "sm",
       }, label);
     };
+    const promoteButton = task.status === "done" && props.onPromote
+      ? h(Button, {
+          onClick: props.onPromote,
+          size: "sm",
+        }, "🚀 " + tx(t, "columnLabels.prod", "Prod"))
+      : null;
 
     // "Specify" appears only when the task is in the Triage column — the
     // one column where an auxiliary LLM pass is meaningful. Elsewhere
@@ -4709,6 +4758,7 @@
       h("div", { className: "hermes-kanban-actions" },
         specifyButton,
         decomposeButton,
+        promoteButton,
         b("→ triage",  { status: "triage" },   task.status !== "triage"),
         b("→ ready",   { status: "ready" },    task.status !== "ready"),
         // No direct → running button: /tasks/:id PATCH rejects status=running

@@ -243,8 +243,16 @@ class BaseEnvironment(ABC):
         """Profile-scoped names that must not persist in the snapshot. Monotonic for the
         environment lifetime: an allowlist can be cleared after a value was captured, and
         retaining the exclusion keeps that old value from leaking to a later profile."""
+        if self.is_local:
+            from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+
+            # LocalEnvironment injects the authoritative lineage/worker env on
+            # every spawn. Even a pre-fix snapshot must not override it (nor
+            # restore parent worker identity into a scrubbed child process).
+            self._snapshot_passthrough_names.update(
+                (DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS))
         if not self._profile_scoped_passthrough:
-            return ()
+            return tuple(sorted(self._snapshot_passthrough_names))
         try:
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():

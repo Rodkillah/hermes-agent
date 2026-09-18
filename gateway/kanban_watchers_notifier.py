@@ -31,7 +31,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "block_loop_resolved", "review_requested", "changes_requested", "production_promoted")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -431,6 +431,21 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
+    # The human decision that closed a block loop: say which way it went.
+    "block_loop_resolved": lambda ev, n: (
+        f"✅ {n.head} block loop resolved — {_payload(ev, 'decision') or 'resolved'}"
+        f"{_clip(ev, 'reason', ': {}', 160)}",
+        None, None,
+    ),
+    # Production promotion is distinct from work completion. Keep this
+    # post-commit notification limited to the non-sensitive identity fields;
+    # receipt, backup, rollback and probe evidence stay in the database.
+    "production_promoted": lambda ev, n: (
+        f"🚀 {n.head} production verified"
+        f"{_clip(ev, 'target', ' — {}', 80)}{_clip(ev, 'deployed_at_utc', ' @ {}', 40)}"
+        f"{_clip(ev, 'deployed_identity_value', ' [{}]', 40)}",
+        None, None,
+    ),
 }
 
 

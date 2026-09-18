@@ -585,6 +585,20 @@ def get_tool_definitions(*args, **kwargs):
 validate_toolset = _lazy_shim("toolsets", "validate_toolset")
 
 
+def _unknown_toolsets(toolsets, mcp_names):
+    """Return requested toolsets that are neither built-in nor plugin-backed."""
+    try:
+        from hermes_cli.plugins import get_plugin_toolset_keys_nowait
+
+        plugin_names = get_plugin_toolset_keys_nowait()
+    except Exception:
+        plugin_names = set()
+    return [
+        name for name in toolsets
+        if not validate_toolset(name) and name not in mcp_names and name not in plugin_names
+    ]
+
+
 def _sync_process_session_id(session_id: str) -> None:
     """Keep process-local session-id consumers aligned after CLI switches."""
     from gateway.session_context import set_current_session_id
@@ -2745,7 +2759,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         if toolsets and "all" not in toolsets and "*" not in toolsets:
             # MCP server names only resolve after discover_mcp_tools runs; skip them here.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
-            invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            invalid = _unknown_toolsets(toolsets, mcp_names)
             if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
 

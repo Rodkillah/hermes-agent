@@ -8,6 +8,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
   FadeScroll,
   profileColor,
@@ -43,12 +44,12 @@ export function useDefaultAssignee(): string {
   return useOrchestration()?.default_assignee.trim() ?? ''
 }
 
-// System-owned drop targets — you can drag a card OUT of these, never INTO
+// System-owned/proof-bearing drop targets — you can drag a card OUT of these, never INTO
 // them, so lanes/menus must not offer them as targets. `running`/`review` are
 // claimed by the dispatcher; `scheduled` needs a wake-up time only an agent or
 // the CLI can attach (a bare status drag is refused with a 409). The reason
 // copy lives in the plugin i18n bundle (`locked.*`); see `lockedReason`.
-export const LOCKED_COLUMNS = ['review', 'running', 'scheduled'] as const
+export const LOCKED_COLUMNS = ['review', 'running', 'scheduled', 'prod'] as const
 
 export const isLockedTarget = (name: string): boolean => (LOCKED_COLUMNS as readonly string[]).includes(name)
 
@@ -190,10 +191,12 @@ export function Avatar({ name, size = '1.25rem' }: { name: string; size?: string
 export function StatusMenu({
   columns,
   onMove,
+  onPromoteToProd,
   status
 }: {
   columns: string[]
   onMove: (status: string) => void
+  onPromoteToProd?: () => void
   status: string
 }) {
   const k = useKanban()
@@ -222,6 +225,15 @@ export function StatusMenu({
               {name === status && <Codicon className="ml-auto" name="check" size="0.8rem" />}
             </DropdownMenuItem>
           ))}
+        {status === 'done' && onPromoteToProd && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={onPromoteToProd}>
+              <Codicon name="rocket" size="0.85rem" />
+              {columnLabel(k, 'prod')}
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )

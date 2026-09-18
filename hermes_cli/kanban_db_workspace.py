@@ -26,7 +26,7 @@ _REMOVABLE_KINDS = ("scratch", "worktree")
 _ACTIVE_CHILDREN_SQL = (
     "SELECT 1 FROM task_links l "
     "JOIN tasks t ON t.id = l.child_id "
-    "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+    "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'prod', 'archived', 'failed', 'cancelled') "
     "LIMIT 1"
 )
 

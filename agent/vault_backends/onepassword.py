@@ -14,7 +14,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
@@ -38,6 +38,13 @@ class OnePasswordLoginBackend(LoginBackend):
         from agent.secret_scope import get_secret
         env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
         self._service_token = get_secret(env_name, "") or ""
+        # In-memory item_id -> set of distinct vault identities, built ONLY from
+        # the non-sensitive ``item.vault`` metadata returned by ``list_items`` and
+        # republished atomically on every successful list. The public handle stays
+        # ``op:<item_id>`` (no vault identity in it), so this index is what lets
+        # ``resolve_password`` / ``resolve_otp`` add ``--vault`` at fill time. A
+        # single identity is resolvable; zero or several are not (fail closed).
+        self._vault_index: Dict[str, Set[str]] = {}
 
     # ── auth ────────────────────────────────────────────────────────────────
 
@@ -102,8 +109,17 @@ class OnePasswordLoginBackend(LoginBackend):
         if not self.is_unlocked():
             return []
         raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
+        # Rebuild the index from scratch on every successful list, then publish it
+        # atomically. This drops any stale identity whose current metadata no longer
+        # carries a vault, and aggregates every distinct identity an item_id appears
+        # under (no last-wins). The public handle list is built from the same pass.
+        fresh_index: Dict[str, Set[str]] = {}
         out: List[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
+            item_id = str(item.get("id") or "")
+            vault = self._vault_identity(item.get("vault"))
+            if item_id and vault:
+                fresh_index.setdefault(item_id, set()).add(vault)
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
             if not origins:
@@ -114,19 +130,80 @@ class OnePasswordLoginBackend(LoginBackend):
                 origin=origins[0], created_at=str(item.get("created_at") or ""),
                 identifier_type="username" if username else None, identifier=username,
                 allowed_origins=_web_origins(origins)))
+        self._vault_index = fresh_index
         return out
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         return next((m for m in self.list_items() if m.id == handle), None)
 
+    @staticmethod
+    def _vault_identity(vault: object) -> Optional[str]:
+        """Extract a stable vault identity from ``item.vault`` metadata.
+
+        Accepts the realistic shapes ``{"id": ..., "name": ...}`` (preferring the
+        stable ``id``) or a bare string. Returns None when no identity is present.
+        Never hardcodes a vault name or id.
+        """
+        if isinstance(vault, dict):
+            vid = str(vault.get("id") or "").strip()
+            if vid:
+                return vid
+            name = str(vault.get("name") or "").strip()
+            return name or None
+        if isinstance(vault, str):
+            return vault.strip() or None
+        return None
+
+    def _resolve_vault(self, item_id: str) -> str:
+        """Return the single vault identity for ``item_id``, recovering it via a
+        bounded ``item list`` metadata refresh when the in-memory index has no
+        entry (an old handle resolved before any ``list_items``). Fails closed
+        with a non-secret error when the identity is absent or ambiguous — never
+        an unbounded ``item get`` without ``--vault`` under a service account.
+        """
+        vault = self._single_vault(item_id)
+        if vault:
+            return vault
+        # Preserve the original UnlockRequired contract: a locked backend must
+        # surface as locked, not as "no vault metadata" (list_items returns []
+        # while locked, which would otherwise mask the real cause).
+        if not self.is_unlocked():
+            raise UnlockRequired(self)
+        # Bounded, non-revealing metadata recovery: item list only, never item get.
+        self.list_items()
+        vault = self._single_vault(item_id)
+        if not vault:
+            raise RuntimeError(
+                f"1Password item {item_id!r} has no unambiguous vault metadata; "
+                "cannot resolve it under a service account (a vault query is "
+                "required). Re-run browser_vault_list to refresh the item's vault, "
+                "or grant the item a single vault."
+            )
+        return vault
+
+    def _single_vault(self, item_id: str) -> Optional[str]:
+        """The unique vault identity for ``item_id``, or None when zero or several
+        distinct identities are known (both are non-resolvable and must fail closed).
+        """
+        identities = self._vault_index.get(item_id)
+        if not identities:
+            return None
+        if len(identities) == 1:
+            return next(iter(identities))
+        return None
+
     def resolve_password(self, handle: str) -> str:
         item_id = handle[len(self.prefix):]
-        return self._run("item", "get", item_id, "--fields", "label=password", "--reveal").rstrip("\r\n")
+        vault = self._resolve_vault(item_id)
+        return self._run("item", "get", item_id, "--vault", vault,
+                          "--fields", "label=password", "--reveal").rstrip("\r\n")
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
+        item_id = handle[len(self.prefix):]
+        vault = self._resolve_vault(item_id)
         try:
-            code = self._run("item", "get", handle[len(self.prefix):], "--otp").strip()
+            code = self._run("item", "get", item_id, "--vault", vault, "--otp").strip()
         except Exception:
             return None
         return code if code.isdigit() else None

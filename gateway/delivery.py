@@ -142,14 +142,31 @@ class DeliveryTarget:
         return ":".join(p for p in parts if p)
 
 
-async def _ensure_named_dm_topic(adapter: Any, chat_id: str, name: str, *, refresh: bool) -> str:
-    """Create (or force-recreate) a named Telegram private DM topic; return its thread id."""
+async def _ensure_named_dm_topic(adapter: Any, chat_id: str, name: str, *, refresh: bool) -> Optional[str]:
+    """Create (or force-recreate) a named Telegram private DM topic; return its thread id.
+
+    Rend ``None`` quand le topic n a pas pu etre cree ou rafraichi, a charge de
+    l appelant de livrer a plat dans le DM principal.
+
+    Patch local ironrod-local-patches (2026-09-01, reporte le 2026-09-11) : 454
+    messages de cron perdus depuis juillet sur 31 jobs, silencieusement, parce
+    que ce chemin levait sans aucun repli. Les topics DM (Bot API 9.4) exigent
+    une bascule manuelle cote utilisateur ; en attendant, ou si elle echoue pour
+    une autre raison, mieux vaut un message a plat qu un message perdu.
+    A revalider apres chaque mise a jour Hermes : upstream levait encore
+    RuntimeError ici au 2026-09-11.
+    """
     verb, ensure_dm_topic = "refresh" if refresh else "create", getattr(adapter, "ensure_dm_topic", None)
     if ensure_dm_topic is None:
         raise RuntimeError(f"Telegram adapter cannot {verb} named private DM topics")
     thread_id = await ensure_dm_topic(chat_id, name, **({"force_create": True} if refresh else {}))
     if not thread_id:
-        raise RuntimeError(f"Failed to {verb} Telegram private DM topic '{name}'")
+        logger.warning(
+            "Topic DM '%s' indisponible pour le chat %s (%s en echec) : envoi a "
+            "plat dans le DM principal plutot que de perdre le message.",
+            name, chat_id, verb,
+        )
+        return None
     return str(thread_id)
 
 
@@ -290,8 +307,16 @@ class DeliveryRouter:
                 if not _looks_like_int(thread_id):
                     # Named topic: create via createForumTopic, use message_thread_id directly.
                     named_topic = thread_id
-                    send_metadata["thread_id"] = await _ensure_named_dm_topic(adapter, target.chat_id, thread_id, refresh=False)
-                    send_metadata["telegram_dm_topic_created_for_send"] = True
+                    created_thread_id = await _ensure_named_dm_topic(adapter, target.chat_id, thread_id, refresh=False)
+                    if created_thread_id is None:
+                        # Repli a plat (cf. _ensure_named_dm_topic) : sans lane
+                        # topic il n'y a rien a rafraichir non plus, et le NOM du
+                        # topic ne doit jamais partir comme identifiant de thread.
+                        named_topic = None
+                        send_metadata.pop("thread_id", None)
+                    else:
+                        send_metadata["thread_id"] = created_thread_id
+                        send_metadata["telegram_dm_topic_created_for_send"] = True
                 elif send_metadata.get("telegram_reply_to_message_id") is None:
                     # Legacy numeric private topic ids not created by this send path need a reply
                     # anchor to stay visible in the requested lane.
@@ -308,8 +333,15 @@ class DeliveryRouter:
             if retry or error is None or not named_topic or "thread not found" not in error.lower():
                 break
             # The named topic vanished under us: recreate it once and resend.
-            send_metadata["thread_id"] = await _ensure_named_dm_topic(adapter, target.chat_id, named_topic, refresh=True)
-            send_metadata["telegram_dm_topic_created_for_send"] = True
+            refreshed_thread_id = await _ensure_named_dm_topic(adapter, target.chat_id, named_topic, refresh=True)
+            if refreshed_thread_id is None:
+                # Meme repli que la creation : on renvoie a plat dans le DM
+                # principal plutot que de perdre le message.
+                send_metadata.pop("thread_id", None)
+                send_metadata.pop("message_thread_id", None)
+            else:
+                send_metadata["thread_id"] = refreshed_thread_id
+                send_metadata["telegram_dm_topic_created_for_send"] = True
         if error is not None:
             raise RuntimeError(error or f"{target.platform.value} delivery failed")
         return result

@@ -581,12 +581,21 @@ async def _send_bluebubbles(extra, chat_id, message):
     try:
         from gateway.config import PlatformConfig
         adapter = bb.BlueBubblesAdapter(PlatformConfig(extra=extra))
-        if not await adapter.connect():
-            return _error("BlueBubbles: failed to connect to server")
-        try:
+        import httpx
+        from gateway.platforms._http_client_limits import platform_httpx_limits
+
+        # An outbound tool call must not own the gateway's inbound lifecycle.
+        # connect()/disconnect() bind the webhook port and register/unregister
+        # the live gateway callback, so a second sender collides with it.
+        async with httpx.AsyncClient(
+            timeout=30.0, limits=platform_httpx_limits()
+        ) as client:
+            adapter.client = client
+            info = await adapter._api_get("/api/v1/server/info")
+            server_data = (info or {}).get("data", {})
+            adapter._private_api_enabled = bool(server_data.get("private_api"))
+            adapter._helper_connected = bool(server_data.get("helper_connected"))
             result = await adapter.send(chat_id, message)
-        finally:
-            await adapter.disconnect()
         if not result.success:
             return _error(f"BlueBubbles send failed: {result.error}")
         return _success("bluebubbles", chat_id, message_id=result.message_id)

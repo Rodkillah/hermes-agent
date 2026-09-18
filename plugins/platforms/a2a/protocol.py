@@ -430,41 +430,100 @@ class TaskStore:
         return task
 
 
+def persist_conversations_enabled() -> bool:
+    """Return whether A2A conversation content may be written to disk.
+
+    Persistence stays upstream-compatible by default, while the pilot can set
+    ``A2A_PERSIST_CONVERSATIONS=false`` to avoid duplicating message content.
+    """
+    raw = os.getenv("A2A_PERSIST_CONVERSATIONS")
+    if raw is None:
+        try:
+            from hermes_cli.config import load_config
+
+            value = (load_config() or {}).get("a2a", {}).get("persist_conversations")
+            if value is not None:
+                return bool(value) if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            pass
+        return True
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _conv_dir() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        base = Path(get_hermes_home())
+    except Exception:
+        base = Path(os.path.expanduser("~/.hermes"))
+    return base / "a2a_conversations"
+
+
+def _safe_name(context_id: str) -> str:
+    return "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
+
+
 def _conv_path(context_id: str) -> Path:
-    safe = "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
-    return get_hermes_home() / "a2a_conversations" / f"{safe}.jsonl"
+    """Path of one context's on-disk conversation log (single source of truth:
+    ``_conv_dir`` + ``_safe_name``, so the profile override is resolved once)."""
+    return _conv_dir() / f"{_safe_name(context_id)}.jsonl"
 
 
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
-    """Append one message to the context's on-disk conversation log. Never raises."""
+    """Append one message to the context's on-disk conversation log."""
+    if not persist_conversations_enabled():
+        return
     try:
-        path = _conv_path(context_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"ts": time.time(), "role": role, "text": text, "task_id": task_id}, ensure_ascii=False) + "\n")
+        d = _conv_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+        rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
+        path = d / f"{_safe_name(context_id)}.jsonl"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fd = -1
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        finally:
+            if fd != -1:
+                os.close(fd)
     except Exception:
         pass
 
 
 def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
-    """Last *limit* messages for a context (empty list if none / unreadable)."""
-    try:
-        lines = _conv_path(context_id).read_text(encoding="utf-8").splitlines()
-    except Exception:
+    """Load the last *limit* messages for a context (empty list if none)."""
+    if not persist_conversations_enabled():
+        return []
+    path = _conv_dir() / f"{_safe_name(context_id)}.jsonl"
+    if not path.exists():
         return []
     out: list[dict] = []
-    for line in lines:
-        if line.strip():
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return []
     return out[-limit:]
 
 
 def list_conversations() -> list[str]:
-    """Context-ids that have persisted conversations."""
-    return sorted(p.stem for p in (get_hermes_home() / "a2a_conversations").glob("*.jsonl"))
+    """Return known context-ids that have persisted conversations."""
+    if not persist_conversations_enabled():
+        return []
+    d = _conv_dir()
+    if not d.exists():
+        return []
+    return sorted(p.stem for p in d.glob("*.jsonl"))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

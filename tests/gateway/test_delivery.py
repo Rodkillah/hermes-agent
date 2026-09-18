@@ -402,3 +402,58 @@ def test_local_delivery_writes_non_ascii_on_windows_codepage(tmp_path, monkeypat
     written = Path(result["path"]).read_text(encoding="utf-8")
     assert "完了 ✅ café" in written
     assert "日次レポート" in written
+
+
+class TopicsDisabledAdapter:
+    """Adaptateur ou la creation d'un topic DM echoue systematiquement.
+
+    Reproduit la panne reelle du Pi (Telegram: 'Topics mode is not enabled'),
+    active de juillet au 2026-09-01 : 454 messages de cron perdus sur 31 jobs.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.ensure_dm_topic_calls = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append({'chat_id': chat_id, 'content': content, 'metadata': dict(metadata or {})})
+        return SendResult(success=True, message_id='flat-message')
+
+    async def ensure_dm_topic(self, chat_id, topic_name, force_create=False):
+        self.ensure_dm_topic_calls.append(
+            {'chat_id': chat_id, 'topic_name': topic_name, 'force_create': force_create}
+        )
+        return None
+
+
+@pytest.mark.asyncio
+async def test_named_telegram_private_topic_failure_falls_back_to_flat_dm(tmp_path, monkeypatch):
+    """Patch local ironrod-local-patches : un topic DM impossible ne perd plus le message.
+
+    Avant le 2026-09-01, delivery.py levait RuntimeError sans repli : le message
+    etait perdu et seul un WARNING restait. Ce test doit ECHOUER sur ce code-la.
+    Le patch local pouvant etre ecrase par une mise a jour Hermes, ce test est le
+    garde-fou qui le signalera.
+    """
+    monkeypatch.setattr('gateway.delivery.get_hermes_home', lambda: tmp_path)
+    adapter = TopicsDisabledAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse('telegram:722341991:Hermes cron-alerte')
+
+    await router._deliver_to_platform(target, 'alerte watchdog', metadata=None)
+
+    # La creation de topic a bien ete tentee, puis a echoue.
+    assert adapter.ensure_dm_topic_calls == [
+        {'chat_id': '722341991', 'topic_name': 'Hermes cron-alerte', 'force_create': False}
+    ]
+
+    # LA preuve : le message part quand meme, au lieu d'etre perdu.
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]['content'] == 'alerte watchdog'
+    assert adapter.calls[0]['chat_id'] == '722341991'
+
+    # Envoi a plat : aucun thread_id, et surtout jamais le NOM du topic comme id.
+    sent_metadata = adapter.calls[0]['metadata']
+    assert 'thread_id' not in sent_metadata
+    assert 'message_thread_id' not in sent_metadata
+    assert 'Hermes cron-alerte' not in str(sent_metadata)

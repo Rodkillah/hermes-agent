@@ -10,6 +10,26 @@ import pytest
 
 
 
+def test_plugin_toolset_is_not_reported_unknown(monkeypatch):
+    import cli as cli_mod
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(cli_mod, "validate_toolset", lambda _name: False)
+    monkeypatch.setattr(plugins_mod, "get_plugin_toolset_keys_nowait", lambda: {"a2a"})
+
+    assert cli_mod._unknown_toolsets(["a2a"], set()) == []
+
+
+def test_unknown_toolset_is_still_reported(monkeypatch):
+    import cli as cli_mod
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(cli_mod, "validate_toolset", lambda _name: False)
+    monkeypatch.setattr(plugins_mod, "get_plugin_toolset_keys_nowait", lambda: {"a2a"})
+
+    assert cli_mod._unknown_toolsets(["bogus"], set()) == ["bogus"]
+
+
 def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
     """Create a HermesCLI instance with minimal mocking."""
     import importlib

@@ -472,6 +472,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if rc:
         return rc
     graph = None
+    production_receipt = None
+    production_receipt_storage_available = None
     want_json = getattr(args, "json", False)
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
@@ -484,14 +486,19 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        production_receipt_storage_available, _receipts = kb.load_production_receipts(
+            conn, [args.task_id])
+        production_receipt = _receipts.get(args.task_id)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
         _print_json({
             "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "production_receipt": production_receipt,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
-            "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+            # ``id`` is the CAS token resolve-block-loop requires.
+            "events": [_obj_dict(e, ("id", "kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
         })
         return 0
@@ -525,7 +532,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(
+        task, events, runs, graph=graph,
+        production_receipt=production_receipt,
+        production_receipt_storage_available=production_receipt_storage_available)
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -548,7 +558,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
                        (f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}" for c in comments))
     if events:
         _print_section(f"Events ({len(events)}):", (
-            f"  [{_fmt_ts(e.created_at)}]{f' [run {e.run_id}]' if e.run_id else ''} {e.kind}"
+            f"  [{_fmt_ts(e.created_at)}] id={e.id}"
+            f"{f' [run {e.run_id}]' if e.run_id else ''} {e.kind}"
             f"{f' {e.payload}' if e.payload else ''}" for e in events[-20:]))
     if runs:
         print()
@@ -640,9 +651,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
             task = kb.get_task(conn, args.task)
             if task is None:
                 return _err(f"no such task: {args.task}")
+            _storage_ok, _receipts = kb.load_production_receipts(conn, [args.task])
             diags_by_task = {args.task: kd.compute_task_diagnostics(
                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
-                graph=kb.task_graph_context(conn, args.task), config=diag_config)}
+                graph=kb.task_graph_context(conn, args.task), config=diag_config,
+                production_receipt=_receipts.get(args.task),
+                production_receipt_storage_available=_storage_ok)}
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
@@ -652,10 +666,13 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 ev_by = _rows_by_task(conn, "task_events", ids)
                 run_by = _rows_by_task(conn, "task_runs", ids)
                 graph_by = kb.task_graph_contexts(conn, ids)
+                _storage_ok, _receipts = kb.load_production_receipts(conn, ids)
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
-                                                     graph=graph_by.get(tid), config=diag_config)
+                                                     graph=graph_by.get(tid), config=diag_config,
+                                                     production_receipt=_receipts.get(tid),
+                                                     production_receipt_storage_available=_storage_ok)
                     if dl:
                         diags_by_task[tid] = dl
 
@@ -967,6 +984,64 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_resolve_block_loop(args: argparse.Namespace) -> int:
+    raw_metadata = getattr(args, "metadata", None)
+    metadata = None
+    if raw_metadata:
+        try:
+            metadata = json.loads(raw_metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            return _err(f"kanban: --metadata: {exc}", 2)
+    actor = (getattr(args, "actor", None) or _profile_author()).strip()
+    with kbc.connect_closing() as conn:
+        ok = kb.resolve_block_loop_task(
+            conn, args.task_id, decision=args.decision, actor=actor,
+            reason=args.reason, expected_event_id=args.expected_event_id,
+            summary=getattr(args, "summary", None),
+            result=getattr(args, "result", None), metadata=metadata)
+        if not ok:
+            return _err(f"cannot resolve block loop for {args.task_id} (requires triage "
+                        "with block_loop_detected provenance and no active run)")
+        task = kb.get_task(conn, args.task_id)
+        print(f"Resolved {args.task_id}: {args.decision} → {task.status if task else 'unknown'}")
+    return 0
+
+
+def _cmd_mark_prod(args: argparse.Namespace) -> int:
+    try:
+        receipt = json.loads(Path(args.receipt_file).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _err(f"cannot read production receipt: {exc}")
+    if not isinstance(receipt, dict):
+        return _err("cannot read production receipt: expected a JSON object")
+    try:
+        with kbc.connect_closing() as conn:
+            stored = kb.mark_task_prod(
+                conn, args.task_id, receipt=receipt, actor=_profile_author(),
+                idempotency_key=args.idempotency_key)
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"cannot mark {args.task_id} as prod: {exc}")
+    print(f"Promoted {args.task_id} to prod (receipt {stored.id})")
+    return 0
+
+
+def _cmd_route_deploy_todo(args: argparse.Namespace) -> int:
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.route_done_to_deploy_todo(
+                conn, args.task_id, candidate_sha=args.candidate_sha,
+                audit_id=args.audit_id, reason=args.reason,
+                next_action=args.next_action, actor=_profile_author())
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"cannot route {args.task_id} to deploy todo: {exc}")
+    if not ok:
+        return _err(f"cannot route {args.task_id} to deploy todo (not a done task)")
+    print(f"Routed {args.task_id} to todo for audited deployment follow-up")
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1263,6 +1338,8 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "resolve-block-loop": _cmd_resolve_block_loop,
+    "mark-prod": _cmd_mark_prod, "route-deploy-todo": _cmd_route_deploy_todo,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

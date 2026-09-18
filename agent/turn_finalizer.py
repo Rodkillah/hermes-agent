@@ -53,7 +53,27 @@ def _record_kanban_budget_exhausted(
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``)
     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
     from multiple exit paths.
+
+    Iron Rod, garde d identite (portee le 2026-08-23 depuis le correctif
+    local du 2026-08-13, cartes t_0b0c1a02 et t_649cea95).
+    HERMES_KANBAN_TASK est present dans l environnement de TOUT ce qui
+    tourne dans le processus du worker, y compris un enfant delegate_task
+    ou un cron declenche en cours de carte. Sans ce predicat,
+    l epuisement du budget de n importe quel agent du processus est impute
+    a la carte du worker. La garde est posee ici, au point de passage
+    unique des deux chemins appelants, plutot que dupliquee sur chaque
+    site d appel.
     """
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if not is_dispatcher_owned_worker_context():
+        logger.info(
+            "budget exhausted in a non dispatcher-owned context; "
+            "not recording a failure on task %s",
+            kanban_task,
+        )
+        return
+
     try:
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc

@@ -663,6 +663,39 @@ class TestReplyCapture:
         finally:
             adapter._pop_pending("task-ok")
 
+    def test_authenticated_peer_is_authorized_for_gateway_dispatch(self, monkeypatch):
+        adapter = _bare_adapter()
+        captured = {}
+
+        def fake_handle_message(event):
+            captured["event"] = event
+
+            async def noop():
+                return None
+
+            return noop()
+
+        def fake_run_coroutine_threadsafe(coroutine, _loop):
+            coroutine.close()
+            return None
+
+        adapter._loop = object()
+        adapter._message_handler = object()
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", fake_run_coroutine_threadsafe)
+
+        terminal, pending = adapter._prepare_task(
+            {"message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-auth")},
+            "ip:10.66.66.5",
+        )
+        try:
+            assert terminal is None
+            assert pending is not None
+            assert captured["event"].source.role_authorized is True
+        finally:
+            if pending is not None:
+                adapter._pop_pending(pending["task_id"])
+
 
 # --------------------------------------------------------------------------
 # Adapter RPC handlers (driven directly, no HTTP)
@@ -1332,6 +1365,17 @@ def test_agent_card_can_advertise_tenant():
 
 
 class TestMultiAgentRouting:
+    def test_root_can_forward_to_active_profile_subprocess(self):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "forward_active_profile": True,
+        }))
+
+        assert adapter._agents[""]["profile"] == adapter._active_profile
+        assert adapter._agents[""]["local"] is False
+
     def test_path_routed_agent_card_uses_prefix_and_canonical_path(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
@@ -1641,6 +1685,36 @@ print('fake reply')
         title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
         con.close()
         assert title == "a2a-dev-ctx-unsafe-value"
+
+    def test_forward_to_profile_strips_parent_gateway_context(self, monkeypatch, tmp_path):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        captured = {}
+
+        def fake_run(_cmd, **kwargs):
+            captured.update(kwargs["env"])
+            return SimpleNamespace(returncode=0, stdout="reply", stderr="")
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "a2a")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "parent-task")
+        monkeypatch.setattr("plugins.platforms.a2a.adapter.subprocess.run", fake_run)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda _profile: str(tmp_path))
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-clean", "hello"
+        )
+
+        assert (reply, state) == ("reply", protocol.STATE_COMPLETED)
+        assert captured["HERMES_HOME"] == str(tmp_path)
+        assert captured["HERMES_A2A_PEER"] == "peer"
+        assert "_HERMES_GATEWAY" not in captured
+        assert "HERMES_SESSION_PLATFORM" not in captured
+        assert "HERMES_KANBAN_TASK" not in captured
 
 
 # --------------------------------------------------------------------------

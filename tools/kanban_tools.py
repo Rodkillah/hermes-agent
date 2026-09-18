@@ -24,6 +24,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+    KANBAN_MARK_PROD_SCHEMA, KANBAN_RESOLVE_BLOCK_LOOP_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,32 @@ def _check_kanban_mode() -> bool:
 
 
 @no_cache_check_fn
+def _check_kanban_creator_mode() -> bool:
+    """Surface de CREATION de taches (kanban_create, kanban_link).
+
+    Iron Rod, 2026-08-15, reporte le 2026-09-11 : la creation de taches est
+    reservee aux profils dont la config porte ``kanban.can_create: true``
+    (defaut True pour ne rien casser ailleurs). Les experts (colbert, julien,
+    ruth) analysent et PROPOSENT ; Amber seule cree. Le lifecycle des cartes
+    qui leur sont assignees (show, comment, heartbeat, block, complete) reste
+    ouvert : il passe par ``_check_kanban_mode``, pas par ici.
+
+    FAIL-CLOSED : si la configuration ne peut pas etre lue, la creation est
+    REFUSEE. Une erreur de chargement ne doit jamais ouvrir la surface de
+    creation.
+    """
+    if not _check_kanban_mode():
+        return False
+    try:
+        cfg = load_config()
+    except Exception:
+        logger.warning(
+            "kanban.can_create: configuration illisible, creation refusee (fail-closed)")
+        return False
+    return bool((cfg.get("kanban") or {}).get("can_create", True))
+
+
+@no_cache_check_fn
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock): hidden from task workers."""
     return _visible(to_env_worker=False)
@@ -144,6 +171,23 @@ def _reject_delegated_child_mutation(tool_name: str) -> None:
             f"{tool_name} refused: delegate_task child agents are not Kanban run owners. "
             "Return findings to the parent agent; the dispatcher worker or an explicitly "
             "configured Kanban orchestrator must perform board mutations.")
+
+
+def _reject_uncreatable_profile(tool_name: str) -> None:
+    """Refuse la CREATION de taches aux profils sans ``kanban.can_create``.
+
+    Second verrou, indispensable : ``registry.dispatch()`` appelle le handler
+    SANS reevaluer le ``check_fn``, et le registre met les resultats de
+    ``check_fn`` en cache. Un ``check_fn`` seul n est donc qu indicatif : il
+    masque l outil dans le schema, il ne l interdit pas.
+    """
+    if _check_kanban_creator_mode():
+        return
+    raise _Reject(tool_error(
+        f"{tool_name} refused: this profile is not allowed to create Kanban "
+        "tasks (kanban.can_create is false, or the configuration could not be "
+        "read and the guard fails closed). Experts analyse and propose; task "
+        "creation is reserved to the orchestrator profile."))
 
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
@@ -336,7 +380,9 @@ _TASK_SUMMARY_FIELDS = tuple(
     "created_at started_at completed_at current_run_id model_override provider_override".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
-_EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
+# Iron Rod: ``id`` is the CAS token kanban_resolve_block_loop requires, so a
+# caller can prove it read the CURRENT block_loop_detected event.
+_EVENT_FIELDS = ("id", "kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
 _CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
@@ -559,6 +605,20 @@ def _handle_list(args: dict, **kw) -> str:
             "next_limit": (min(limit * 2, KANBAN_LIST_MAX_LIMIT)
                            if truncated and limit < KANBAN_LIST_MAX_LIMIT else None),
             "promoted": promoted})
+
+
+@_kanban_handler("kanban_mark_prod")
+def _handle_mark_prod(args: dict, **kw) -> str:
+    """Promote a completed task using the canonical production proof gate."""
+    tid = _worker_guard("kanban_mark_prod", args)
+    receipt = args.get("receipt")
+    _check(isinstance(receipt, dict), "receipt must be an object")
+    with _board(args.get("board")) as (kb, conn):
+        stored = kb.mark_task_prod(
+            conn, tid, receipt=receipt,
+            actor=os.environ.get("HERMES_PROFILE", ""),
+            idempotency_key=args.get("idempotency_key", ""))
+        return json.dumps({"task_id": tid, "status": "prod", "receipt": stored.to_dict()})
 
 
 @_kanban_handler("kanban_complete")
@@ -856,6 +916,7 @@ def _handle_attachments(args: dict, **kw) -> str:
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
     _reject_delegated_child_mutation("kanban_create")
+    _reject_uncreatable_profile("kanban_create")
     title = _require_text(args, "title")
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
@@ -1003,6 +1064,7 @@ def _handle_unblock(args: dict, **kw) -> str:
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
     _reject_delegated_child_mutation("kanban_link")
+    _reject_uncreatable_profile("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
@@ -1012,13 +1074,47 @@ def _handle_link(args: dict, **kw) -> str:
                    **({"gated_by": parent_id} if gated else {}))
 
 
+@_kanban_handler("kanban_resolve_block_loop")
+def _handle_resolve_block_loop(args: dict, **kw) -> str:
+    """Apply an explicit orchestrator decision to a block-loop triage card."""
+    _reject_delegated_child_mutation("kanban_resolve_block_loop")
+    _require_orchestrator_tool("kanban_resolve_block_loop")
+    tid = _default_task_id(args.get("task_id"))
+    _check(tid, "task_id is required")
+    _enforce_worker_task_ownership(tid)
+    reason = str(args.get("reason") or "").strip()
+    _check(reason, "reason is required — explain the human decision")
+    actor = str(args.get("actor") or "").strip()
+    _check(actor, "actor is required — identify the human decision maker")
+    metadata = args.get("metadata")
+    _check(metadata is None or isinstance(metadata, dict), "metadata must be an object/dict")
+    expected_event_id = args.get("expected_event_id")
+    _check(expected_event_id is not None,
+           "expected_event_id is required — read the current block_loop_detected event first")
+    with _board(args.get("board")) as (kb, conn):
+        ok = kb.resolve_block_loop_task(
+            conn, tid,
+            decision=args.get("decision"), actor=actor, reason=reason,
+            summary=args.get("summary"), result=args.get("result"),
+            metadata=metadata, handoff=args.get("handoff"),
+            expected_event_id=expected_event_id)
+        _check(ok, f"could not resolve block loop for {tid} (requires triage "
+                   "with block_loop_detected provenance and no active run)")
+        task = kb.get_task(conn, tid)
+        return _ok(task_id=tid, decision=args.get("decision"),
+                   status=task.status if task else None)
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_resolve_block_loop"})
+# Iron Rod: experts analyse and propose, the orchestrator profile creates.
+_CREATOR_TOOLS = frozenset({"kanban_create", "kanban_link"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
+    ("kanban_mark_prod", KANBAN_MARK_PROD_SCHEMA, _handle_mark_prod, "🚀"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
@@ -1030,9 +1126,16 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_resolve_block_loop", KANBAN_RESOLVE_BLOCK_LOOP_SCHEMA,
+     _handle_resolve_block_loop, "⚖"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
-    _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
+    if _name in _ORCHESTRATOR_TOOLS:
+        _gate = _check_kanban_orchestrator_mode
+    elif _name in _CREATOR_TOOLS:
+        _gate = _check_kanban_creator_mode
+    else:
+        _gate = _check_kanban_mode
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
                       check_fn=_gate)

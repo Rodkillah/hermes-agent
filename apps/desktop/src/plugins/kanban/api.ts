@@ -218,6 +218,14 @@ function nudged<T>(write: Promise<T>): Promise<T> {
 export const patchTask = (id: string, patch: Record<string, unknown>) =>
   nudged(call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch }))
 
+/** Production is a proof-bearing transition; it must never use optimistic
+ * PATCH/drag semantics. */
+export const promoteTaskToProd = (id: string, receipt: Record<string, unknown>, idempotencyKey: string) =>
+  nudged(call(withBoard(`/tasks/${id}/prod`), {
+    method: 'POST',
+    body: { receipt, idempotency_key: idempotencyKey }
+  }))
+
 export const createTask = (body: Record<string, unknown>) =>
   nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
 
@@ -242,6 +250,18 @@ export const reassignTask = (id: string, profile: string) =>
   nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
 
 export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
+
+export const resolveBlockLoopTask = (
+  id: string,
+  body: {
+    actor: string
+    decision: 'archive' | 'complete' | 'retry'
+    expected_event_id: number
+    reason: string
+    result?: string
+    summary?: string
+  }
+) => nudged(call(withBoard(`/tasks/${id}/resolve-block-loop`), { method: 'POST', body }))
 
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })

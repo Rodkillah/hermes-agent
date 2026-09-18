@@ -13,6 +13,7 @@ import asyncio
 import importlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -166,7 +167,7 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 
 # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column). Keep in
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
-BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
+BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "prod"]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -219,12 +220,20 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
 
     events_by_task = _rows_by_task("task_events")
     runs_by_task = _rows_by_task("task_runs")
+    # Production integrity diagnostics need the normalized receipt. The helper
+    # preserves whether the receipt table was available, so the event fallback
+    # cannot hide a missing row on a current-schema board.
+    receipt_storage_available, receipts_by_task = kanban_db.load_production_receipts(
+        conn, row_ids)
     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
     out: dict[str, list[dict]] = {}
     for r in rows:
         tid = r["id"]
         diags = kd.compute_task_diagnostics(
-            r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid))
+            r, events_by_task[tid], runs_by_task[tid], config=diag_config,
+            graph=graph_by_task.get(tid),
+            production_receipt=receipts_by_task.get(tid),
+            production_receipt_storage_available=receipt_storage_available)
         if diags:
             out[tid] = [d.to_dict() for d in diags]
     return out
@@ -288,7 +297,7 @@ def get_board(
             "SELECT l.parent_id AS pid, t.status AS cstatus FROM task_links l JOIN tasks t ON t.id = l.child_id").fetchall():
             p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
             p["total"] += 1
-            p["done"] += row["cstatus"] == "done"
+            p["done"] += row["cstatus"] in ("done", "prod")
         diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
         latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
@@ -362,6 +371,8 @@ def get_task(
             "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
+            "production_receipt": (
+                _receipt.to_dict() if (_receipt := kanban_db.get_production_receipt(conn, task_id)) else None),
             "child_results": [
                 {"id": c.id, "title": c.title, "status": c.status, "latest_summary": child_summaries.get(c.id), "result": c.result}
                 for c in children],
@@ -602,6 +613,18 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
     (naming the blocking parent(s) for ``ready`` so the UI renders an actionable toast)."""
     s = payload.status
+    # Production is proof-bearing and must never ride along a generic PATCH.
+    if s == "prod":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot set status to 'prod' directly; use POST /tasks/{task_id}/prod "
+                   "with an audited receipt")
+    task_row = kanban_db.get_task(conn, task_id)
+    if (task_row is not None and task_row.status == "triage" and s != "triage"
+            and kanban_db.is_block_loop_triage(conn, task_id)):
+        raise _conflict(
+            "block-loop triage must be resolved with "
+            "POST /tasks/{task_id}/resolve-block-loop")
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
@@ -665,6 +688,61 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         return {"task": _task_dict(updated) if updated else None}
 
 
+class ProductionPromotionBody(BaseModel):
+    receipt: dict[str, Any]
+    idempotency_key: str
+
+
+@router.post("/tasks/{task_id}/prod")
+def promote_task_to_prod(task_id: str, payload: ProductionPromotionBody,
+                         board: Optional[str] = Query(None)):
+    """Promote a done task through the sole audited production primitive."""
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        try:
+            stored = kanban_db.mark_task_prod(
+                conn, task_id, receipt=payload.receipt,
+                actor=os.environ.get("HERMES_PROFILE", "").strip(),
+                idempotency_key=payload.idempotency_key)
+        except kanban_db.ProductionLifecycleError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        task = kanban_db.get_task(conn, task_id)
+        return {"task": _task_dict(task) if task else None,
+                "production_receipt": stored.to_dict()}
+
+
+class ResolveBlockLoopBody(BaseModel):
+    decision: str
+    actor: str
+    reason: str
+    summary: Optional[str] = None
+    result: Optional[str] = None
+    metadata: Optional[dict] = None
+    expected_event_id: int
+
+
+@router.post("/tasks/{task_id}/resolve-block-loop")
+def resolve_block_loop_endpoint(task_id: str, payload: ResolveBlockLoopBody,
+                                board: Optional[str] = Query(None)):
+    """Apply an explicit retry/complete/archive decision to block-loop triage."""
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        with _map_errors(400, ValueError):
+            ok = kanban_db.resolve_block_loop_task(
+                conn, task_id, decision=payload.decision, actor=payload.actor.strip(),
+                reason=payload.reason, summary=payload.summary, result=payload.result,
+                metadata=payload.metadata, expected_event_id=payload.expected_event_id)
+        if not ok:
+            raise _conflict(
+                f"cannot resolve block loop for {task_id}: requires triage "
+                "with block_loop_detected provenance and no active run")
+        task = kanban_db.get_task(conn, task_id)
+        return {"ok": True, "task_id": task_id, "decision": payload.decision,
+                "status": task.status if task else None}
+
+
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
@@ -683,7 +761,7 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
+        "WHERE l.child_id = ? AND t.status NOT IN ('done', 'prod')",
         (task_id,)).fetchall()
     return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
 
@@ -708,6 +786,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         # dispatcher spawns a child whose upstream work hasn't completed.
         if effective_status == "ready" and not kanban_db._parents_satisfied(conn, task_id):
             return False
+        if new_status == "prod":
+            raise ValueError("prod is only reachable through mark_task_prod")
+        if prev["status"] == "prod" and new_status not in {"prod", "archived"}:
+            raise ValueError("prod tasks may only be archived")
         was_running = prev["status"] == "running"
         reopening_satisfied_parent = prev["status"] in {"done", "archived"} and effective_status not in {"done", "archived"}
         cur = conn.execute(
@@ -1217,9 +1299,40 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
-    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
+    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
+
+    Iron Rod 2026-09-12: the nudge used to pass ``max_spawn`` alone. In
+    ``_dispatch_once_locked`` a ``None`` cap means UNCAPPED, so one click on
+    "Nudge dispatcher" bypassed ``kanban.max_in_progress`` and
+    ``kanban.max_in_progress_per_profile`` entirely. On 2026-09-11 at 23:41:35
+    a single nudge spawned 6 workers at once (max=8 minus 2 already running),
+    put 3 'architect' cards in parallel against a per-profile cap of 1 and
+    saturated the host (load 22, 3 GB of swap). The nudge now resolves the same
+    caps as ``hermes_cli.kanban_ops._cmd_dispatch`` and the gateway watcher.
+    ``default_assignee`` is deliberately NOT forwarded: unassigned cards must
+    stay inert on a nudge, as they do on a tick (Iron Rod doctrine).
+    """
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        max_in_progress = kbd.resolve_max_in_progress(
+            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
+        )
+        max_in_progress_per_profile = kbd._positive_int(
+            _kanban_cfg.get("max_in_progress_per_profile"), None
+        )
+    except Exception:
+        max_in_progress = max_in_progress_per_profile = None
     with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        result = kbd.dispatch_once(
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            max_in_progress=max_in_progress,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            board=board,
+        )
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:

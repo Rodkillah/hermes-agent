@@ -1611,6 +1611,21 @@ class AsyncCodexAuxiliaryClient(_AsyncAuxiliaryClientBase):
     pass
 
 
+def _is_aux_probe_client(client: Any) -> bool:
+    """Return whether ``client`` is or wraps a probe-only leaf client.
+
+    Only the known Codex wrappers are traversed.  This keeps the probe
+    classifier side-effect free for third-party clients while covering both
+    sync and async cache entries.  ``_real_client`` is read defensively:
+    ``_AsyncAuxiliaryClientBase`` only mirrors it when the sync wrapper has one.
+    """
+    if isinstance(client, _AuxProbeClientStub):
+        return True
+    if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        return isinstance(getattr(client, "_real_client", None), _AuxProbeClientStub)
+    return False
+
+
 def _translate_anthropic_response_format(anthropic_kwargs: Dict[str, Any], response_format: Any) -> None:
     """Merge an OpenAI response format into Anthropic ``output_config``."""
     if not isinstance(response_format, dict):
@@ -5650,7 +5665,7 @@ def _current_event_loop() -> Any:
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
-    if isinstance(client, _AuxProbeClientStub):
+    if _is_aux_probe_client(client):
         return  # probe stubs must never be cached — the next hit would get a dud client
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
@@ -5848,15 +5863,21 @@ def _get_cached_client(
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            loop_ok = not async_mode or (
-                cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
-            )
-            if loop_ok:
-                return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
-            del _client_cache[cache_key]
+            if _is_aux_probe_client(cached_client):
+                # A probe stub can only be a stale entry from a previous
+                # availability check (or a mixed-version caller).  Never
+                # expose it to runtime inference; evict and rebuild below.
+                del _client_cache[cache_key]
+            else:
+                loop_ok = not async_mode or (
+                    cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
+                )
+                if loop_ok:
+                    return cached_client, _compat_model(cached_client, model, cached_default)
+                # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
+                # foreign loop stays force-neutered.
+                _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+                del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
     # and retry an exhausted key.
@@ -5877,6 +5898,10 @@ def _get_cached_client(
         # False and vision tools vanish for the process lifetime (#87654).
         return client, model or default_model
     if client is not None:
+        if _is_aux_probe_client(client):
+            # Availability probes may resolve a stub, but that object is not
+            # usable for inference and must never become a cache hit.
+            return client, model or default_model
         with _client_cache_lock:
             if cache_key not in _client_cache:
                 # FIFO safety-belt eviction. Do NOT close evicted clients: another caller may be

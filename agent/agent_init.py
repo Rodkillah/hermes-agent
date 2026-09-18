@@ -1079,13 +1079,15 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
-    # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
-    # expose kanban_show interactively, and children/cron runs inherit the env var, without
-    # owning a task.
-    from agent.delegation_context import owned_kanban_task
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if owned_kanban_task() and "kanban_show" in agent.valid_tool_names else ""
+    # Kanban worker lifecycle guidance is session-static. Orchestrator profiles
+    # can expose kanban_show in ordinary chat, so tool presence alone is not a
+    # worker identity signal; ownership of the dispatcher task must also be
+    # established (``owned_kanban_task`` — the env var alone is inherited by
+    # in-process delegate children and cron runs). Resolving the ~835-token
+    # block once here avoids re-running the membership test + reference on every
+    # system-prompt rebuild (init + each context compression).
+    agent._kanban_worker_guidance = _resolve_kanban_worker_guidance(
+        agent.valid_tool_names
     )
     if agent.quiet_mode:
         return
@@ -2207,6 +2209,36 @@ _CALLBACK_PARAMS = (
     "status_callback", "notice_callback", "notice_clear_callback",
     "event_callback", "reaction_callback", "tool_gen_callback",
 )
+
+
+def _resolve_kanban_worker_guidance(valid_tool_names: set[str]) -> str:
+    """Return task lifecycle guidance only for a real dispatcher worker.
+
+    Orchestrator profiles may expose ``kanban_show`` in ordinary chat so they
+    can route board work.  Tool availability alone therefore does not mean the
+    current process owns a task.  Injecting worker guidance into those chats
+    falsely tells the model to call ``kanban_show()`` first, even when no
+    ``HERMES_KANBAN_TASK`` exists and the user explicitly requested direct
+    execution.
+
+    Ownership, not the environment variable, is the signal: an in-process
+    delegate_task child and a cron run fired beside a worker both inherit
+    ``HERMES_KANBAN_TASK`` from the worker's ``os.environ``.  Both the presence
+    of the worker tool and ``owned_kanban_task()`` are therefore required,
+    which keeps the prompt off ordinary orchestrator sessions and delegated
+    children while preserving the full lifecycle contract for real workers.
+    """
+    if "kanban_show" not in valid_tool_names:
+        return ""
+
+    from agent.delegation_context import owned_kanban_task
+
+    if not owned_kanban_task():
+        return ""
+
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    return KANBAN_GUIDANCE
 
 
 def init_agent(

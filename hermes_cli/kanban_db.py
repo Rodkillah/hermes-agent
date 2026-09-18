@@ -23,6 +23,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -100,8 +101,15 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "prod", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# ``done`` is the completion of the work item.  ``prod`` is a later, explicit
+# proof that the exact candidate was deployed and verified.  Keep these
+# predicates in one place so dependency and terminal checks cannot drift.
+WORK_COMPLETED_STATUSES = frozenset({"done", "prod"})
+EXECUTION_TERMINAL_STATUSES = frozenset({"done", "prod", "archived"})
+HIDDEN_STATUSES = frozenset({"archived"})
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
@@ -699,6 +707,7 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    work_completed_at: Optional[int] = None
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -755,6 +764,9 @@ _TASK_REQUIRED_COLUMNS = (
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
+    # Retained when a delivered item is routed back to todo solely because its
+    # production deployment is still outstanding.
+    "work_completed_at",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
 )
@@ -872,6 +884,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
     completed_at         INTEGER,
+    -- Work completion is retained when a delivered item is routed back to
+    -- todo solely because its production deployment is still outstanding.
+    work_completed_at    INTEGER,
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
@@ -1065,7 +1080,41 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+-- Immutable production proof.  These tables are additive and deliberately
+-- have no backfill: legacy done cards remain exactly as they were.
+CREATE TABLE IF NOT EXISTS production_receipts (
+    id                       TEXT PRIMARY KEY,
+    task_id                  TEXT NOT NULL UNIQUE,
+    schema_version            INTEGER NOT NULL,
+    environment               TEXT NOT NULL,
+    target                    TEXT NOT NULL,
+    deployed_at_utc           TEXT NOT NULL,
+    candidate_sha             TEXT NOT NULL,
+    deployed_identity_kind    TEXT NOT NULL,
+    deployed_identity_value   TEXT NOT NULL,
+    derivation_ref             TEXT,
+    backup_ref                 TEXT NOT NULL,
+    rollback_ref               TEXT NOT NULL,
+    verification_mode          TEXT NOT NULL,
+    actor                      TEXT NOT NULL,
+    idempotency_key            TEXT NOT NULL UNIQUE,
+    evidence_sha256            TEXT NOT NULL,
+    created_at                 INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS production_probes (
+    receipt_id   TEXT NOT NULL,
+    ordinal      INTEGER NOT NULL,
+    name         TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    required     INTEGER NOT NULL,
+    result       TEXT NOT NULL,
+    evidence_ref TEXT NOT NULL,
+    PRIMARY KEY (receipt_id, ordinal)
+);
+
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_production_probes_receipt ON production_probes(receipt_id, ordinal);
 """
 
 
@@ -1240,6 +1289,32 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+_MOJIBAKE_MARKERS = re.compile(r"Ã.|Â.|â[\x80-\xbf]|ð[\x80-\xbf]")
+
+
+def _repair_utf8_mojibake(value: Optional[str]) -> Optional[str]:
+    """Repair one accidental UTF-8-as-Latin-1/CP1252 decode, conservatively.
+
+    Agent/tool boundaries occasionally hand the Kanban DB text such as
+    ``demandÃ©`` or ``schemaâ\x86\x94migrations``. SQLite then stores those
+    Unicode code points faithfully, so the corruption survives every later
+    surface. Only accept a round-trip candidate when it is valid UTF-8 and
+    strictly reduces the characteristic marker count; legitimate text such as
+    ``Âge`` or ``SÃO`` therefore remains unchanged.
+    """
+    if value is None or not _MOJIBAKE_MARKERS.search(value):
+        return value
+    before = len(_MOJIBAKE_MARKERS.findall(value))
+    for source_encoding in ("latin-1", "cp1252"):
+        try:
+            candidate = value.encode(source_encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if len(_MOJIBAKE_MARKERS.findall(candidate)) < before:
+            return candidate
+    return value
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1270,6 +1345,8 @@ def create_task(
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
+    title = _repair_utf8_mojibake(title) or ""
+    body = _repair_utf8_mojibake(body)
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
@@ -1388,12 +1465,24 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # ``recompute_ready`` treats an explicit ``blocked`` event as the
+                # durable marker that an operator block is sticky. A task created
+                # directly in ``blocked`` otherwise carries only the status in its
+                # row, so the next dispatcher tick promoted parentless gates to
+                # ``ready`` and could spawn them. Record the same lifecycle marker
+                # ``block_task`` uses so initial blocked gates stay fail-closed.
                 if task_status == "blocked":
                     _append_event(
                         conn,
                         task_id,
                         "blocked",
-                        {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
+                        {
+                            "reason": "initial_status=blocked",
+                            "kind": None,
+                            "recurrences": 0,
+                            "source_status": "created",
+                            "actor": created_by or "user",
+                        },
                     )
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as
@@ -1630,9 +1719,18 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
-        # If child was ready but parent is not yet terminal, demote child to todo
-        # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
-        if _task_status(conn, parent_id) not in ("done", "archived"):
+        # If child was ready but the parent has not delivered, demote to todo.
+        # A parent in ``prod``, or parked back in ``todo`` awaiting deployment,
+        # has completed its work and must not demote its children - the same
+        # predicate as ``_parents_satisfied`` / ``recompute_ready``. ``archived``
+        # is NOT terminal for dependency gating (Iron Rod contract).
+        parent_row = conn.execute(
+            "SELECT status, work_completed_at FROM tasks WHERE id = ?", (parent_id,)
+        ).fetchone()
+        if not parent_row or (
+            parent_row["status"] not in WORK_COMPLETED_STATUSES
+            and not (parent_row["status"] == "todo" and parent_row["work_completed_at"] is not None)
+        ):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -1734,6 +1832,7 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 # --- Comments & events ---
 
 def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+    body = _repair_utf8_mojibake(body) or ""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -2111,11 +2210,15 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, t.work_completed_at FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(
+                p["status"] in WORK_COMPLETED_STATUSES
+                or (p["status"] == "todo" and p["work_completed_at"] is not None)
+                for p in parents
+            ):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2156,7 +2259,11 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
+        # Iron Rod contract: ``archived`` does NOT release descendants, only a
+        # real completion does. ``prod``, and a delivered card parked back in
+        # ``todo`` awaiting deployment, both count as work completed.
+        "AND p.status NOT IN ('done', 'prod') "
+        "AND NOT (p.status = 'todo' AND p.work_completed_at IS NOT NULL) LIMIT 1", (task_id,),
     ).fetchone() is None
 
 
@@ -2674,6 +2781,8 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    result = _repair_utf8_mojibake(result)
+    summary = _repair_utf8_mojibake(summary)
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -3071,6 +3180,7 @@ def block_task(
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition."""
+    reason = _repair_utf8_mojibake(reason)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
@@ -3383,7 +3493,7 @@ def promote_task(
         "JOIN task_links l ON l.parent_id = t.id "
         "WHERE l.child_id = ?", (task_id,),
     ).fetchall()
-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
+    unsatisfied = [p["id"] for p in parents if p["status"] not in WORK_COMPLETED_STATUSES]
     if unsatisfied:
         return False, (
             f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
@@ -3576,7 +3686,8 @@ def invalidate_descendants_for_parent_reopen(
             # docstring for why this diverges from reopen_review_task.
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
-                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "work_completed_at = NULL, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "worker_started_at = NULL, "
                 "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
             )
             entry = {
@@ -3709,7 +3820,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
-    # ``archived`` parents no longer block children; promote them now.
+    # ``archived`` parents BLOCK children (Iron Rod contract): archiving a
+    # parent does NOT release its descendants. Only a real completion does.
+    # Promote whatever the archive genuinely unblocked.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
@@ -3721,6 +3834,12 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
+    receipt = conn.execute(
+        "SELECT id FROM production_receipts WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if receipt:
+        conn.execute("DELETE FROM production_probes WHERE receipt_id = ?", (receipt["id"],))
+        conn.execute("DELETE FROM production_receipts WHERE id = ?", (receipt["id"],))
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3778,7 +3897,7 @@ def schedule_task(
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Everything a worker should read about its task: header, body,
-    attachments, prior attempts, done-parent handoffs, the assignee's recent
+    attachments, prior attempts, completed-parent handoffs, the assignee's recent
     work, comments. Lists are tail-capped and fields char-capped
     (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
     task = get_task(conn, task_id)
@@ -3904,16 +4023,21 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
 
 
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
+    """Completed-parent handoffs: newest ``completed`` run's summary+metadata,
     falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
+    relative age so the worker re-verifies stale upstream results.
+
+    Iron Rod: the predicate is ``WORK_COMPLETED_STATUSES`` (``done`` and
+    ``prod``), never a local copy. Gating already releases a child whose
+    parent was promoted to ``prod``; if this filter disagreed, that child
+    would start with no handoff at all, and nothing would report it."""
     parent_rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
     ).fetchall()
     wrote_header = False
     for pid in (r["parent_id"] for r in parent_rows):
         pt = get_task(conn, pid)
-        if not pt or pt.status != "done":
+        if not pt or pt.status not in WORK_COMPLETED_STATUSES:
             continue
         runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
         runs.sort(key=lambda r: r.started_at, reverse=True)
@@ -4073,7 +4197,8 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "(SELECT id FROM tasks WHERE status IN ('done', 'prod', 'archived')) "
+            "AND kind != 'production_promoted'", (cutoff,),
         )
     return int(cur.rowcount or 0)
 
@@ -4260,6 +4385,744 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
 )
 
 
+@dataclass(frozen=True)
+class ProductionReceipt:
+    """The durable, redacted proof returned by :func:`mark_task_prod`."""
+
+    id: str
+    task_id: str
+    schema_version: int
+    environment: str
+    target: str
+    deployed_at_utc: str
+    candidate_sha: str
+    deployed_identity_kind: str
+    deployed_identity_value: str
+    derivation_ref: Optional[str]
+    backup_ref: str
+    rollback_ref: str
+    verification_mode: str
+    actor: str
+    idempotency_key: str
+    evidence_sha256: str
+    created_at: int
+    probes: tuple[dict, ...] = ()
+
+    def to_dict(self) -> dict:
+        value = {
+            key: getattr(self, key)
+            for key in (
+                "id", "task_id", "schema_version", "environment", "target",
+                "deployed_at_utc", "candidate_sha", "deployed_identity_kind",
+                "deployed_identity_value", "derivation_ref", "backup_ref",
+                "rollback_ref", "verification_mode", "actor", "idempotency_key",
+                "evidence_sha256", "created_at",
+            )
+        }
+        value["probes"] = [dict(probe) for probe in self.probes]
+        return value
+
+
+class ProductionLifecycleError(ValueError):
+    """Raised when a production proof is incomplete or a transition is invalid."""
+
+
+_PROD_REF_MAX = 512
+_PROD_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def _production_string(value: Any, name: str, *, required: bool = True) -> Optional[str]:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise ProductionLifecycleError(f"{name} must be a string")
+    value = value.strip()
+    if required and not value:
+        raise ProductionLifecycleError(f"{name} must be non-empty")
+    if len(value) > _PROD_REF_MAX or any(ord(ch) < 32 for ch in value):
+        raise ProductionLifecycleError(f"{name} is invalid or too long")
+    return value
+
+
+def _production_ref(value: Any, name: str) -> str:
+    value = _production_string(value, name)
+    # References are opaque identifiers, not executable commands, URLs or
+    # copied logs.  Keep this check deliberately conservative.
+    if "://" in value or "\n" in value or "\r" in value:
+        raise ProductionLifecycleError(f"{name} must be an opaque reference")
+    return value
+
+
+def _normalise_production_receipt(receipt: Mapping[str, Any]) -> tuple[dict, list[dict]]:
+    if not isinstance(receipt, Mapping):
+        raise ProductionLifecycleError("receipt must be an object")
+    try:
+        schema_version = int(receipt.get("schema_version"))
+    except (TypeError, ValueError):
+        raise ProductionLifecycleError("schema_version must be 1") from None
+    if schema_version != 1:
+        raise ProductionLifecycleError("schema_version must be 1")
+    candidate_sha = _production_string(receipt.get("candidate_sha"), "candidate_sha").lower()
+    if not _PROD_SHA_RE.fullmatch(candidate_sha):
+        raise ProductionLifecycleError("candidate_sha must be an exact 40-hex SHA")
+    deployed_at = _production_string(receipt.get("deployed_at_utc"), "deployed_at_utc")
+    try:
+        parsed = datetime.fromisoformat(deployed_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise ProductionLifecycleError("deployed_at_utc must be ISO-8601") from None
+    if parsed.tzinfo is None:
+        raise ProductionLifecycleError("deployed_at_utc must include a timezone")
+    deployed_at = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    identity_kind = _production_string(
+        receipt.get("deployed_identity_kind"), "deployed_identity_kind"
+    )
+    if identity_kind not in {"git_sha", "artifact_sha256", "release_id"}:
+        raise ProductionLifecycleError("deployed_identity_kind is not supported")
+    identity_value = _production_ref(
+        receipt.get("deployed_identity_value"), "deployed_identity_value"
+    )
+    verification_mode = _production_string(
+        receipt.get("verification_mode"), "verification_mode"
+    )
+    if verification_mode not in {"system_verified", "authorized_attestation"}:
+        raise ProductionLifecycleError("verification_mode is not supported")
+    probes_value = receipt.get("probes")
+    if not isinstance(probes_value, list) or not probes_value:
+        raise ProductionLifecycleError("at least one production probe is required")
+    probes: list[dict] = []
+    for ordinal, probe in enumerate(probes_value):
+        if not isinstance(probe, Mapping):
+            raise ProductionLifecycleError("each production probe must be an object")
+        name = _production_string(probe.get("name"), f"probes[{ordinal}].name")
+        scope = _production_string(probe.get("scope"), f"probes[{ordinal}].scope")
+        result = _production_string(probe.get("result"), f"probes[{ordinal}].result")
+        if scope != "live_production":
+            raise ProductionLifecycleError("production probes must use live_production scope")
+        if result not in {"passed", "failed"}:
+            raise ProductionLifecycleError("probe result must be passed or failed")
+        required = probe.get("required")
+        if not isinstance(required, bool):
+            raise ProductionLifecycleError("probe required must be boolean")
+        evidence_ref = _production_ref(
+            probe.get("evidence_ref"), f"probes[{ordinal}].evidence_ref"
+        )
+        probes.append({
+            "ordinal": ordinal,
+            "name": name,
+            "scope": scope,
+            "required": required,
+            "result": result,
+            "evidence_ref": evidence_ref,
+        })
+    if not any(p["required"] and p["result"] == "passed" for p in probes):
+        raise ProductionLifecycleError("a required passed live production probe is required")
+    if any(p["required"] and p["result"] != "passed" for p in probes):
+        raise ProductionLifecycleError("a required production probe failed")
+    normalised = {
+        "schema_version": 1,
+        "environment": _production_string(receipt.get("environment"), "environment"),
+        "target": _production_string(receipt.get("target"), "target"),
+        "deployed_at_utc": deployed_at,
+        "candidate_sha": candidate_sha,
+        "deployed_identity_kind": identity_kind,
+        "deployed_identity_value": identity_value,
+        "derivation_ref": _production_ref(receipt.get("derivation_ref"), "derivation_ref")
+        if receipt.get("derivation_ref") is not None else None,
+        "backup_ref": _production_ref(receipt.get("backup_ref"), "backup_ref"),
+        "rollback_ref": _production_ref(receipt.get("rollback_ref"), "rollback_ref"),
+        "verification_mode": verification_mode,
+        "probes": probes,
+    }
+    return normalised, probes
+
+
+def _board_for_connection(conn: sqlite3.Connection) -> str:
+    """Resolve the board owning an open connection, not the ambient board."""
+    try:
+        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+        resolved = str(Path(db_file).resolve()) if db_file else ""
+        for meta in list_boards(include_archived=True):
+            slug = meta.get("slug")
+            if not slug:
+                continue
+            # ``kanban_db_path`` deliberately honors HERMES_KANBAN_DB, so it
+            # cannot be used to identify the owner of an already-open
+            # connection: an incoherent ambient override would make every
+            # board appear to point at the override. Compare against the
+            # canonical per-board location instead.
+            expected = (
+                kanban_home() / "kanban.db"
+                if slug == DEFAULT_BOARD
+                else board_dir(slug) / "kanban.db"
+            )
+            if str(expected.resolve()) == resolved:
+                return slug
+    except Exception:
+        # Production promotion must never fall back to the ambient board when
+        # connection ownership cannot be established.
+        raise ProductionLifecycleError(
+            "cannot resolve the board owning the production connection"
+        ) from None
+    raise ProductionLifecycleError(
+        "cannot resolve the board owning the production connection"
+    )
+
+
+def _production_verifier(
+    conn: sqlite3.Connection, task_id: str, receipt: Mapping[str, Any]
+) -> dict:
+    """Run the board-scoped verifier without invoking a shell."""
+    board = _board_for_connection(conn)
+    meta = read_board_metadata(board)
+    automation = meta.get("automation") if isinstance(meta, dict) else None
+    production = automation.get("production") if isinstance(automation, dict) else None
+    if not isinstance(production, dict):
+        # Accept the candidate's spelling during the transition, but keep the
+        # board scope and fail-closed rules identical.
+        production = automation.get("auto_production") if isinstance(automation, dict) else None
+    if not isinstance(production, dict) or production.get("enabled") is not True:
+        raise ProductionLifecycleError("production verifier is disabled or not configured")
+    command_value = production.get("verifier_command")
+    command = Path(str(command_value or "")).expanduser()
+    if not command.is_absolute() or not command.is_file() or not os.access(command, os.X_OK):
+        raise ProductionLifecycleError("production verifier is not executable")
+    try:
+        timeout = max(1, min(int(production.get("verifier_timeout_seconds", 30)), 60))
+    except (TypeError, ValueError):
+        timeout = 30
+    task = conn.execute(
+        "SELECT id, title, body, workspace_path FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task is None:
+        raise ProductionLifecycleError("task not found")
+    request = {
+        "schema_version": 1,
+        "board": board,
+        "task": {"id": task_id, "title": task["title"], "body": task["body"]},
+        "receipt": dict(receipt),
+    }
+    try:
+        result = subprocess.run(
+            [str(command)], input=json.dumps(request, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProductionLifecycleError(f"production verifier failed: {type(exc).__name__}") from None
+    if result.returncode != 0 or len(result.stdout or "") > 64 * 1024:
+        raise ProductionLifecycleError("production verifier rejected the request")
+    try:
+        attestation = json.loads(result.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        raise ProductionLifecycleError("production verifier returned invalid JSON") from None
+    if not isinstance(attestation, dict) or attestation.get("ok") is not True:
+        raise ProductionLifecycleError("production verifier returned a negative receipt")
+    if attestation.get("task_id") != task_id:
+        raise ProductionLifecycleError("production verifier receipt task mismatch")
+    if not _production_string(attestation.get("receipt_id"), "verifier receipt_id"):
+        raise ProductionLifecycleError("production verifier receipt has no id")
+    checked_at = _production_string(attestation.get("checked_at"), "verifier checked_at")
+    try:
+        checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise ProductionLifecycleError("production verifier timestamp is invalid") from None
+    if checked.tzinfo is None:
+        raise ProductionLifecycleError("production verifier timestamp has no timezone")
+    facts = attestation.get("facts")
+    required_facts = (
+        "candidate_on_main", "deployed_revision_matches", "backup_exists",
+        "rollback_available", "required_probes_passed",
+    )
+    if not isinstance(facts, dict) or any(facts.get(key) is not True for key in required_facts):
+        raise ProductionLifecycleError("production verifier did not attest all required facts")
+    return attestation
+
+
+def _receipt_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ProductionReceipt:
+    probes = tuple(dict(p) for p in conn.execute(
+        "SELECT ordinal, name, scope, required, result, evidence_ref "
+        "FROM production_probes WHERE receipt_id = ? ORDER BY ordinal", (row["id"],)
+    ).fetchall())
+    return ProductionReceipt(
+        id=row["id"], task_id=row["task_id"], schema_version=row["schema_version"],
+        environment=row["environment"], target=row["target"],
+        deployed_at_utc=row["deployed_at_utc"], candidate_sha=row["candidate_sha"],
+        deployed_identity_kind=row["deployed_identity_kind"],
+        deployed_identity_value=row["deployed_identity_value"],
+        derivation_ref=row["derivation_ref"], backup_ref=row["backup_ref"],
+        rollback_ref=row["rollback_ref"], verification_mode=row["verification_mode"],
+        actor=row["actor"], idempotency_key=row["idempotency_key"],
+        evidence_sha256=row["evidence_sha256"], created_at=row["created_at"], probes=probes,
+    )
+
+
+def _production_receipt_matches(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    normalized: Mapping[str, Any],
+    *,
+    actor: str,
+) -> bool:
+    """Compare an idempotent retry with the immutable stored request.
+
+    A retry must be the same proof, not merely the same task and candidate.
+    This comparison deliberately excludes verifier-generated fields (receipt
+    id, attestation timestamp and evidence digest), which are unavailable
+    until a first attempt has actually run the verifier.
+    """
+    stored_fields = (
+        "schema_version", "environment", "target", "deployed_at_utc",
+        "candidate_sha", "deployed_identity_kind", "deployed_identity_value",
+        "derivation_ref", "backup_ref", "rollback_ref", "verification_mode",
+    )
+    if row["actor"] != actor:
+        return False
+    return all(row[field] == normalized.get(field) for field in stored_fields) and [
+        dict(
+            ordinal=probe["ordinal"], name=probe["name"],
+            scope=probe["scope"], required=bool(probe["required"]),
+            result=probe["result"], evidence_ref=probe["evidence_ref"],
+        )
+        for probe in conn.execute(
+            "SELECT ordinal, name, scope, required, result, evidence_ref "
+            "FROM production_probes WHERE receipt_id = ? ORDER BY ordinal",
+            (row["id"],),
+        ).fetchall()
+    ] == list(normalized.get("probes", []))
+
+
+def mark_task_prod(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    receipt: Mapping[str, Any],
+    actor: str,
+    idempotency_key: str,
+) -> ProductionReceipt:
+    """Atomically promote exactly one ``done`` task to ``prod``.
+
+    All validation happens before the CAS write, and every mutable write is in
+    one transaction.  The verifier is board-scoped and its facts, never a
+    caller-supplied actor or boolean, authorize the transition.
+    """
+    _assert_not_delegated_child_mutation()
+    if not isinstance(actor, str) or not actor.strip():
+        raise ProductionLifecycleError("actor is required")
+    actor = actor.strip()
+    idempotency_key = _production_ref(idempotency_key, "idempotency_key")
+    normalized, probes = _normalise_production_receipt(receipt)
+    existing = conn.execute(
+        "SELECT * FROM production_receipts WHERE idempotency_key = ?", (idempotency_key,)
+    ).fetchone()
+    if existing:
+        if (
+            existing["task_id"] != task_id
+            or not _production_receipt_matches(
+                conn, existing, normalized, actor=actor,
+            )
+        ):
+            raise ProductionLifecycleError("idempotency key conflicts with an existing receipt")
+        return _receipt_from_row(conn, existing)
+    current = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if current is None:
+        raise ProductionLifecycleError("task not found")
+    if current["status"] != "done":
+        raise ProductionLifecycleError("only done tasks can be promoted to prod")
+    board = _board_for_connection(conn)
+    board_meta = read_board_metadata(board)
+    automation = board_meta.get("automation") if isinstance(board_meta, dict) else None
+    production = automation.get("production") if isinstance(automation, dict) else None
+    allowed = production.get("allowed_profiles", []) if isinstance(production, dict) else []
+    if not isinstance(allowed, list) or actor not in {str(p) for p in allowed}:
+        raise ProductionLifecycleError("actor is not allowed to promote production on this board")
+    attestation = _production_verifier(conn, task_id, normalized)
+    receipt_id = str(attestation["receipt_id"]).strip()
+    if conn.execute(
+        "SELECT 1 FROM production_receipts WHERE id = ?", (receipt_id,)
+    ).fetchone():
+        raise ProductionLifecycleError("production verifier returned a duplicate receipt id")
+    normalized["actor"] = actor
+    normalized["idempotency_key"] = idempotency_key
+    evidence_sha = hashlib.sha256(
+        json.dumps({"receipt": normalized, "attestation": attestation},
+                   sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, completed_at, work_completed_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ProductionLifecycleError("task not found")
+        if row["status"] != "done":
+            raise ProductionLifecycleError("only done tasks can be promoted to prod")
+        if conn.execute("SELECT 1 FROM production_receipts WHERE task_id = ?", (task_id,)).fetchone():
+            raise ProductionLifecycleError("task already has a production receipt")
+        conn.execute(
+            """INSERT INTO production_receipts
+            (id, task_id, schema_version, environment, target, deployed_at_utc,
+             candidate_sha, deployed_identity_kind, deployed_identity_value,
+             derivation_ref, backup_ref, rollback_ref, verification_mode, actor,
+             idempotency_key, evidence_sha256, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (receipt_id, task_id, normalized["schema_version"], normalized["environment"],
+             normalized["target"], normalized["deployed_at_utc"], normalized["candidate_sha"],
+             normalized["deployed_identity_kind"], normalized["deployed_identity_value"],
+             normalized["derivation_ref"], normalized["backup_ref"], normalized["rollback_ref"],
+             normalized["verification_mode"], actor, idempotency_key, evidence_sha, now),
+        )
+        conn.executemany(
+            "INSERT INTO production_probes "
+            "(receipt_id, ordinal, name, scope, required, result, evidence_ref) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(receipt_id, p["ordinal"], p["name"], p["scope"], int(p["required"]),
+              p["result"], p["evidence_ref"]) for p in probes],
+        )
+        changed = conn.execute(
+            "UPDATE tasks SET status = 'prod', work_completed_at = COALESCE(work_completed_at, completed_at) "
+            "WHERE id = ? AND status = 'done'", (task_id,)
+        )
+        if changed.rowcount != 1:
+            raise ProductionLifecycleError("task changed during production promotion")
+        _append_event(conn, task_id, "production_promoted", {
+            "receipt_id": receipt_id, "environment": normalized["environment"],
+            "target": normalized["target"], "deployed_at_utc": normalized["deployed_at_utc"],
+            "candidate_sha": normalized["candidate_sha"],
+            "deployed_identity_kind": normalized["deployed_identity_kind"],
+            "deployed_identity_value": normalized["deployed_identity_value"],
+            "actor": actor, "schema_version": 1,
+            "passed_probes": sum(p["result"] == "passed" for p in probes),
+            "required_probes": sum(p["required"] for p in probes),
+        })
+        stored = conn.execute("SELECT * FROM production_receipts WHERE id = ?", (receipt_id,)).fetchone()
+    return _receipt_from_row(conn, stored)
+
+
+def get_production_receipt(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[ProductionReceipt]:
+    """Return the immutable production proof for a task, if one exists."""
+    row = conn.execute(
+        "SELECT * FROM production_receipts WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return _receipt_from_row(conn, row) if row else None
+
+
+def load_production_receipts(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    """Load normalized production evidence and report storage availability.
+
+    The boolean is deliberately separate from the result mapping: an empty
+    mapping means either "the current table has no matching rows" or "this is
+    a legacy board without the table". Callers must preserve that distinction
+    so a legacy event fallback cannot hide a missing receipt on a current DB.
+    """
+    task_ids = list(dict.fromkeys(task_ids))
+    if not task_ids:
+        return True, {}
+    placeholders = ",".join(["?"] * len(task_ids))
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM production_receipts WHERE task_id IN ({placeholders})",
+            tuple(task_ids),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False, {}
+
+    receipts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        receipt = dict(row)
+        try:
+            receipt["probes"] = [
+                dict(probe)
+                for probe in conn.execute(
+                    "SELECT ordinal, name, scope, required, result, evidence_ref "
+                    "FROM production_probes WHERE receipt_id = ? ORDER BY ordinal",
+                    (row["id"],),
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            # A partially migrated board can have the receipt table before
+            # the probe table. Keep the receipt visible and let diagnostics
+            # report what the available evidence supports.
+            receipt["probes"] = []
+        receipts[row["task_id"]] = receipt
+    return True, receipts
+
+
+def route_done_to_deploy_todo(
+    conn: sqlite3.Connection, task_id: str, *, candidate_sha: str,
+    audit_id: str, reason: str, next_action: str, actor: str,
+) -> bool:
+    """Route an audited, not-yet-deployed delivery back to ``todo``."""
+    if actor != "amber":
+        raise ProductionLifecycleError("only amber may route audited deployment follow-up")
+    if not _PROD_SHA_RE.fullmatch(str(candidate_sha or "").lower()):
+        raise ProductionLifecycleError("candidate_sha must be an exact 40-hex SHA")
+    audit_id = _production_ref(audit_id, "audit_id")
+    reason = _production_ref(reason, "reason")
+    next_action = _production_ref(next_action, "next_action")
+    with write_txn(conn):
+        row = conn.execute("SELECT status, completed_at, work_completed_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] != "done":
+            return False
+        work_completed_at = row["work_completed_at"] or row["completed_at"]
+        if work_completed_at is None:
+            raise ProductionLifecycleError("no completion proof exists for deployment follow-up")
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', work_completed_at = ? WHERE id = ? AND status = 'done'",
+            (work_completed_at, task_id),
+        )
+        _append_event(conn, task_id, "production_followup_required", {
+            "candidate_sha": str(candidate_sha).lower(), "audit_id": audit_id,
+            "reason": reason, "next_action": next_action,
+        })
+    return True
+
+
+def list_tasks_page(
+    conn: sqlite3.Connection, *, status: str = "done", limit: int = 50,
+    cursor: Optional[str] = None, tenant: Optional[str] = None,
+) -> dict:
+    """Keyset page of tasks, stable by ``(completed_at, id)``."""
+    import base64
+    if status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    limit = max(1, min(int(limit), 50))
+    where = ["status = ?"]
+    params: list[Any] = [status]
+    if tenant is not None:
+        where.append("tenant = ?")
+        params.append(tenant)
+    if cursor:
+        try:
+            raw = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+            completed_at, task_id = int(raw[0]), str(raw[1])
+        except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
+            raise ValueError("invalid cursor") from None
+        where.append("(completed_at, id) > (?, ?)")
+        params.extend([completed_at, task_id])
+    predicate = " AND ".join(where)
+    total = int(conn.execute(f"SELECT COUNT(*) FROM tasks WHERE {predicate.split(' AND (completed_at')[0]}", tuple(params[:len(params) - (2 if cursor else 0)])).fetchone()[0])
+    rows = conn.execute(
+        f"SELECT * FROM tasks WHERE {predicate} ORDER BY completed_at ASC, id ASC LIMIT ?",
+        (*params, limit + 1),
+    ).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = base64.urlsafe_b64encode(
+            json.dumps([last["completed_at"], last["id"]]).encode("utf-8")
+        ).decode("ascii")
+    return {
+        "tasks": [Task.from_row(row) for row in rows],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "total_matching": total,
+    }
+
+
+def is_block_loop_triage(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether ``task_id`` is block-loop triage provenance.
+
+    Dashboard status editing uses this read-only predicate to avoid creating a
+    second ``triage -> ready`` escape hatch beside the domain transition.
+    Only the latest state event counts; comments and other non-state events do
+    not change the provenance.
+    """
+    state_kinds = (
+        "block_loop_detected", "status", "blocked", "unblocked",
+        "dependency_wait", "promoted", "review_requested",
+        "changes_requested", "review_reopened", "completed", "archived",
+    )
+    placeholders = ", ".join("?" for _ in state_kinds)
+    row = conn.execute(
+        f"SELECT kind FROM task_events WHERE task_id = ? "
+        f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (task_id, *state_kinds),
+    ).fetchone()
+    return row is not None and row["kind"] == "block_loop_detected"
+
+
+def resolve_block_loop_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    actor: str,
+    reason: str,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    handoff: Optional[str] = None,
+    expected_event_id: Optional[int] = None,
+) -> bool:
+    """Resolve a task escalated by ``block_loop_detected``.
+
+    Only a task still in ``triage`` with no active claim and a latest state
+    event of ``block_loop_detected`` can use this transition. ``retry``
+    preserves block-loop memory, ``complete`` resets it and releases
+    dependants, while ``archive`` leaves dependants gated.
+    """
+    decision = str(decision or "").strip().lower()
+    if decision not in {"retry", "complete", "archive"}:
+        raise ValueError("decision must be one of 'retry', 'complete', or 'archive'")
+    actor = str(redact_review_value(actor or "")).strip()
+    reason = str(redact_review_value(reason or "")).strip()
+    if not actor:
+        raise ValueError("actor is required")
+    if not reason:
+        raise ValueError("reason is required")
+    if expected_event_id is None:
+        raise ValueError("expected_event_id is required")
+    try:
+        expected_event_id = int(expected_event_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected_event_id must be an integer") from exc
+    if handoff and not summary and not result:
+        summary = handoff
+    summary = _repair_utf8_mojibake(summary)
+    result = _repair_utf8_mojibake(result)
+    metadata = redact_review_value(metadata)
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object/dict")
+    if decision == "complete" and not (
+        str(summary or "").strip() or str(result or "").strip()
+    ):
+        raise ValueError("complete decision requires a non-empty handoff (summary or result)")
+
+    state_kinds = (
+        "block_loop_detected", "status", "blocked", "unblocked",
+        "dependency_wait", "promoted", "review_requested",
+        "changes_requested", "review_reopened", "completed", "archived",
+    )
+    placeholders = ", ".join("?" for _ in state_kinds)
+    run_id: Optional[int] = None
+    release_dependants = False
+    cleanup_workspace = False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "triage":
+            return False
+        if any(
+            row[key] is not None
+            for key in ("current_run_id", "claim_lock", "claim_expires", "worker_pid")
+        ):
+            return False
+        # The task pointer is the normal ownership guard, but keep the
+        # transition fail-closed if an earlier writer left an orphaned live
+        # run row behind. A triage decision must never race an active worker,
+        # even when the task/run invariant is already damaged.
+        active_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if active_run is not None:
+            return False
+        provenance = conn.execute(
+            f"SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+            f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+            (task_id, *state_kinds),
+        ).fetchone()
+        if provenance is None or provenance["kind"] != "block_loop_detected":
+            return False
+        if int(provenance["id"]) != expected_event_id:
+            return False
+        try:
+            source = json.loads(provenance["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(source, dict):
+            return False
+        source_status = source.get("source_status")
+        if source_status not in {"ready", "review"}:
+            return False
+        # A human may bypass the goal judge for this explicit resolution, but
+        # must not bypass dependency gating: completing a child while one of
+        # its parents is still open would release descendants on an invalid
+        # graph.
+        if decision == "complete" and not _parents_satisfied(conn, task_id):
+            return False
+        resolved_payload = {
+            "decision": decision,
+            "actor": actor,
+            "reason": reason,
+            "source_event_id": int(provenance["id"]),
+            "source_status": source_status,
+        }
+
+        if decision == "retry":
+            landing = _landing_status_after_parents(conn, task_id)
+            new_status = "review" if source_status == "review" and landing == "ready" else landing
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status = 'triage' AND current_run_id IS NULL",
+                (new_status, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            resolved_payload["status"] = new_status
+        elif decision == "complete":
+            now = int(time.time())
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'done', result = ?, completed_at = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = NULL, block_recurrences = 0, current_run_id = NULL "
+                "WHERE id = ? AND status = 'triage' AND current_run_id IS NULL",
+                (result, now, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="completed",
+                summary=summary if summary is not None else result,
+                metadata=metadata,
+            )
+            resolved_payload["status"] = "done"
+            resolved_payload["run_id"] = run_id
+            _append_event(conn, task_id, "block_loop_resolved", resolved_payload, run_id=run_id)
+            _append_event(
+                conn, task_id, "completed",
+                {"summary": (summary or result or "").strip().splitlines()[0][:400]},
+                run_id=run_id,
+            )
+            release_dependants = True
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'archived', current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'triage' AND current_run_id IS NULL",
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                return False
+            resolved_payload["status"] = "archived"
+            cleanup_workspace = True
+
+        if decision != "complete":
+            _append_event(conn, task_id, "block_loop_resolved", resolved_payload)
+        if decision == "archive":
+            _append_event(conn, task_id, "archived", None)
+
+    if release_dependants:
+        recompute_ready(conn)
+    if cleanup_workspace:
+        _cleanup_workspace(conn, task_id)
+    return True
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
@@ -4280,7 +5143,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
         SELECT t.id AS id, t.result AS result
         FROM tasks t
         JOIN task_links l ON l.parent_id = t.id
-        WHERE l.child_id = ? AND t.status = 'done'
+        WHERE l.child_id = ? AND t.status IN ('done', 'prod')
         ORDER BY t.completed_at ASC
         """,
         (task_id,),

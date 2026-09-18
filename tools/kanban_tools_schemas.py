@@ -518,6 +518,69 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ["task_id"],
 )
 
+KANBAN_MARK_PROD_SCHEMA = {
+    "name": "kanban_mark_prod",
+    "description": (
+        "Promote a done task to prod through the audited, board-scoped production "
+        "verifier. The receipt must include the exact candidate SHA, deployment "
+        "identity, backup/rollback references, and live production probes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "idempotency_key": {"type": "string", "description": "Opaque stable retry key."},
+            "receipt": {
+                "type": "object",
+                "description": "Production proof; sensitive values and raw logs are forbidden.",
+                "properties": {
+                    "schema_version": {"type": "integer", "enum": [1]},
+                    "environment": {"type": "string"},
+                    "target": {"type": "string"},
+                    "deployed_at_utc": {"type": "string"},
+                    "candidate_sha": {"type": "string"},
+                    "deployed_identity_kind": {"type": "string", "enum": ["git_sha", "artifact_sha256", "release_id"]},
+                    "deployed_identity_value": {"type": "string"},
+                    "derivation_ref": {"type": "string"},
+                    "backup_ref": {"type": "string"},
+                    "rollback_ref": {"type": "string"},
+                    "verification_mode": {"type": "string", "enum": ["system_verified", "authorized_attestation"]},
+                    "probes": {"type": "array", "items": {"type": "object"}},
+                },
+                "required": ["schema_version", "environment", "target", "deployed_at_utc", "candidate_sha", "deployed_identity_kind", "deployed_identity_value", "backup_ref", "rollback_ref", "verification_mode", "probes"],
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["idempotency_key", "receipt"],
+    },
+}
+
+KANBAN_RESOLVE_BLOCK_LOOP_SCHEMA = {
+    "name": "kanban_resolve_block_loop",
+    "description": (
+        "Orchestrator-only human decision for a task routed to triage by "
+        "block_loop_detected. Choose retry, complete, or archive. Requires "
+        "a durable actor and reason; complete also requires a summary or result."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Block-loop triage task id."},
+            "decision": {"type": "string", "enum": ["retry", "complete", "archive"]},
+            "actor": {"type": "string", "description": "Human/orchestrator decision maker."},
+            "reason": {"type": "string", "description": "Durable reason for the decision."},
+            "summary": {"type": "string", "description": "Completion handoff required for complete."},
+            "result": {"type": "string", "description": "Optional completion result."},
+            "handoff": {"type": "string", "description": "Alias for summary."},
+            "metadata": {"type": "object", "description": "Structured completion facts."},
+            "expected_event_id": {"type": "integer", "description": "Required CAS id of the current block_loop_detected event from a fresh task read."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["decision", "actor", "reason", "expected_event_id"],
+    },
+}
+
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (

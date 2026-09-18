@@ -11,6 +11,7 @@ These pin the CLI cold-start contract established in the sub-400ms pass:
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -53,6 +54,154 @@ class TestAuxProbeMode:
         assert answers == [True, True, True]
         with aux._client_cache_lock:
             assert not [k for k in aux._client_cache if k[1:2] == (False,) and k[-1] == "vendor/model"]
+    def test_probe_leaf_classifier_covers_known_codex_wrappers_only(self):
+        import agent.auxiliary_client as aux
+
+        stub = aux._AuxProbeClientStub()
+        sync_wrapper = aux.CodexAuxiliaryClient(stub, "m")
+        async_wrapper = aux.AsyncCodexAuxiliaryClient(sync_wrapper)
+        real_wrapper = aux.CodexAuxiliaryClient(
+            SimpleNamespace(api_key="key", base_url="https://example.invalid"),
+            "m",
+        )
+
+        assert aux._is_aux_probe_client(stub)
+        assert aux._is_aux_probe_client(sync_wrapper)
+        assert aux._is_aux_probe_client(async_wrapper)
+        assert not aux._is_aux_probe_client(real_wrapper)
+        assert not aux._is_aux_probe_client(
+            aux.AnthropicAuxiliaryClient(
+                SimpleNamespace(), "m", "key", "https://anthropic.example"
+            )
+        )
+        assert not aux._is_aux_probe_client(object())
+
+    def test_wrapped_probe_stub_never_cached(self):
+        import agent.auxiliary_client as aux
+
+        stub = aux._AuxProbeClientStub()
+        sync_wrapper = aux.CodexAuxiliaryClient(stub, "m")
+        async_wrapper = aux.AsyncCodexAuxiliaryClient(sync_wrapper)
+        key = ("wrapped-probe-test", False, "", "", "", (), False, "", None, "m")
+        async_key = ("wrapped-probe-test", True, "", "", "", (), False, "", None, "m")
+        aux._store_cached_client(key, sync_wrapper, "m")
+        aux._store_cached_client(async_key, async_wrapper, "m")
+        with aux._client_cache_lock:
+            assert key not in aux._client_cache
+            assert async_key not in aux._client_cache
+
+    def test_cached_client_path_does_not_cache_probe_stub(self):
+        import agent.auxiliary_client as aux
+
+        provider = "probe-cache-regression"
+        stub = aux._AuxProbeClientStub()
+        key = aux._client_cache_key(provider, model="m", async_mode=False)
+        with aux._client_cache_lock:
+            aux._client_cache.pop(key, None)
+        try:
+            with patch.object(aux, "resolve_provider_client", return_value=(stub, "m")):
+                with aux.aux_probe_mode():
+                    client, model = aux._get_cached_client(provider, model="m")
+            assert client is stub
+            assert model == "m"
+            with aux._client_cache_lock:
+                assert key not in aux._client_cache
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.pop(key, None)
+
+    def test_cached_client_path_does_not_cache_wrapped_probe_stub(self):
+        import agent.auxiliary_client as aux
+
+        provider = "wrapped-probe-cache-regression"
+        stub = aux._AuxProbeClientStub()
+        wrapped = aux.CodexAuxiliaryClient(stub, "m")
+        key = aux._client_cache_key(provider, model="m", async_mode=False)
+        with aux._client_cache_lock:
+            aux._client_cache.pop(key, None)
+        try:
+            with patch.object(aux, "resolve_provider_client", return_value=(wrapped, "m")):
+                with aux.aux_probe_mode():
+                    client, model = aux._get_cached_client(provider, model="m")
+            assert client is wrapped
+            assert model == "m"
+            with aux._client_cache_lock:
+                assert key not in aux._client_cache
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.pop(key, None)
+
+    def test_runtime_rebuilds_after_stale_probe_stub(self):
+        import agent.auxiliary_client as aux
+
+        stub = aux._AuxProbeClientStub()
+        provider = "probe-stale-cache-regression"
+        key = aux._client_cache_key(provider, model="m", async_mode=False)
+        with aux._client_cache_lock:
+            aux._client_cache[key] = (stub, "m", None)
+        real_client = object()
+        try:
+            with patch.object(aux, "resolve_provider_client", return_value=(real_client, "m")):
+                client, model = aux._get_cached_client(provider, model="m")
+            assert client is real_client
+            assert model == "m"
+            with aux._client_cache_lock:
+                assert aux._client_cache[key][0] is real_client
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.pop(key, None)
+
+    def test_runtime_rebuilds_after_stale_wrapped_probe_stub(self):
+        import agent.auxiliary_client as aux
+
+        stub = aux._AuxProbeClientStub()
+        stale = aux.CodexAuxiliaryClient(stub, "m")
+        provider = "wrapped-probe-stale-cache-regression"
+        key = aux._client_cache_key(provider, model="m", async_mode=False)
+        real_client = object()
+        with aux._client_cache_lock:
+            aux._client_cache[key] = (stale, "m", None)
+        try:
+            with patch.object(aux, "resolve_provider_client", return_value=(real_client, "m")):
+                client, model = aux._get_cached_client(provider, model="m")
+            assert client is real_client
+            assert model == "m"
+            with aux._client_cache_lock:
+                assert aux._client_cache[key][0] is real_client
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.pop(key, None)
+
+    def test_async_runtime_rebuilds_after_stale_wrapped_probe_stub(self):
+        import asyncio
+        import agent.auxiliary_client as aux
+
+        async def exercise():
+            stub = aux._AuxProbeClientStub()
+            stale = aux.AsyncCodexAuxiliaryClient(
+                aux.CodexAuxiliaryClient(stub, "m")
+            )
+            provider = "async-wrapped-probe-stale-cache-regression"
+            key = aux._client_cache_key(provider, model="m", async_mode=True)
+            real_client = object()
+            with aux._client_cache_lock:
+                aux._client_cache[key] = (stale, "m", asyncio.get_running_loop())
+            try:
+                with patch.object(
+                    aux, "resolve_provider_client", return_value=(real_client, "m")
+                ):
+                    client, model = aux._get_cached_client(
+                        provider, model="m", async_mode=True
+                    )
+                assert client is real_client
+                assert model == "m"
+                with aux._client_cache_lock:
+                    assert aux._client_cache[key][0] is real_client
+            finally:
+                with aux._client_cache_lock:
+                    aux._client_cache.pop(key, None)
+
+        asyncio.run(exercise())
 
     def test_probe_stub_raises_on_runtime_use(self):
         import agent.auxiliary_client as aux

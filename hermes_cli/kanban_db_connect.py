@@ -814,6 +814,10 @@ _RENAMED_TASK_COLUMNS = (
 # NULL / 0 defaults below reproduce the behaviour existing rows had before the
 # column existed.
 _LATER_TASK_COLUMNS = (
+    # Iron Rod: retained when a delivered item is routed back to todo solely
+    # because its production deployment is still outstanding. Additive only:
+    # existing cards keep their status and get no inferred evidence.
+    ("work_completed_at", "work_completed_at INTEGER"),
     ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
     ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
     ("current_run_id", "current_run_id INTEGER"),
