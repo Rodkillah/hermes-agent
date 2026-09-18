@@ -45,7 +45,7 @@ def setup_runner(tmp_path, monkeypatch):
     return runner
 
 
-def completion(*, profile="yuki", metadata=None, chat="post", thread="post", mode="notify+wake"):
+def completion(*, profile: str | None = "yuki", metadata=None, chat="post", thread="post", mode="notify+wake"):
     with kbc.connect() as conn:
         task = kb.create_task(conn, title="route completion", assignee="worker")
         kbn.add_notify_sub(conn, task_id=task, platform="discord", chat_id=chat,
@@ -70,6 +70,88 @@ def unseen(task):
     with kbc.connect() as conn:
         return kbn.unseen_events_for_sub(conn, task_id=task, platform="discord", chat_id="post",
                                          thread_id="post", kinds=["completed"])[1]
+
+
+def test_two_authorities_emit_one_ping_and_two_independent_wakes(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    secondary = RecordingAdapter()
+    runner._profile_adapters["other"] = {Platform.DISCORD: secondary}  # type: ignore[dict-item]
+    metadata = {"guild_id": "guild", "scope_id": "guild", "parent_chat_id": "parent"}
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="v2 completion", assignee="worker")
+        kbn.add_notify_authority(
+            conn,
+            task_id=task,
+            platform="discord",
+            chat_id="post",
+            thread_id="post",
+            chat_type="thread",
+            user_id="creator",
+            bot_profile="default",
+            notifier_profile="yuki",
+            delivery_mode="notify+wake",
+            delivery_metadata=metadata,
+            ping_priority=100,
+        )
+        kbn.add_notify_authority(
+            conn,
+            task_id=task,
+            platform="discord",
+            chat_id="post",
+            thread_id="post",
+            chat_type="thread",
+            user_id="creator",
+            bot_profile="other",
+            notifier_profile="other",
+            delivery_mode="notify+wake",
+            delivery_metadata=metadata,
+            ping_priority=10,
+        )
+        kb.complete_task(conn, task, result="finished")
+
+    rows = collect(runner)
+    assert [(row["sub"]["flow"], row["sub"]["notifier_profile"]) for row in rows] == [
+        ("ping", "yuki"),
+        ("wake", "other"),
+        ("wake", "yuki"),
+    ]
+    asyncio.run(deliver(runner, rows))
+
+    assert len(getattr(primary, "sent")) == 1
+    assert len(getattr(primary, "handled")) == 1
+    assert secondary.sent == []
+    assert len(secondary.handled) == 1
+    assert not collect(runner)
+
+
+def test_ping_authority_is_owned_by_bot_not_wake_runtime(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="transport-only authority", assignee="worker")
+        kbn.add_notify_authority(
+            conn,
+            task_id=task,
+            platform="discord",
+            chat_id="post",
+            thread_id="post",
+            chat_type="thread",
+            bot_profile="default",
+            notifier_profile="offline-runtime",
+            delivery_mode="notify",
+            ping_priority=100,
+        )
+        kb.complete_task(conn, task, result="finished")
+
+    rows = collect(runner)
+    assert [(row["sub"]["flow"], row["sub"]["bot_profile"]) for row in rows] == [
+        ("ping", "default")
+    ]
+    asyncio.run(deliver(runner, rows))
+    assert len(primary.sent) == 1
+    assert primary.handled == []
+    assert not collect(runner)
 
 
 def test_exact_routed_profile_delivers_once_on_its_authorized_transport(tmp_path, monkeypatch):
@@ -99,12 +181,253 @@ def test_exact_routed_profile_delivers_once_on_its_authorized_transport(tmp_path
     assert not unseen(task)
 
 
+def test_rebound_subscription_rejects_the_stale_claim(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    task = completion(profile="yuki", mode="notify")
+    rows = collect(runner)
+    assert len(rows) == 1
+    stale_sub = rows[0]["sub"]
+
+    with kbc.connect() as conn:
+        assert kbn.remove_notify_sub(
+            conn, task_id=task, platform="discord", chat_id="post",
+            thread_id="post",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=task, platform="discord", chat_id="post",
+            thread_id="post", chat_type="thread", notifier_profile="other",
+            delivery_mode="notify",
+            delivery_metadata={
+                "guild_id": "guild", "scope_id": "guild",
+                "parent_chat_id": "parent",
+            },
+        )
+        rebound = kbn.list_notify_subs(conn, task)[0]
+        assert rebound["subscription_id"] != stale_sub["subscription_id"]
+        rebound_cursor = rebound["last_event_id"]
+
+    asyncio.run(deliver(runner, rows))
+
+    assert getattr(primary, "sent") == []
+    with kbc.connect() as conn:
+        current = kbn.list_notify_subs(conn, task)[0]
+    assert current["subscription_id"] == rebound["subscription_id"]
+    assert current["last_event_id"] == rebound_cursor
+
+
+def test_identical_resubscribe_preserves_claim_and_delivers_once(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    task = completion()
+    rows = collect(runner)
+    assert len(rows) == 1
+    claimed_sub = rows[0]["sub"]
+
+    with kbc.connect() as conn:
+        kbn.add_notify_sub(
+            conn, task_id=task, platform="discord", chat_id="post",
+            thread_id="post", user_id="creator", chat_type="thread",
+            notifier_profile="yuki", delivery_mode="notify+wake",
+            delivery_metadata={
+                "guild_id": "guild", "scope_id": "guild",
+                "parent_chat_id": "parent",
+            },
+        )
+        current = kbn.list_notify_subs(conn, task)[0]
+    assert current["subscription_id"] == claimed_sub["subscription_id"]
+
+    asyncio.run(deliver(runner, rows))
+
+    assert len(primary.sent) == len(primary.handled) == 1
+    assert not unseen(task)
+    assert not collect(runner)
+
+
+def test_unowned_routed_subscription_delivers_once_without_dispatch_lock(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    runner._kanban_dispatcher_lock_handle = None
+    primary = runner.adapters[Platform.DISCORD]
+    foreign = RecordingAdapter()
+    runner._profile_adapters["other"] = {Platform.DISCORD: foreign}  # type: ignore[dict-item]
+    task = completion(profile=None, mode="notify")
+
+    rows = collect(runner)
+    assert [row["task"].id for row in rows] == [task]
+    asyncio.run(deliver(runner, rows))
+
+    assert len(getattr(primary, "sent")) == 1
+    assert foreign.sent == []
+    assert not unseen(task)
+    assert not collect(runner)
+
+
+def test_ownerless_route_uses_declared_bot_profile_transport(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    other = RecordingAdapter()
+    runner._profile_adapters["other"] = {Platform.DISCORD: other}  # type: ignore[dict-item]
+    runner.config.profile_routes = parse_profile_routes([
+        dict(
+            platform="discord", guild_id="guild", chat_id="parent",
+            profile="yuki", bot_profile="other",
+        ),
+    ])
+    task = completion(profile=None, mode="notify")
+
+    rows = collect(runner)
+    assert [row["task"].id for row in rows] == [task]
+    asyncio.run(deliver(runner, rows))
+
+    assert getattr(primary, "sent") == []
+    assert len(other.sent) == 1
+    assert not unseen(task)
+
+
+def test_ownerless_wake_uses_routed_profile_and_runtime_scope(tmp_path, monkeypatch):
+    from hermes_constants import get_hermes_home
+
+    runner = setup_runner(tmp_path, monkeypatch)
+    home = tmp_path / ".hermes"
+    observed = []
+
+    class ScopedAdapter(RecordingAdapter):
+        async def handle_message(self, event):
+            await asyncio.sleep(0)
+            observed.append((event.source.profile, get_hermes_home()))
+            await super().handle_message(event)
+
+    primary = ScopedAdapter()
+    runner.adapters[Platform.DISCORD] = primary  # type: ignore[assignment]
+    task = completion(profile=None)
+
+    rows = collect(runner)
+    assert [row["task"].id for row in rows] == [task]
+    asyncio.run(deliver(runner, rows))
+
+    assert len(primary.sent) == len(primary.handled) == 1
+    assert observed == [("yuki", home / "profiles" / "yuki")]
+    assert not unseen(task)
+    assert not collect(runner)
+
+
+def test_removed_runtime_never_loads_global_scope_or_delivers(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+    import shutil
+
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    task = completion(profile=None)
+    rows = collect(runner)
+    assert len(rows) == 1
+    yuki_home = tmp_path / ".hermes" / "profiles" / "yuki"
+    original_resolver = runner._resolve_profile_home_for_source
+    entered_homes = []
+
+    def remove_then_resolve(source):
+        shutil.rmtree(yuki_home)
+        return original_resolver(source)
+
+    @asynccontextmanager
+    async def record_scope(profile_home):
+        entered_homes.append(profile_home)
+        yield
+
+    runner._resolve_profile_home_for_source = remove_then_resolve
+    monkeypatch.setattr("gateway.run._async_profile_runtime_scope", record_scope)
+    asyncio.run(deliver(runner, rows))
+
+    assert entered_homes == []
+    assert getattr(primary, "sent") == []
+    assert getattr(primary, "handled") == []
+    assert unseen(task)
+
+
+def test_removed_bot_profile_cannot_use_its_stale_adapter(tmp_path, monkeypatch):
+    import shutil
+
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    other = RecordingAdapter()
+    runner._profile_adapters["other"] = {Platform.DISCORD: other}  # type: ignore[dict-item]
+    runner.config.profile_routes = parse_profile_routes([
+        dict(
+            platform="discord", guild_id="guild", chat_id="parent",
+            profile="yuki", bot_profile="other",
+        ),
+    ])
+    task = completion(profile=None, mode="notify")
+    rows = collect(runner)
+    assert len(rows) == 1
+    shutil.rmtree(tmp_path / ".hermes" / "profiles" / "other")
+
+    asyncio.run(deliver(runner, rows))
+
+    assert getattr(primary, "sent") == []
+    assert other.sent == []
+    assert unseen(task)
+
+
+def test_route_mutation_after_ping_blocks_stale_wake(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+
+    class MutatingAdapter(RecordingAdapter):
+        async def send(self, chat_id, text, **kwargs):
+            await super().send(chat_id, text, **kwargs)
+            runner.config.profile_routes = parse_profile_routes([
+                dict(
+                    platform="discord", guild_id="guild", chat_id="parent",
+                    profile="other",
+                ),
+            ])
+
+    adapter = MutatingAdapter()
+    runner.adapters[Platform.DISCORD] = adapter  # type: ignore[assignment]
+    task = completion(profile=None)
+    rows = collect(runner)
+    assert len(rows) == 1
+
+    asyncio.run(deliver(runner, rows))
+
+    assert len(adapter.sent) == 1
+    assert adapter.handled == []
+    assert unseen(task)
+
+
+def test_route_mutation_while_runtime_scope_loads_is_retryable(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    task = completion(profile=None)
+    rows = collect(runner)
+    assert len(rows) == 1
+
+    @asynccontextmanager
+    async def mutate_route(_profile_home):
+        runner.config.profile_routes = parse_profile_routes([
+            dict(
+                platform="discord", guild_id="guild", chat_id="parent",
+                profile="other",
+            ),
+        ])
+        yield
+
+    monkeypatch.setattr("gateway.run._async_profile_runtime_scope", mutate_route)
+    asyncio.run(deliver(runner, rows))
+
+    assert getattr(primary, "sent") == []
+    assert getattr(primary, "handled") == []
+    assert unseen(task)
+
+
 def test_route_denials_leave_events_retryable_at_claim_and_send(tmp_path, monkeypatch):
     runner = setup_runner(tmp_path, monkeypatch)
     primary = runner.adapters[Platform.DISCORD]
-    # Unknown owners, wrong/default owners, incomplete anchors, and partial credentials
-    # never become primary delivery authority.
-    tasks = [completion(profile=owner) for owner in ("other", "default", None)]
+    # Unknown/wrong owners, incomplete anchors (including an ownerless row),
+    # and partial credentials never become primary delivery authority.
+    tasks = [completion(profile=owner) for owner in ("other", "default")]
+    tasks += [completion(profile=None, metadata={"scope_id": "guild"})]
     tasks += [completion(metadata=meta) for meta in (
         {"parent_chat_id": "parent"}, {"guild_id": "guild"},
         {"guild_id": "wrong", "parent_chat_id": "parent"},

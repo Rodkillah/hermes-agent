@@ -89,6 +89,10 @@ async def _load_profile_snapshot(
         display += f"  busy_text_mode: {legacy_text_mode}\n"
     profile_home.mkdir()
     (profile_home / "config.yaml").write_text(display, encoding="utf-8")
+    # Explicit profile routing is fail-closed when the canonical profile was
+    # removed, so the synthetic adapter fixture must represent a live profile.
+    from hermes_cli.profiles import get_profile_dir
+    get_profile_dir("research").mkdir(parents=True, exist_ok=True)
 
     assert await runner._start_one_profile_adapters("research", profile_home, {}) == 0
     adapter = _adapter()

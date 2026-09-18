@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +116,28 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_dashboard_create_applies_configured_default_target(client, kanban_home):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: telegram\n"
+        "      chat_id: dashboard-route\n"
+        "      delivery_mode: notify\n"
+    )
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "dashboard configured target", "assignee": "worker"},
+    )
+    assert response.status_code == 200, response.text
+    task_id = response.json()["task"]["id"]
+    with kbc.connect_closing() as conn:
+        subs = kbn.list_notify_subs(conn, task_id)
+    assert [(sub["platform"], sub["chat_id"], sub["delivery_mode"])
+            for sub in subs] == [("telegram", "dashboard-route", "notify")]
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):

@@ -4160,6 +4160,15 @@ class GatewayRunner(
         # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
         _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        transport_owner = self._transport_owner(context.source)
+        _bot_profile = ""
+        if transport_owner is not None:
+            _bot_profile = (
+                transport_owner[1]
+                or getattr(self, "_primary_profile_name", None)
+                or self._active_profile_name()
+                or "default"
+            )
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -4174,6 +4183,7 @@ class GatewayRunner(
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            bot_profile=_bot_profile,
             async_delivery=_async_delivery,
             cron_session="")
 
@@ -4343,20 +4353,29 @@ class GatewayRunner(
             profile_dir = get_profile_dir(name)
             if explicit_profile and not profile_exists(name):
                 logger.warning(
-                    "Profile %r does not exist for source %s/%s (guild_id=%s), "
-                    "falling back to global HERMES_HOME",
+                    "Profile %r does not exist for source %s/%s (guild_id=%s); "
+                    "refusing global HERMES_HOME fallback",
                     explicit_profile, source.platform.value, source.chat_id,
                     getattr(source, "guild_id", None))
-                return get_hermes_home()
+                raise ProfileRouteRejected(explicit_profile)
             return profile_dir
         except ProfileRouteRejected:
             raise
-        except Exception:
+        except Exception as exc:
+            if explicit_profile:
+                logger.warning(
+                    "Failed to resolve explicit profile directory for source %s/%s "
+                    "(guild_id=%s); refusing global HERMES_HOME fallback: %s",
+                    source.platform.value, source.chat_id,
+                    getattr(source, "guild_id", None), explicit_profile,
+                    exc_info=True,
+                )
+                raise ProfileRouteRejected(explicit_profile) from exc
             logger.warning(
                 "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
-                "falling back to global HERMES_HOME: %s",
-                source.platform.value, source.chat_id, getattr(source, "guild_id", None),
-                explicit_profile or "(no profile)", exc_info=True)
+                "falling back to global HERMES_HOME: (no profile)",
+                source.platform.value, source.chat_id,
+                getattr(source, "guild_id", None), exc_info=True)
             return get_hermes_home()
 
     @dataclasses.dataclass

@@ -405,8 +405,12 @@ _SPECS = [
              help="Parent channel ID for a thread or forum post, used for multiplex profile routing."),
         _arg("--guild-id",
              help="Discord guild ID, used for multiplex profile routing."),
+        _arg("--bot-profile",
+             help="Credential-owning gateway profile; when set, create a v2 authority"),
         _arg("--notifier-profile",
              help="Profile gateway that owns/delivers this subscription (default: active profile)"),
+        _arg("--ping-priority", type=int, default=0,
+             help="v2 physical ping election priority (higher wins)"),
         # choices: single source of truth shared with the DB/watcher enum.
         _arg("--delivery-mode", choices=kbn._NOTIFY_DELIVERY_MODES,
              help="How the kanban-notifier reacts to terminal events for this "
@@ -418,7 +422,24 @@ _SPECS = [
     ], help="Subscribe a gateway source to a task's terminal events (used by /kanban subscribe in the gateway adapter)"),
     _cmd("notify-list", [_arg("task_id", nargs="?"), _json_flag()],
          help="List notification subscriptions (optionally for a single task)"),
-    _cmd("notify-unsubscribe", [_TASK_ID, *_NOTIFY_TARGET], help="Remove a gateway subscription from a task"),
+    _cmd("notify-unsubscribe", [
+        _TASK_ID,
+        *_NOTIFY_TARGET,
+        _arg("--bot-profile", help="Credential-owning profile of the v2 authority"),
+        _arg("--notifier-profile", help="Wake-runtime profile of the v2 authority"),
+    ], help="Remove a legacy route or one fully identified v2 authority from a task"),
+    _cmd("notify-migrate-authorities", [
+        _arg("--board", default=argparse.SUPPRESS, metavar="<slug>",
+             help="Board slug (accepted here so the documented migration command can place "
+                  "--board after the action)"),
+        _arg("--mapping-file", required=True,
+             help="Private (mode 0600) JSON mapping of legacy subscription leases to bot profiles"),
+        _arg("--dry-run", action="store_true",
+             help="Validate completeness and print counts without writing"),
+        _arg("--apply", action="store_true",
+             help="Atomically apply a complete, unambiguous mapping"),
+        _json_flag(),
+    ], help="Migrate every legacy notification subscription to explicit v2 authorities"),
     _cmd("log", [_TASK_ID, _arg("--tail", type=int, help="Only print the last N bytes")],
          help="Print the worker log for a task (from <kanban-root>/kanban/logs/)"),
     _cmd("runs", [_TASK_ID, _json_flag(), *_run_state_args("filter runs by task_runs column")],

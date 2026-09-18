@@ -97,7 +97,7 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
         resolved = resolver(str(sub.get("chat_id") or ""))
     except Exception as exc:
         # An adapter-side lookup failure yields no scope, never an error.
-        logger.debug("kanban notifier: scope lookup failed for chat %s: %s", sub.get("chat_id"), exc, exc_info=True)
+        logger.debug("kanban notifier: scope lookup failed (%s)", type(exc).__name__)
         return None
     return str(resolved) if resolved else None
 
@@ -131,22 +131,25 @@ def _platform_names(mapping: Any) -> set[str]:
     return {getattr(platform, "value", str(platform)).lower() for platform in mapping}
 
 
-def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profile: Optional[str]) -> Any:
-    """Resolve a durable route without turning a missing secondary bot into primary authority."""
-    adapter = runner._authorization_adapter(platform, owner_profile)
+def _resolve_subscription_route(
+    runner: Any, platform: Any, sub: dict, owner_profile: Optional[str]
+) -> Optional[tuple[Any, Optional[str], Optional[str]]]:
+    """Return ``(adapter, runtime profile, adapter profile)`` for one durable row.
+
+    Ownerless rows carry no transport identity. Under multiplex, derive it from
+    the canonical profile-route matcher and require exactly one viable bot; a
+    missing anchor or competing bot leaves the claim retryable.
+    """
     config = getattr(runner, "config", None)
+    adapter = runner._authorization_adapter(platform, owner_profile)
     if not getattr(config, "multiplex_profiles", False):
-        return adapter
+        return (adapter, owner_profile, None) if adapter is not None else None
+
     primary = runner.adapters.get(platform)
-    if adapter is not None and adapter is not primary:
-        return adapter
-    profile = owner_profile or getattr(runner, "_kanban_notifier_profile", None)
-    primary_profile = getattr(runner, "_primary_profile_name", None) or runner._active_profile_name()
-    profile = profile or primary_profile
-    # Empty maps are startup placeholders for route-only profiles; a connected
-    # secondary on ANY platform establishes an independent credential boundary.
-    if (getattr(runner, "_profile_adapters", {}) or {}).get(profile):
-        return None
+    if owner_profile and adapter is not None and adapter is not primary:
+        registered, adapter_profile = runner._owning_profile(adapter, platform)
+        return (adapter, owner_profile, adapter_profile) if registered else None
+
     metadata = sub.get("delivery_metadata") or {}
     guild = metadata.get("scope_id") or metadata.get("guild_id")
     parent = metadata.get("parent_chat_id")
@@ -154,22 +157,96 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     thread_like = bool(thread) or (sub.get("chat_type") or metadata.get("chat_type")) in {
         "thread", "forum", "forum_post", "forum-post", "topic",
     }
-    # Preserve canonical route order, including equal-specificity ties. An older
-    # row missing an anchor must not skip a potentially winning route. Reuse the
-    # route's matcher (including platform-specific identity aliases), not a second
-    # hand-maintained equality implementation.
+    # For each receiving bot, only its highest-priority exact (or potentially
+    # exact, when the persisted row lacks an anchor) route matters.
+    route_states: dict[Optional[str], tuple[str, Any]] = {}
     for route in getattr(config, "profile_routes", None) or []:
-        if route.matches(platform.value, guild_id=guild, chat_id=chat,
-                         thread_id=thread, parent_chat_id=parent):
-            if route.profile != profile:
-                return None
+        bot_profile = route.bot_profile or None
+        if bot_profile in route_states:
+            continue
+        args = dict(
+            platform=platform.value, guild_id=guild, chat_id=chat,
+            thread_id=thread, parent_chat_id=parent, adapter_profile=bot_profile,
+        )
+        if route.matches(**args):
+            route_states[bot_profile] = ("exact", route)
+            continue
+        args["guild_id"] = guild or route.guild_id
+        args["parent_chat_id"] = parent or (route.chat_id if thread_like else None)
+        if route.matches(**args):
+            route_states[bot_profile] = ("uncertain", route)
+
+    if route_states:
+        applicable = [
+            (bot_profile, state, route)
+            for bot_profile, (state, route) in route_states.items()
+            if not owner_profile or route.profile == owner_profile
+        ]
+        if len(applicable) != 1 or applicable[0][1] != "exact":
+            return None
+        bot_profile, _state, route = applicable[0]
+        try:
             from gateway.run import _multiplex_profile_homes
             served = {name for name, _home in _multiplex_profile_homes(config)}
-            return primary if profile in served else None
-        if route.matches(platform.value, guild_id=guild or route.guild_id, chat_id=chat,
-                         thread_id=thread, parent_chat_id=parent or (route.chat_id if thread_like else None)):
+        except Exception:
             return None
-    return primary if profile == primary_profile else None
+        if route.profile not in served or (bot_profile and bot_profile not in served):
+            return None
+        # Shared-bot routes resolve through the runtime profile so
+        # _is_shared_bot_satellite enforces credential-boundary failures.
+        transport_profile = bot_profile or route.profile
+        adapter = runner._authorization_adapter(platform, transport_profile)
+        if adapter is None:
+            return None
+        registered, actual_profile = runner._owning_profile(adapter, platform)
+        actual_profile = actual_profile if actual_profile not in ("", "default") else None
+        if not registered or actual_profile != bot_profile:
+            return None
+        return adapter, route.profile, bot_profile
+
+    # No profile route covers this destination: preserve the legacy owner
+    # subscription, or the primary transport for an ownerless singleton row.
+    adapter = runner._authorization_adapter(platform, owner_profile)
+    if adapter is None:
+        return None
+    if owner_profile and adapter is primary:
+        primary_profile = (
+            getattr(runner, "_primary_profile_name", None)
+            or runner._active_profile_name()
+        )
+        if owner_profile not in ("default", primary_profile):
+            return None
+    registered, adapter_profile = runner._owning_profile(adapter, platform)
+    if not registered:
+        return None
+    return adapter, owner_profile, adapter_profile
+
+
+def _resolve_v2_authority(
+    runner: Any, platform: Any, sub: dict
+) -> Optional[tuple[Any, str, str]]:
+    """Resolve only the credential and runtime named by a v2 authority."""
+    bot_profile = str(sub.get("bot_profile") or "").strip()
+    runtime_profile = str(sub.get("notifier_profile") or "").strip()
+    if not bot_profile or not runtime_profile:
+        return None
+    adapter = runner._authorization_adapter(platform, bot_profile)
+    if adapter is None:
+        return None
+    registered, actual_profile = runner._owning_profile(adapter, platform)
+    primary_profile = (
+        getattr(runner, "_primary_profile_name", None)
+        or runner._active_profile_name()
+        or "default"
+    )
+    normalized_actual = (
+        primary_profile if actual_profile in (None, "", "default")
+        else str(actual_profile)
+    )
+    normalized_bot = primary_profile if bot_profile == "default" else bot_profile
+    if not registered or normalized_actual != normalized_bot:
+        return None
+    return adapter, runtime_profile, bot_profile
 
 
 # --- Collection (runs in a worker thread) ---
@@ -185,12 +262,18 @@ class _Collector:
         self.gc_due = gc_due
         self.gc_retention_days = gc_retention_days
         self.deliveries: list[dict] = []
-        self.include_unowned = runner._owns_kanban_dispatcher_lock()
-        self.profile_adapters = getattr(runner, "_profile_adapters", {})
-        self.notifier_profiles = {notifier_profile}
-        self.notifier_profiles.update(str(p).strip() for p in self.profile_adapters if str(p).strip())
         config = getattr(runner, "config", None)
-        if getattr(config, "multiplex_profiles", False):
+        self.multiplex_profiles = bool(getattr(config, "multiplex_profiles", False))
+        # The singleton owner remains the legacy fallback. A multiplex gateway
+        # may also inspect ownerless rows because exact persisted route anchors
+        # select the authorized profile adapter before the atomic event claim.
+        self.include_unowned = runner._owns_kanban_dispatcher_lock() or self.multiplex_profiles
+        self.profile_adapters = getattr(runner, "_profile_adapters", {})
+        self.notifier_profiles = {
+            str(notifier_profile).strip()
+        } if notifier_profile and str(notifier_profile).strip() else set()
+        self.notifier_profiles.update(str(p).strip() for p in self.profile_adapters if str(p).strip())
+        if self.multiplex_profiles:
             self.notifier_profiles.update(
                 route.profile for route in config.profile_routes
                 if route.enabled and route.platform in _platform_names(runner.adapters)
@@ -228,7 +311,9 @@ class _Collector:
         sidecars, checkpoints); a probe failure falls back to the writable open."""
         try:
             count = _kbn().count_notify_subs(
-                board=slug, notifier_profiles=self.notifier_profiles, include_unowned=self.include_unowned)
+                board=slug, notifier_profiles=self.notifier_profiles,
+                include_unowned=self.include_unowned,
+            ) + _kbn().count_notify_authorities(board=slug)
         except Exception as exc:
             logger.debug("kanban notifier: read-only subscription probe failed "
                          "for board %s (%s); falling back to writable open", slug, exc)
@@ -250,6 +335,11 @@ class _Collector:
 
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
         """Claim one subscription's unseen events; None when skipped or nothing new."""
+        # Every row loaded through connect() is migrated to a durable lease.
+        # Refuse a hand-written post-migration row that omitted it rather than
+        # claiming without rebind protection.
+        if not sub.get("subscription_id"):
+            return None
         owner_profile = sub.get("notifier_profile") or None
         platform = (sub.get("platform") or "").lower()
         if platform not in self.active_platforms:
@@ -257,19 +347,110 @@ class _Collector:
                          sub.get("task_id"), platform or "<missing>")
             return None
         from gateway.config import Platform
-        if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
+        # The durable row is authoritative: resolve through the canonical route
+        # matcher, which fails closed when a thread-shaped row carries no anchor
+        # and no profile route covers it.
+        resolved = _resolve_subscription_route(
+            self.runner, Platform(platform), sub, owner_profile
+        )
+        if resolved is None:
             _warn_anchorless_thread_sub_once(sub, platform)
             return None
+        _adapter, runtime_profile, adapter_profile = resolved
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
+            subscription_id=sub.get("subscription_id") or None,
         )
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {
+            "sub": sub, "old_cursor": old_cursor, "cursor": cursor,
+            "events": events, "task": task, "board": slug,
+            "resolved_profile": runtime_profile,
+            "resolved_adapter_profile": adapter_profile,
+        }
+
+    def _claim_v2(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
+        platform_name = str(sub.get("platform") or "").lower()
+        flow = sub["flow"]
+        if platform_name not in self.active_platforms:
+            return None
+        # Ping ownership follows the credential-bearing bot. The wake runtime is
+        # an independent flow and may be served by another gateway process.
+        if flow == "wake" and sub.get("notifier_profile") not in self.notifier_profiles:
+            return None
+        from gateway.config import Platform
+        try:
+            platform = Platform(platform_name)
+        except ValueError:
+            return None
+        resolved = _resolve_v2_authority(self.runner, platform, sub)
+        if resolved is None:
+            return None
+        _adapter, runtime_profile, adapter_profile = resolved
+        if flow == "ping":
+            claim = _kbn().claim_notify_ping(
+                conn,
+                route_id=sub["route_id"],
+                event_kinds=TERMINAL_KINDS,
+            )
+            old_cursor_key = "last_ping_event_id"
+        else:
+            claim = _kbn().claim_notify_wake(
+                conn,
+                subscription_id=sub["subscription_id"],
+                event_kinds=TERMINAL_KINDS,
+            )
+            old_cursor_key = "last_wake_event_id"
+        if claim is None:
+            return None
+        event = self.kb.Event(**claim["event"])
+        task = self.kb.get_task(conn, claim["task_id"])
+        return {
+            "sub": claim,
+            "old_cursor": int(claim.get(old_cursor_key) or 0),
+            "cursor": event.id,
+            "events": [event],
+            "task": task,
+            "board": slug,
+            "resolved_profile": runtime_profile,
+            "resolved_adapter_profile": adapter_profile,
+        }
+
+    def _collect_v2(self, conn: Any, slug: str) -> None:
+        authorities = _kbn().list_notify_authorities(conn)
+        by_subscription = {
+            authority["subscription_id"]: authority for authority in authorities
+        }
+        candidates: list[dict] = []
+        for route in _kbn().list_notify_routes(conn):
+            authority = by_subscription.get(route.get("ping_subscription_id"))
+            if authority is not None:
+                candidates.append({**authority, **route, "flow": "ping"})
+        candidates.extend(
+            {**authority, "flow": "wake"}
+            for authority in authorities
+            if authority["delivery_mode"] in ("wake", "notify+wake")
+        )
+        candidates.sort(key=lambda item: (
+            0 if item["flow"] == "ping" else 1,
+            str(item.get("notifier_profile") or ""),
+            str(item.get("subscription_id") or ""),
+        ))
+        for candidate in candidates:
+            try:
+                claimed = self._claim_v2(conn, slug, candidate)
+                if claimed is not None:
+                    self.deliveries.append(claimed)
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: v2 %s claim for task %s on board %s failed: %s",
+                    candidate["flow"], candidate.get("task_id"), slug, exc,
+                )
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -287,6 +468,7 @@ class _Collector:
             # No explicit init_db(): connect() already runs the migration once per
             # process, and init_db() would re-run it on a second connection racing
             # the first.
+            self._collect_v2(conn, slug)
             subs = _kbn().list_notify_subs(conn, notifier_profiles=self.notifier_profiles, include_unowned=self.include_unowned)
             if not subs:
                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
@@ -306,9 +488,10 @@ class _Collector:
 def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool, gc_retention_days: int) -> list[dict]:
     """Claim unseen terminal events for every owned subscription on every board.
 
-    Each gateway polls only subscriptions owned by profiles whose adapters it
-    hosts; legacy rows without a profile stamp are visible only to the process
-    holding the singleton dispatcher lock.
+    Each gateway polls subscriptions owned by profiles whose adapters it hosts.
+    Legacy rows without a profile stamp are visible to the singleton dispatcher
+    owner and to multiplex gateways, where exact persisted route anchors must
+    authorize the adapter before the atomic claim.
     """
     return _Collector(
         runner, kb, notifier_profile=notifier_profile, gc_due=gc_due, gc_retention_days=gc_retention_days,
@@ -452,6 +635,50 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
 # --- Delivery of one claimed batch (one subscription, N events) ---
 
 
+def _v2_claim_op(
+    board_slug: Optional[str], operation: str, sub: dict, event_id: int
+) -> bool:
+    with _kbc().connect(board=board_slug) as conn:
+        flow = sub["flow"]
+        token = sub["claim_token"]
+        if operation == "current":
+            lease_id = sub["route_id"] if flow == "ping" else sub["subscription_id"]
+            return _kbn().notify_v2_claim_is_current(
+                conn,
+                flow=flow,
+                lease_id=lease_id,
+                claim_token=token,
+                event_id=event_id,
+            )
+        if operation == "settle":
+            if flow == "ping":
+                return _kbn().settle_notify_ping(
+                    conn, route_id=sub["route_id"], claim_token=token,
+                    event_id=event_id,
+                )
+            return _kbn().settle_notify_wake(
+                conn, subscription_id=sub["subscription_id"],
+                claim_token=token, event_id=event_id,
+            )
+        if operation == "release":
+            if flow == "ping":
+                return _kbn().release_notify_ping(
+                    conn, route_id=sub["route_id"], claim_token=token,
+                    event_id=event_id,
+                )
+            return _kbn().release_notify_wake(
+                conn, subscription_id=sub["subscription_id"],
+                claim_token=token, event_id=event_id,
+            )
+        if operation == "unsubscribe":
+            if flow == "ping" and sub.get("delivery_mode") != "notify":
+                return True
+            return _kbn().remove_notify_authority(
+                conn, subscription_id=sub["subscription_id"]
+            )
+    return False
+
+
 class _KanbanNotification:
     """Deliver one subscription's claimed events, then settle the cursor.
 
@@ -470,7 +697,9 @@ class _KanbanNotification:
         self.board_slug = d.get("board")
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
-        self.sub_profile = sub.get("notifier_profile") or ""
+        self.persisted_profile = sub.get("notifier_profile") or None
+        self.sub_profile = d.get("resolved_profile") or self.persisted_profile or ""
+        self.adapter_profile = d.get("resolved_adapter_profile")
         self.title = (task.title if task else sub["task_id"])[:120]
         self.board_tag = f"[{self.board_slug}] " if self.board_slug else ""
         # Attribute the ping to the worker that did the work.
@@ -478,9 +707,16 @@ class _KanbanNotification:
         self.head = f"{self.board_tag}{tag}Kanban {self.task_id}"
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
+        self.v2_flow = sub.get("flow") if sub.get("flow") in ("ping", "wake") else None
+        if self.v2_flow:
+            self.sub_key = (
+                *self.sub_key,
+                self.v2_flow,
+                sub["route_id"] if self.v2_flow == "ping" else sub["subscription_id"],
+            )
         mode = sub.get("delivery_mode") or "notify"
-        self.wake_agent = mode in ("notify+wake", "wake")
-        self.send_passive = mode != "wake"
+        self.wake_agent = self.v2_flow == "wake" if self.v2_flow else mode in ("notify+wake", "wake")
+        self.send_passive = self.v2_flow == "ping" if self.v2_flow else mode != "wake"
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
@@ -492,14 +728,41 @@ class _KanbanNotification:
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
     async def rewind(self) -> None:
+        if self.v2_flow:
+            await _to_thread_process_service(
+                _v2_claim_op,
+                self.board_slug,
+                "release",
+                self.sub,
+                self.d["cursor"],
+            )
+            return
         await _to_thread_process_service(
             self.runner._kanban_rewind, self.sub, self.d["cursor"], self.d.get("old_cursor", 0), self.board_slug,
         )
 
     async def advance(self) -> None:
+        if self.v2_flow:
+            await _to_thread_process_service(
+                _v2_claim_op,
+                self.board_slug,
+                "settle",
+                self.sub,
+                self.d["cursor"],
+            )
+            return
         await _to_thread_process_service(self.runner._kanban_advance, self.sub, self.d["cursor"], self.board_slug)
 
     async def unsub(self) -> None:
+        if self.v2_flow:
+            await _to_thread_process_service(
+                _v2_claim_op,
+                self.board_slug,
+                "unsubscribe",
+                self.sub,
+                self.d["cursor"],
+            )
+            return
         await _to_thread_process_service(self.runner._kanban_unsub, self.sub, self.board_slug)
 
     def clear_failures(self) -> None:
@@ -535,10 +798,35 @@ class _KanbanNotification:
             self.wake_review_detail = review_detail
         return msg
 
+    def _stale_block_loop_detection_ids(self) -> set[int]:
+        """Ids of ``block_loop_detected`` events superseded by a later
+        ``block_loop_resolved`` in the same claimed batch.
+
+        A triage escalation already resolved before this tick must not ping a
+        human with a stale "routed to TRIAGE" alert. The cursor still advances
+        past the skipped event (it was claimed); only the alert and its wake are
+        suppressed. History is preserved, and a still-open detection (no later
+        resolution) is delivered normally.
+        """
+        events = self.d["events"]
+        resolved_ids = {ev.id for ev in events if ev.kind == "block_loop_resolved"}
+        if not resolved_ids:
+            return set()
+        return {
+            ev.id for ev in events
+            if ev.kind == "block_loop_detected" and any(rid > ev.id for rid in resolved_ids)
+        }
+
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        # A block_loop_detected already resolved on the board must not wake the
+        # creator for a closed loop.
+        stale = self._stale_block_loop_detection_ids()
+        self.wake_kinds = {
+            ev.kind for ev in self.d["events"]
+            if ev.kind in _WAKE_KINDS and ev.id not in stale
+        } if self.wake_agent else set()
         self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
         if not self.wake_kinds:
             return
@@ -566,28 +854,44 @@ class _KanbanNotification:
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
 
     def _log_woke(self) -> None:
-        logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                    self.task_id, self.platform_str, self.sub["chat_id"], self.sub_profile or "default", self.wake_kinds)
+        logger.info("kanban notifier: woke agent for %s on %s profile=%s events=%s",
+                    self.task_id, self.platform_str, self.sub_profile or "default", self.wake_kinds)
 
     def _owner_scope(self):
-        """Runtime scope of the subscription's profile under multiplex, else a no-op context."""
+        """Runtime scope required by this flow under a multiplex gateway."""
         runner = self.runner
-        if not (self.sub_profile and getattr(getattr(runner, "config", None), "multiplex_profiles", False)):
+        scope_profile = (
+            self.adapter_profile
+            if self.v2_flow == "ping"
+            else self.sub_profile
+        )
+        if not (
+            scope_profile
+            and getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+        ):
             return contextlib.nullcontext()
         from gateway.run import _async_profile_runtime_scope
         from gateway.session import SessionSource
-        source = SessionSource(platform=self.plat, chat_id=self.sub["chat_id"], profile=self.sub_profile)
+        source = SessionSource(
+            platform=self.plat,
+            chat_id=self.sub["chat_id"],
+            profile=scope_profile,
+        )
         return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
 
-    async def wake(self) -> None:
-        """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
+    async def wake(self) -> bool:
+        """Wake the creator session; False when delivery authority went stale."""
         from gateway.wake import deliver_wake
         sub = self.sub
         if not self.is_push_adapter:
+            # Revalidate the durable route after hydration, immediately before
+            # the external emission.
+            if await self._current_route() is None:
+                return False
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
                                notification_category="diagnostic" if self.wake_diagnostic else "result")
             self._log_woke()
-            return
+            return True
         from gateway.session import SessionSource
         # Rebuild the creator's real session scope from the persisted chat_type:
         # build_session_key() keys DMs differently from group/thread, so a
@@ -613,9 +917,12 @@ class _KanbanNotification:
             if not profile_exists(self.sub_profile):
                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
+            if await self._current_route() is None:
+                return False
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
                                notification_category="diagnostic" if self.wake_diagnostic else "result")
         self._log_woke()
+        return True
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
@@ -636,8 +943,9 @@ class _KanbanNotification:
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
-        logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                     ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
+        logger.debug("kanban notifier: delivered %s event for %s to %s/%s via %s on board %s",
+                     ev.kind, self.task_id, self.platform_str, sub["chat_id"],
+                     getattr(self, "plat", "") or "", self.board_slug)
         # Upload artifact paths from the handoff payload / legacy result as
         # native files. Both handoff kinds stage files for exactly this: a
         # review-bound card's files exist precisely so the human sees them at
@@ -655,7 +963,12 @@ class _KanbanNotification:
 
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        stale = self._stale_block_loop_detection_ids()
         for ev in self.d["events"]:
+            if ev.id in stale:
+                # Superseded by a later block_loop_resolved in this batch: skip the
+                # stale "routed to TRIAGE" alert (and its wake). Cursor still advances.
+                continue
             msg = self.format_event(ev)
             if msg is None:
                 continue
@@ -674,13 +987,19 @@ class _KanbanNotification:
                 continue
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
+            if await self._current_route() is None:
+                await self._rewind_stale_authority()
+                return False
             try:
                 if await self._send_event(ev, msg) is False:
                     continue
-                await _to_thread_process_service(partial(
-                    self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
-                    event_id=ev.id,
-                ))
+                # A v2 flow advances its own durable route/authority cursor;
+                # only the legacy row projects progress through the sub op.
+                if not self.v2_flow:
+                    await _to_thread_process_service(partial(
+                        self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
+                        event_id=ev.id,
+                    ))
                 self.clear_failures()
             except Exception as exc:
                 await self.delivery_failed(
@@ -690,48 +1009,108 @@ class _KanbanNotification:
                 return False
         return True
 
+    async def _current_route(self) -> Optional[tuple[Any, Optional[str], Optional[str]]]:
+        """Revalidate both the durable row lease and live route authority."""
+        if self.v2_flow:
+            current = await _to_thread_process_service(
+                _v2_claim_op,
+                self.board_slug,
+                "current",
+                self.sub,
+                self.d["cursor"],
+            )
+            if not current:
+                return None
+            resolved = _resolve_v2_authority(self.runner, self.plat, self.sub)
+            if (
+                resolved is None
+                or resolved[1] != self.sub_profile
+                or resolved[2] != self.adapter_profile
+            ):
+                return None
+            if self.adapter is not None and resolved[0] is not self.adapter:
+                return None
+            return resolved
+        current = await _to_thread_process_service(
+            self.runner._kanban_sub_current, self.sub, self.board_slug,
+        )
+        if not current:
+            return None
+        resolved = _resolve_subscription_route(
+            self.runner, self.plat, self.sub, self.persisted_profile,
+        )
+        if (
+            resolved is None
+            or (resolved[1] or "") != self.sub_profile
+            or resolved[2] != self.adapter_profile
+        ):
+            return None
+        if self.adapter is not None and resolved[0] is not self.adapter:
+            return None
+        return resolved
+
+    async def _rewind_stale_authority(self) -> None:
+        logger.debug(
+            "kanban notifier: delivery authority changed for %s on %s; rewinding claim",
+            self.task_id, self.platform_str,
+        )
+        await self.rewind()
+
     async def deliver(self) -> None:
         try:
             self.plat = self.platform_cls(self.platform_str)
         except ValueError:
             await self.advance()
             return
-        # Recheck the exact route after claiming: config/adapters can change between ticks.
-        adapter = _adapter_for_subscription(self.runner, self.plat, self.sub, self.sub_profile or None)
-        if adapter is None:
-            logger.debug("kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
-                         self.platform_str, self.task_id)
-            await self.rewind()
+        # Recheck both the exact durable row and its route after claiming:
+        # subscriptions, config and adapters can all change between ticks.
+        resolved = await self._current_route()
+        if resolved is None:
+            await self._rewind_stale_authority()
             return
+        adapter = resolved[0]
         self.adapter = adapter
         from gateway.wake import adapter_supports_push
         self.is_push_adapter = adapter_supports_push(adapter)
 
         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
-        async with self._owner_scope():
-            if not await self._send_pings():
-                return
-            # All text pings delivered (or skipped for non-push / wake-only).
-            original_events = self.d["events"]
-            from gateway.warning_notifications import warning_notifications_enabled
-            split = not warning_notifications_enabled(self.platform_str)
-            wake_groups = ([original_events] if not split else [
-                [ev for ev in original_events if diagnostic_event(ev)],
-                [ev for ev in original_events if not diagnostic_event(ev)],
-            ])
-            wake_payloads = []
-            for events in wake_groups:
-                if not events:
-                    continue
-                self.d = {**self.d, "events": events}
-                self.wake_handoff = self.wake_review_detail = ""
-                for ev in events:
-                    self.format_event(ev)
-                self.build_wake_text()
-                if self.wake_kinds:
-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
-            self.d = {**self.d, "events": original_events}
+        from gateway.profile_routing import ProfileRouteRejected
+        wake_payloads = []
+        try:
+            async with self._owner_scope():
+                # Secret/config hydration yields to the event loop. Revalidate after
+                # that boundary and immediately before any external emission.
+                if await self._current_route() is None:
+                    await self._rewind_stale_authority()
+                    return
+                if not await self._send_pings():
+                    return
+                # All text pings delivered (or skipped for non-push / wake-only).
+                # Diagnostic and result events wake separately when user-channel
+                # warning notifications are off, so a wake never carries a
+                # category the operator asked to suppress.
+                original_events = self.d["events"]
+                from gateway.warning_notifications import warning_notifications_enabled
+                split = not warning_notifications_enabled(self.platform_str)
+                wake_groups = ([original_events] if not split else [
+                    [ev for ev in original_events if diagnostic_event(ev)],
+                    [ev for ev in original_events if not diagnostic_event(ev)],
+                ])
+                for events in wake_groups:
+                    if not events:
+                        continue
+                    self.d = {**self.d, "events": events}
+                    self.wake_handoff = self.wake_review_detail = ""
+                    for ev in events:
+                        self.format_event(ev)
+                    self.build_wake_text()
+                    if self.wake_kinds:
+                        wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
+                self.d = {**self.d, "events": original_events}
+        except ProfileRouteRejected:
+            await self._rewind_stale_authority()
+            return
         wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 
@@ -739,8 +1118,13 @@ class _KanbanNotification:
         if wake_payloads:
             try:
                 for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
-                    await self.wake()
+                    if not await self.wake():
+                        await self._rewind_stale_authority()
+                        return
                 self.clear_failures()
+            except ProfileRouteRejected:
+                await self._rewind_stale_authority()
+                return
             except WakeNotAccepted:
                 # Startup / full queue is not a dead destination. Keep the durable
                 # subscription alive regardless of how long admission takes.

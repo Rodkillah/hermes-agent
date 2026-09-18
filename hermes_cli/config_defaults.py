@@ -1761,6 +1761,17 @@ DEFAULT_CONFIG = {
         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
         # not own notification subscriptions to avoid an idle five-second board probe.
         "notify_in_gateway": True,
+        # Explicit per-board default notification targets, applied to every new task created on a
+        # matching board (tool + CLI + dashboard) in addition to the creator's auto-subscription.
+        # Empty by default: other installs/profiles gain no implicit destination. Each entry is a
+        # mapping with keys board (required), platform (required), chat_id (required),
+        # delivery_mode (required: notify|wake|notify+wake), notifier_profile (required for
+        # wake/notify+wake and every v2 authority), and optional bot_profile / ping_priority /
+        # thread_id / chat_type / user_id / user_id_alt / delivery_metadata. A target with
+        # bot_profile uses the v2 route/authority model; one without it remains a legacy route.
+        # A non-empty invalid list fails task creation (fail-closed) rather than silently creating
+        # an un-notified card. Gated by auto_subscribe_on_create.
+        "default_notify_targets": [],
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,

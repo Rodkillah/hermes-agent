@@ -1863,6 +1863,9 @@ def test_default_config_kanban_block_not_dropped_by_duplicate_key():
     # From the second block:
     assert "dispatch_in_gateway" in kanban
     assert "auto_decompose" in kanban
+    # The new default-notify-targets key must default to an empty list so other
+    # installs/profiles gain no implicit destination.
+    assert kanban.get("default_notify_targets") == []
 
 
 def test_default_config_has_no_duplicate_top_level_keys():

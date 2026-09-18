@@ -38,6 +38,43 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["notifier_profile"] == "default"
 
 
+def test_notify_cursor_advance_is_monotonic(kanban_home):
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="monotonic cursor", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat1",
+        )
+        kb._append_event(conn, task_id, kind="crashed")
+        kb._append_event(conn, task_id, kind="timed_out")
+        event_ids = [
+            event.id for event in kb.list_events(conn, task_id)
+            if event.kind in {"crashed", "timed_out"}
+        ]
+        first_event, second_event = event_ids
+
+        kbn.advance_notify_cursor(
+            conn, task_id=task_id, platform="telegram", chat_id="chat1",
+            new_cursor=second_event,
+        )
+        # A slower delivery settling an older claim must never move the durable
+        # cursor backward and make the later event eligible for redelivery.
+        kbn.advance_notify_cursor(
+            conn, task_id=task_id, platform="telegram", chat_id="chat1",
+            new_cursor=first_event,
+        )
+
+        sub = kbn.list_notify_subs(conn, task_id)[0]
+        assert sub["last_event_id"] == second_event
+        _, remaining = kbn.unseen_events_for_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat1",
+            kinds=["crashed", "timed_out"],
+        )
+        assert remaining == []
+    finally:
+        conn.close()
+
+
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
     """delivery_mode persists; an explicit re-subscribe is last-write-wins, a
     ``None`` re-subscribe leaves the existing mode untouched, an unknown value
@@ -424,6 +461,7 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
     from gateway.run import GatewayRunner
     from gateway.config import Platform
 
+    (kanban_home / "profiles" / "owner-profile").mkdir(parents=True)
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="group wake", assignee="worker1")
@@ -717,6 +755,8 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
+    adapter = SimpleNamespace()
+    runner.adapters = {Platform.TELEGRAM: adapter}
     source = SimpleNamespace(
         platform=Platform.TELEGRAM,
         chat_id="chat1",
@@ -724,6 +764,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         thread_id="20197",
         user_id="u1",
     )
+    source._transport_adapter_ref = lambda: adapter
     event = SimpleNamespace(
         text='/kanban --board projx create "hello" --assignee alice',
         source=source,
@@ -737,7 +778,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
     conn = kbc.connect(board="projx")
     try:
-        subs = kbn.list_notify_subs(conn)
+        subs = kbn.list_notify_authorities(conn)
         tasks = kb.list_tasks(conn)
     finally:
         conn.close()
@@ -793,6 +834,8 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
+    adapter = SimpleNamespace()
+    runner.adapters = {Platform.TELEGRAM: adapter}
     # user_id != user_id_alt is the whole point: the alt id is the canonical
     # participant, so dropping it silently corrupts the session key.
     source = SimpleNamespace(
@@ -803,6 +846,7 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
         user_id="open-id",
         user_id_alt="union-id",
     )
+    source._transport_adapter_ref = lambda: adapter
     event = SimpleNamespace(
         text='/kanban create "hello" --assignee alice',
         source=source,
@@ -813,7 +857,7 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
     conn = kbc.connect()
     try:
-        subs = kbn.list_notify_subs(conn)
+        subs = kbn.list_notify_authorities(conn)
     finally:
         conn.close()
     assert len(subs) == 1

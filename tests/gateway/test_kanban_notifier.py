@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -25,6 +26,11 @@ class RecordingAdapter:
     async def handle_message(self, event):
         self.handled.append(event)
         event._gateway_accepted = True
+
+
+class FailingScopeAdapter(RecordingAdapter):
+    def scope_id_for_chat(self, chat_id):
+        raise RuntimeError(f"scope unavailable for {chat_id}")
 
 
 class DisconnectedAdapters(dict):
@@ -67,6 +73,32 @@ def _create_completed_subscription(summary="done once"):
         return tid
     finally:
         conn.close()
+
+
+def test_notifier_logs_never_expose_route_ids(tmp_path, monkeypatch, caplog):
+    route_sentinel = "CHAT-ID-MUST-NOT-APPEAR"
+    db_path = tmp_path / "confidential-log-route.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="confidential route", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=route_sentinel,
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = FailingScopeAdapter()
+    runner = _make_runner(adapter)
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert route_sentinel not in caplog.text
 
 
 def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
@@ -400,6 +432,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     """Done is reversible; archive alone ends notification ownership."""
     db_path = tmp_path / "done-reopen-archive.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    from hermes_cli.profiles import get_profile_dir
+    get_profile_dir("reviewer").mkdir(parents=True, exist_ok=True)
     kb.init_db()
 
     conn = kbc.connect()
@@ -899,3 +933,250 @@ def test_notifier_delivers_production_promoted_post_commit_without_replay(
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 1
+
+
+def test_default_notify_target_delivers_terminal_event(tmp_path, monkeypatch):
+    """End-to-end: a task created with a configured ``kanban.default_notify_targets``
+    target (no session channel) carries a Forge/Telegram/DM/notify+wake subscription
+    that the notifier actually delivers on a terminal event, and does not replay it
+    on a second tick (cursor caught up)."""
+    db_path = tmp_path / "default-target-delivery.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: telegram\n"
+        "      chat_id: forge-chat\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: forge\n"
+        "      delivery_mode: notify+wake\n"
+    )
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="forge default target", assignee="worker")
+        subs = kbn.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["chat_id"] == "forge-chat"
+        assert subs[0]["notifier_profile"] == "forge"
+        assert subs[0]["delivery_mode"] == "notify+wake"
+        kb.complete_task(conn, tid, summary="done via default target")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "done" in adapter.sent[0]["text"]
+
+    # Second tick: cursor already advanced, no replay.
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+
+
+def test_default_notify_target_delivers_blocked_needs_input(tmp_path, monkeypatch):
+    """The exact original bug: a card created without a session channel must still
+    notify Forge on a ``blocked/needs_input`` event via the configured default target."""
+    db_path = tmp_path / "default-target-blocked.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: telegram\n"
+        "      chat_id: forge-chat\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: forge\n"
+        "      delivery_mode: notify+wake\n"
+    )
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="forge blocked", assignee="worker")
+        assert len(kbn.list_notify_subs(conn, tid)) == 1
+        kb.block_task(conn, tid, reason="needs human decision", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "blocked" in adapter.sent[0]["text"]
+
+
+def test_default_notify_target_delivers_all_terminal_kinds(tmp_path, monkeypatch):
+    """Criterion 4: a default-target subscription delivers every terminal kind the
+    notifier observes — blocked, crashed, timed_out, changes_requested, completed —
+    with notify+wake, and the cursor advances so none is replayed."""
+    db_path = tmp_path / "default-target-all-kinds.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  default_notify_targets:\n"
+        "    - board: default\n"
+        "      platform: telegram\n"
+        "      chat_id: forge-chat\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: forge\n"
+        "      delivery_mode: notify+wake\n"
+    )
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="all kinds", assignee="worker")
+        assert len(kbn.list_notify_subs(conn, tid)) == 1
+        # Emit each terminal kind the notifier observes (TERMINAL_KINDS).
+        kb._append_event(conn, tid, kind="crashed")
+        kb._append_event(conn, tid, kind="timed_out")
+        kb._append_event(conn, tid, kind="changes_requested", payload={"reason": "rework"})
+        kb._append_event(conn, tid, kind="blocked", payload={"reason": "needs input", "kind": "needs_input"})
+        kb._append_event(conn, tid, kind="completed", payload={"summary": "done"})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # All five terminal kinds delivered exactly once, in order.
+    assert len(adapter.sent) == 5
+    texts = [d["text"].lower() for d in adapter.sent]
+    assert any("crashed" in t for t in texts)
+    assert any("timed out" in t or "timed_out" in t for t in texts)
+    assert any("changes" in t for t in texts)
+    assert any("blocked" in t for t in texts)
+    assert any("done" in t for t in texts)
+
+    # Second tick: cursor advanced past all five, nothing replayed.
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 5
+
+
+def _make_block_loop_task(conn, kb, *, resolved: bool):
+    """Create a task with a notify+wake subscription, then a ``block_loop_detected``
+    event, optionally followed by a ``block_loop_resolved`` event."""
+    tid = kb.create_task(conn, title="loop", assignee="worker")
+    kbn.add_notify_sub(
+        conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        notifier_profile="forge", delivery_mode="notify+wake",
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+        kb._append_event(
+            conn, tid, "block_loop_detected",
+            {"source_status": "ready", "recurrences": 2, "reason": "repeat"},
+        )
+        if resolved:
+            kb._append_event(
+                conn, tid, "block_loop_resolved",
+                {"decision": "retry", "actor": "amber", "reason": "superseded"},
+            )
+    return tid
+
+
+def test_block_loop_detected_then_resolved_before_tick_is_not_delivered(tmp_path, monkeypatch):
+    """A triage escalation resolved before the notifier tick must not ping a human
+    with a stale 'routed to TRIAGE' alert (the exact t_9ae74e66 regression)."""
+    db_path = tmp_path / "block-loop-resolved-before-tick.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = _make_block_loop_task(conn, kb, resolved=True)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # No stale "routed to TRIAGE" alert; the resolution is the only actionable event.
+    assert len(adapter.sent) == 1
+    assert "block loop resolved" in adapter.sent[0]["text"]
+    assert "TRIAGE" not in adapter.sent[0]["text"]
+
+
+def test_block_loop_detected_unresolved_is_delivered(tmp_path, monkeypatch):
+    """A still-open triage escalation (no later resolution) is delivered normally."""
+    db_path = tmp_path / "block-loop-unresolved.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = _make_block_loop_task(conn, kb, resolved=False)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "TRIAGE" in adapter.sent[0]["text"]
+
+
+def test_block_loop_resolved_after_delivery_is_not_replayed(tmp_path, monkeypatch):
+    """A resolution arriving after the detection was already delivered does not
+    replay the detection (cursor advanced), and the resolution itself is delivered."""
+    db_path = tmp_path / "block-loop-resolved-after-tick.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = _make_block_loop_task(conn, kb, resolved=False)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert "TRIAGE" in adapter.sent[0]["text"]
+
+    # Resolution lands after the first tick.
+    conn = kbc.connect()
+    try:
+        kb._append_event(
+            conn, tid, "block_loop_resolved",
+            {"decision": "retry", "actor": "amber", "reason": "superseded"},
+        )
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "forge"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Only the resolution is new; the detection is not replayed.
+    assert len(adapter.sent) == 2
+    assert "block loop resolved" in adapter.sent[1]["text"]
+    assert "TRIAGE" not in adapter.sent[1]["text"]

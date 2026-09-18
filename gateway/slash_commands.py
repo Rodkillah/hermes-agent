@@ -391,22 +391,53 @@ class GatewaySlashCommandsMixin(
         if not (platform_str and chat_id):
             return False
 
+        runtime_profile = (
+            _field("profile")
+            or getattr(self, "_kanban_notifier_profile", None)
+            or self._active_profile_name()
+            or "default"
+        )
+        transport_owner = self._transport_owner(source)
+        bot_profile = None
+        if transport_owner is not None:
+            bot_profile = (
+                transport_owner[1]
+                or getattr(self, "_primary_profile_name", None)
+                or self._active_profile_name()
+                or "default"
+            )
+
         def _sub():
-            from hermes_cli import kanban_db as _kb
             from hermes_cli import kanban_db_connect as _kbc
             from hermes_cli import kanban_db_notify as _kbn
             conn = _kbc.connect(board=requested_board)
             try:
-                _kbn.add_notify_sub(
-                    conn, task_id=task_id, platform=platform_str, chat_id=chat_id, chat_type=chat_type,
-                    thread_id=_field("thread_id"), user_id=_field("user_id"),
-                    # Also persist the stable alt id (Signal UUID, Feishu union_id): build_session_key
-                    # keys the participant on ``user_id_alt or user_id``, so a replayed wake rebuilds
-                    # the same session key only when the alt id survives the round-trip.
-                    user_id_alt=_field("user_id_alt"),
-                    notifier_profile=_field("profile") or getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                    # Subscribing from chat: deliver the passive message and wake the destination agent.
-                    delivery_mode="notify+wake", delivery_metadata=delivery_metadata)
+                if bot_profile:
+                    exists = any(
+                        authority["platform"] == platform_str
+                        and authority["chat_id"] == chat_id
+                        and (authority["thread_id"] or "") == (_field("thread_id") or "")
+                        and authority["bot_profile"] == bot_profile
+                        and authority["notifier_profile"] == runtime_profile
+                        for authority in _kbn.list_notify_authorities(conn, task_id)
+                    )
+                    if not exists:
+                        _kbn.add_notify_authority(
+                            conn, task_id=task_id, platform=platform_str, chat_id=chat_id,
+                            chat_type=chat_type, thread_id=_field("thread_id"),
+                            user_id=_field("user_id"), user_id_alt=_field("user_id_alt"),
+                            bot_profile=bot_profile, notifier_profile=runtime_profile,
+                            delivery_mode="notify+wake", delivery_metadata=delivery_metadata,
+                            source_kind="creator",
+                        )
+                else:
+                    _kbn.add_notify_sub(
+                        conn, task_id=task_id, platform=platform_str, chat_id=chat_id,
+                        chat_type=chat_type, thread_id=_field("thread_id"),
+                        user_id=_field("user_id"), user_id_alt=_field("user_id_alt"),
+                        notifier_profile=runtime_profile, delivery_mode="notify+wake",
+                        delivery_metadata=delivery_metadata,
+                    )
             finally:
                 conn.close()
         await asyncio.to_thread(_sub)

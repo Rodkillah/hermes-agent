@@ -1066,12 +1066,59 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'notify',
     delivery_metadata TEXT,
+    subscription_id TEXT NOT NULL DEFAULT '',
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     last_ping_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- v2 keeps the physical destination separate from the bots/runtimes allowed to
+-- use it.  The legacy table above remains an inert rollback projection once its
+-- subscription_id is linked from an authority; there are deliberately no
+-- triggers or cascading foreign keys between the two generations.
+CREATE TABLE IF NOT EXISTS kanban_notify_routes (
+    task_id              TEXT NOT NULL,
+    platform             TEXT NOT NULL,
+    chat_id              TEXT NOT NULL,
+    thread_id            TEXT NOT NULL DEFAULT '',
+    route_id              TEXT NOT NULL UNIQUE,
+    ping_subscription_id  TEXT,
+    last_ping_event_id    INTEGER NOT NULL DEFAULT 0,
+    claim_event_id        INTEGER,
+    claim_token           TEXT,
+    claim_expires_at      INTEGER,
+    created_at            INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_notify_authorities (
+    task_id                TEXT NOT NULL,
+    platform               TEXT NOT NULL,
+    chat_id                TEXT NOT NULL,
+    thread_id              TEXT NOT NULL DEFAULT '',
+    bot_profile            TEXT NOT NULL CHECK (bot_profile <> ''),
+    notifier_profile       TEXT NOT NULL CHECK (notifier_profile <> ''),
+    subscription_id        TEXT NOT NULL UNIQUE,
+    legacy_subscription_id TEXT UNIQUE,
+    delivery_mode          TEXT NOT NULL CHECK (delivery_mode IN ('notify', 'notify+wake', 'wake')),
+    ping_priority          INTEGER NOT NULL DEFAULT 0 CHECK (typeof(ping_priority) = 'integer'),
+    source_kind            TEXT NOT NULL CHECK (source_kind IN ('default', 'creator', 'inherited', 'manual', 'legacy')),
+    user_id                TEXT,
+    user_id_alt            TEXT,
+    chat_type              TEXT,
+    delivery_metadata      TEXT,
+    last_wake_event_id      INTEGER NOT NULL DEFAULT 0,
+    claim_event_id          INTEGER,
+    claim_token             TEXT,
+    claim_expires_at        INTEGER,
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (
+        task_id, platform, chat_id, thread_id, bot_profile, notifier_profile
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1114,6 +1161,19 @@ CREATE TABLE IF NOT EXISTS production_probes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_routes_task    ON kanban_notify_routes(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_routes_claim   ON kanban_notify_routes(claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_notify_authorities_task ON kanban_notify_authorities(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_authorities_bot ON kanban_notify_authorities(bot_profile);
+CREATE INDEX IF NOT EXISTS idx_notify_authorities_runtime ON kanban_notify_authorities(notifier_profile);
+CREATE INDEX IF NOT EXISTS idx_notify_authorities_claim ON kanban_notify_authorities(claim_expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_authorities_legacy
+    ON kanban_notify_authorities(legacy_subscription_id)
+    WHERE legacy_subscription_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_authorities_wake_runtime
+    ON kanban_notify_authorities(
+        task_id, platform, chat_id, thread_id, notifier_profile
+    ) WHERE delivery_mode IN ('wake', 'notify+wake');
 CREATE INDEX IF NOT EXISTS idx_production_probes_receipt ON production_probes(receipt_id, ordinal);
 """
 
@@ -1315,6 +1375,66 @@ def _repair_utf8_mojibake(value: Optional[str]) -> Optional[str]:
     return value
 
 
+def _load_default_notify_targets() -> list[dict]:
+    """Resolve + validate ``kanban.default_notify_targets``.
+
+    Returns the normalized target list (board filtering happens at insert time so
+    one normalized list serves every board). Absent/empty config -> ``[]``
+    (historical behaviour: no implicit destination). Gated by
+    ``kanban.auto_subscribe_on_create``, matching the creator auto-subscription.
+    An unreadable config -> ``[]``; a readable but non-empty invalid value raises
+    :class:`ValueError` (fail-closed, no silent un-notified card).
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        cfg = load_config()
+        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+            return []
+        raw = cfg_get(cfg, "kanban", "default_notify_targets", default=None)
+    except Exception:
+        return []
+    from hermes_cli import kanban_db_notify as _kbn
+    return _kbn.normalize_default_notify_targets(raw)
+
+
+def _canonical_board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """Canonical board whose standard DB path matches ``conn``, if known.
+
+    Compare standard locations directly: ``kanban_db_path`` honors
+    ``HERMES_KANBAN_DB`` and would otherwise make every slug appear to own the
+    override. Unknown/custom DB paths return ``None`` for caller fallback.
+    """
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        resolved = str(Path(row[2]).resolve()) if row and row[2] else ""
+        for meta in list_boards(include_archived=True):
+            slug = _normalize_board_slug(meta.get("slug"))
+            if not slug:
+                continue
+            expected = (
+                kanban_home() / "kanban.db"
+                if slug == DEFAULT_BOARD
+                else board_dir(slug) / "kanban.db"
+            )
+            if str(expected.resolve()) == resolved:
+                return slug
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_board_slug(conn: sqlite3.Connection, board: Optional[str]) -> str:
+    """Resolve the board identity for a write from the opened database.
+
+    A known canonical DB is authoritative, so a divergent explicit slug cannot
+    select another board's notification targets for that DB. Custom DB paths
+    fall back to the explicit slug, then ambient state.
+    """
+    opened = _canonical_board_for_connection(conn)
+    explicit = _normalize_board_slug(board)
+    return opened or explicit or get_current_board()
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1358,13 +1478,17 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    # A known opened DB is authoritative for every inherited board default;
+    # resolve it once before consulting metadata so ambient board state cannot
+    # select another project's repo for this connection.
+    board_slug = _resolve_board_slug(conn, board)
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
     # it must not be upgraded to a worktree in the board's repo (#106342).
     if project_id is None and workspace_kind != "scratch":
         try:
-            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
+            project_id = (_board_meta_for(board_slug).get("project_id") or "").strip() or None
         except Exception:
             pass
     if workspace_kind is None:
@@ -1398,10 +1522,15 @@ def create_task(
 
     now = int(time.time())
 
+    # Resolve + validate configured default notify targets once, before the write
+    # txn, so a non-empty invalid config fails creation before any row is written
+    # (fail-closed: no silent un-notified card). Board filtering happens at insert.
+    default_targets = _load_default_notify_targets()
+
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
     if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
-        board_default = _board_meta_for(board).get("default_workdir")
+        board_default = _board_meta_for(board_slug).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
 
@@ -1498,6 +1627,20 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                from hermes_cli import kanban_db_notify as _kbn
+                _kbn.inherit_notify_authorities(
+                    conn,
+                    task_id=task_id,
+                    creator_task_id=creator_task_id,
+                    parent_ids=parents,
+                )
+                # Configured default notify targets (kanban.default_notify_targets),
+                # applied in the same transaction after creator/parent inheritance so
+                # an identical route already owned by the creator/parent wins and the
+                # default target is treated as satisfied (no destructive overwrite).
+                if default_targets:
+                    _kbn.apply_default_notify_targets(
+                        conn, task_id=task_id, board=board_slug, targets=default_targets)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -1563,10 +1706,11 @@ def _inherit_notify_subs(
         INSERT OR IGNORE INTO kanban_notify_subs
             (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
              chat_type, notifier_profile, delivery_mode, delivery_metadata,
-             created_at, last_event_id)
+             subscription_id, created_at, last_event_id)
         SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
                COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+               COALESCE(delivery_mode, 'notify'), delivery_metadata,
+               lower(hex(randomblob(16))), ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
@@ -3832,7 +3976,14 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in (
+        "kanban_notify_authorities",
+        "kanban_notify_routes",
+        "task_comments",
+        "task_events",
+        "task_runs",
+        "kanban_notify_subs",
+    ):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
     receipt = conn.execute(
         "SELECT id FROM production_receipts WHERE task_id = ?", (task_id,)
@@ -4538,31 +4689,9 @@ def _normalise_production_receipt(receipt: Mapping[str, Any]) -> tuple[dict, lis
 
 def _board_for_connection(conn: sqlite3.Connection) -> str:
     """Resolve the board owning an open connection, not the ambient board."""
-    try:
-        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
-        resolved = str(Path(db_file).resolve()) if db_file else ""
-        for meta in list_boards(include_archived=True):
-            slug = meta.get("slug")
-            if not slug:
-                continue
-            # ``kanban_db_path`` deliberately honors HERMES_KANBAN_DB, so it
-            # cannot be used to identify the owner of an already-open
-            # connection: an incoherent ambient override would make every
-            # board appear to point at the override. Compare against the
-            # canonical per-board location instead.
-            expected = (
-                kanban_home() / "kanban.db"
-                if slug == DEFAULT_BOARD
-                else board_dir(slug) / "kanban.db"
-            )
-            if str(expected.resolve()) == resolved:
-                return slug
-    except Exception:
-        # Production promotion must never fall back to the ambient board when
-        # connection ownership cannot be established.
-        raise ProductionLifecycleError(
-            "cannot resolve the board owning the production connection"
-        ) from None
+    slug = _canonical_board_for_connection(conn)
+    if slug:
+        return slug
     raise ProductionLifecycleError(
         "cannot resolve the board owning the production connection"
     )

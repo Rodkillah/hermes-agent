@@ -1006,10 +1006,12 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
             delivery_metadata["direct_messages_topic_id"] = str(thread_id)
         if message_id:
             delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
+    bot_profile = env("HERMES_SESSION_BOT_PROFILE", "") or None
     return dict(
         platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=thread_id,
         user_id=env("HERMES_SESSION_USER_ID", "") or None,
         user_id_alt=env("HERMES_SESSION_USER_ID_ALT", "") or None,
+        bot_profile=bot_profile,
         notifier_profile=notifier_profile,
         delivery_mode="notify+wake" if platform != "tui" else None,
         delivery_metadata=delivery_metadata or None)
@@ -1019,7 +1021,12 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
-    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create."""
+    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create.
+
+    Also returns True when the task already carries at least one subscription — e.g. a
+    configured ``kanban.default_notify_targets`` row applied by ``create_task`` — even if
+    this session has no persistent channel of its own, so the ``subscribed`` flag reflects
+    the real delivery state rather than only the creator's auto-subscription."""
     try:
         if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
             return False
@@ -1029,15 +1036,38 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     try:
         target = _resolve_notify_target()
         if target is None:
-            return False  # CLI / cron / test — no persistent channel
+            # CLI / cron / test — no persistent channel. A configured default target
+            # may still have subscribed the task inside create_task; reflect that.
+            from hermes_cli import kanban_db_notify as _kbn
+            return bool(
+                _kbn.list_notify_subs(conn, task_id)
+                or _kbn.list_notify_authorities(conn, task_id)
+            )
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
         # Auto-subscribe must not turn a passive destination into an agent wake.
+        legacy = _kbn.list_notify_subs(conn, task_id)
         if any(sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
-               for sub in _kbn.list_notify_subs(conn, task_id)):
+               for sub in legacy):
             return True
-        _kbn.add_notify_sub(conn, task_id=task_id, **target)
+        if target.get("bot_profile"):
+            if any(
+                authority["platform"] == target["platform"]
+                and authority["chat_id"] == target["chat_id"]
+                and (authority["thread_id"] or "") == (target["thread_id"] or "")
+                and authority["bot_profile"] == target["bot_profile"]
+                and authority["notifier_profile"] == target["notifier_profile"]
+                for authority in _kbn.list_notify_authorities(conn, task_id)
+            ):
+                return True
+            _kbn.add_notify_authority(
+                conn, task_id=task_id, source_kind="creator", **target
+            )
+        else:
+            legacy_target = dict(target)
+            legacy_target.pop("bot_profile", None)
+            _kbn.add_notify_sub(conn, task_id=task_id, **legacy_target)
         return True
     except Exception as _exc:
         logger.warning(

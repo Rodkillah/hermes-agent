@@ -853,6 +853,7 @@ _NOTIFY_SUB_COLUMNS = (
     # (which prefers ``user_id_alt``). NULL is inert.
     ("user_id_alt", "user_id_alt TEXT"),
     ("delivery_metadata", "delivery_metadata TEXT"),
+    ("subscription_id", "subscription_id TEXT NOT NULL DEFAULT ''"),
 )
 
 _TASK_RUN_COLUMNS = (
@@ -931,6 +932,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     "UPDATE kanban_notify_subs SET delivery_mode = 'notify+wake' "
                     "WHERE platform != 'tui'"
                 )
+        # Durable row identity fences an in-flight notifier claim from a later
+        # unsubscribe/rebind of the same logical route. Legacy rows receive one
+        # token exactly once; the partial index tolerates hand-written legacy
+        # fixtures that still omit the additive column.
+        conn.execute(
+            "UPDATE kanban_notify_subs "
+            "SET subscription_id = lower(hex(randomblob(16))) "
+            "WHERE subscription_id IS NULL OR subscription_id = ''"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_subscription_id "
+            "ON kanban_notify_subs(subscription_id) WHERE subscription_id <> ''"
+        )
 
     if _table_exists(conn, "task_runs"):
         run_cols = _column_names(conn, "task_runs")
@@ -1051,11 +1065,16 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT,"
         " chat_type TEXT,"
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
-        " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
+        " delivery_metadata TEXT, subscription_id TEXT NOT NULL DEFAULT '',"
+        " created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " last_ping_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
-        ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
+        (
+            "CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",
+            "CREATE UNIQUE INDEX idx_notify_subscription_id "
+            "ON kanban_notify_subs(subscription_id) WHERE subscription_id <> ''",
+        ),
     ),
 }
 

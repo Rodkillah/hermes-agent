@@ -1162,6 +1162,41 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_notify_migrate_authorities(args: argparse.Namespace) -> int:
+    if bool(args.dry_run) == bool(args.apply):
+        return _err("choose exactly one of --dry-run or --apply")
+    mapping_path = Path(args.mapping_file).expanduser()
+    try:
+        if mapping_path.is_symlink() or not mapping_path.is_file():
+            return _err("mapping file must be a regular file")
+        if mapping_path.stat().st_mode & 0o777 != 0o600:
+            return _err("mapping file must have mode 0600")
+        raw = json.loads(mapping_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return _err("mapping file is unreadable or invalid JSON")
+    mappings = raw.get("mappings") if isinstance(raw, dict) else raw
+    if not isinstance(mappings, list):
+        return _err("mapping file must contain a list of mappings")
+    try:
+        with kbc.connect_closing() as conn:
+            result = kbn.migrate_notify_authorities(
+                conn, mappings=mappings, apply=bool(args.apply)
+            )
+    except (ValueError, TypeError):
+        return _err("mapping file contains invalid authority data")
+    public = {
+        key: result[key]
+        for key in ("mappable", "unmapped", "ambiguous", "already_migrated")
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(public, sort_keys=True))
+    else:
+        print(" ".join(f"{key}={value}" for key, value in public.items()))
+    if args.apply and (result["unmapped"] or result["ambiguous"]):
+        return 1
+    return 0
+
+
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     delivery_metadata = {
         key: value
@@ -1174,14 +1209,32 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             return _err(f"no such task: {args.task_id}")
-        kbn.add_notify_sub(
-            conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
-            chat_type=args.chat_type, thread_id=args.thread_id, user_id=args.user_id,
-            user_id_alt=getattr(args, "user_id_alt", None),
-            notifier_profile=args.notifier_profile or _profile_author(),
-            delivery_mode=getattr(args, "delivery_mode", None),
-            delivery_metadata=delivery_metadata or None,
-        )
+        if getattr(args, "bot_profile", None):
+            kbn.add_notify_authority(
+                conn,
+                task_id=args.task_id,
+                platform=args.platform,
+                chat_id=args.chat_id,
+                chat_type=args.chat_type,
+                thread_id=args.thread_id,
+                user_id=args.user_id,
+                user_id_alt=getattr(args, "user_id_alt", None),
+                bot_profile=args.bot_profile,
+                notifier_profile=args.notifier_profile or _profile_author(),
+                delivery_mode=getattr(args, "delivery_mode", None) or "notify+wake",
+                ping_priority=getattr(args, "ping_priority", 0),
+                source_kind="manual",
+                delivery_metadata=delivery_metadata or None,
+            )
+        else:
+            kbn.add_notify_sub(
+                conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
+                chat_type=args.chat_type, thread_id=args.thread_id, user_id=args.user_id,
+                user_id_alt=getattr(args, "user_id_alt", None),
+                notifier_profile=args.notifier_profile or _profile_author(),
+                delivery_mode=getattr(args, "delivery_mode", None),
+                delivery_metadata=delivery_metadata or None,
+            )
     print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
           + f" to {args.task_id}")
     return 0
@@ -1190,6 +1243,30 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
 def _cmd_notify_list(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         subs = kbn.list_notify_subs(conn, args.task_id)
+        routes = {
+            (
+                route["task_id"], route["platform"], route["chat_id"],
+                route["thread_id"] or "",
+            ): route
+            for route in kbn.list_notify_routes(conn, args.task_id)
+        }
+        for authority in kbn.list_notify_authorities(conn, args.task_id):
+            route = routes[
+                (
+                    authority["task_id"], authority["platform"],
+                    authority["chat_id"], authority["thread_id"] or "",
+                )
+            ]
+            mode = authority["delivery_mode"]
+            ping_cursor = int(route["last_ping_event_id"] or 0)
+            wake_cursor = int(authority["last_wake_event_id"] or 0)
+            authority["last_event_id"] = (
+                min(ping_cursor, wake_cursor)
+                if mode == "notify+wake"
+                else wake_cursor if mode == "wake" else ping_cursor
+            )
+            authority["schema_version"] = 2
+            subs.append(authority)
     if _json_out(args, subs):
         return 0
     if not subs:
@@ -1200,18 +1277,37 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
         dmode, ctype = s.get("delivery_mode") or "notify", s.get("chat_type") or "dm"
         extras = "".join((
             f"  owner={s['notifier_profile']}" if s.get("notifier_profile") else "",
+            f"  bot={s['bot_profile']}" if s.get("bot_profile") else "",
             "" if ctype == "dm" else f"  chat_type={ctype}",
             f"  user_id_alt={s['user_id_alt']}" if s.get("user_id_alt") else "",
             "" if dmode == "notify" else f"  mode={dmode}",
+            f"  priority={s['ping_priority']}" if s.get("schema_version") == 2 else "",
         ))
         print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}  (since event {s['last_event_id']}){extras}")
     return 0
 
 
 def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
+    bot_profile = str(getattr(args, "bot_profile", None) or "").strip()
+    notifier_profile = str(getattr(args, "notifier_profile", None) or "").strip()
+    if bool(bot_profile) != bool(notifier_profile):
+        return _err("v2 unsubscribe requires both --bot-profile and --notifier-profile")
     with kbc.connect_closing() as conn:
-        ok = kbn.remove_notify_sub(conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
-                                  thread_id=args.thread_id)
+        if bot_profile:
+            ok = kbn.remove_notify_authority_by_identity(
+                conn,
+                task_id=args.task_id,
+                platform=args.platform,
+                chat_id=args.chat_id,
+                thread_id=args.thread_id,
+                bot_profile=bot_profile,
+                notifier_profile=notifier_profile,
+            )
+        else:
+            ok = kbn.remove_notify_sub(
+                conn, task_id=args.task_id, platform=args.platform,
+                chat_id=args.chat_id, thread_id=args.thread_id,
+            )
     return _ok_or_err(ok, "(no such subscription)", f"Unsubscribed from {args.task_id}")
 
 
@@ -1347,6 +1443,7 @@ _HANDLERS = {
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
+    "notify-migrate-authorities": _cmd_notify_migrate_authorities,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
     "gc": _cmd_gc,
 }

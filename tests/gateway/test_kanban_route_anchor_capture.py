@@ -15,7 +15,11 @@ def test_session_route_anchors_reach_metadata_and_context_then_clear(monkeypatch
     expected = {key: getattr(source, key) for key in ("scope_id", "parent_chat_id")}
     metadata = runner._thread_metadata_for_source(source)
     assert {key: metadata.get(key) for key in expected} == expected
-    keys = {key: "HERMES_SESSION_" + key.upper() for key in ("scope_id", "parent_chat_id")}
+    keys = {
+        key: "HERMES_SESSION_" + key.upper()
+        for key in ("scope_id", "parent_chat_id", "bot_profile")
+    }
+    expected["bot_profile"] = ""
     for name in keys.values():
         monkeypatch.setenv(name, "stale")
     tokens = runner._set_session_env(context)
@@ -26,6 +30,33 @@ def test_session_route_anchors_reach_metadata_and_context_then_clear(monkeypatch
     assert all(get_session_env(name) == "" for name in keys.values())
 
 
+def test_slash_subscription_without_transport_provenance_stays_legacy(tmp_path, monkeypatch):
+    import asyncio
+    from gateway.platforms.event import MessageEvent
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kbn
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._kanban_notifier_profile = "default"
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="post",
+        chat_type="thread",
+        thread_id="post",
+        profile="yuki",
+    )
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="unproven transport")
+    assert asyncio.run(
+        runner._kanban_auto_subscribe(
+            MessageEvent(text="/kanban create", source=source), task, None
+        )
+    )
+    with kbc.connect() as conn:
+        assert len(kbn.list_notify_subs(conn, task)) == 1
+        assert kbn.list_notify_authorities(conn, task) == []
+
+
 def test_slash_subscription_keeps_the_routed_source_owner(tmp_path, monkeypatch):
     import asyncio
     from gateway.platforms.event import MessageEvent
@@ -34,13 +65,25 @@ def test_slash_subscription_keeps_the_routed_source_owner(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._kanban_notifier_profile = "default"
+    runner.adapters = {}
+
+    class _Adapter:
+        pass
+
+    adapter = _Adapter()
+    runner._profile_adapters = {"yuki": {Platform.DISCORD: adapter}}
     source = SessionSource(platform=Platform.DISCORD, chat_id="post", chat_type="thread",
                            thread_id="post", scope_id="guild", parent_chat_id="parent", profile="yuki")
+    source._transport_adapter_ref = lambda: adapter
     with kbc.connect() as conn:
         task = kb.create_task(conn, title="slash-created")
     assert asyncio.run(runner._kanban_auto_subscribe(MessageEvent(text="/kanban create", source=source), task, None))
     with kbc.connect() as conn:
-        sub = kbn.list_notify_subs(conn, task)[0]
-    assert sub["notifier_profile"] == source.profile
-    assert all(sub["delivery_metadata"][key] == getattr(source, key)
+        authorities = kbn.list_notify_authorities(conn, task)
+        assert kbn.list_notify_subs(conn, task) == []
+    assert len(authorities) == 1
+    authority = authorities[0]
+    assert authority["notifier_profile"] == source.profile
+    assert authority["bot_profile"] == source.profile
+    assert all(authority["delivery_metadata"][key] == getattr(source, key)
                for key in ("scope_id", "parent_chat_id"))
