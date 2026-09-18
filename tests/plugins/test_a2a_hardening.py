@@ -188,3 +188,133 @@ def test_iron_rod_surface_and_transport_limits_are_enforced(monkeypatch):
             await adapter.disconnect()
 
     asyncio.run(run())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Strict mode must gate the fan-out path (a2a_orchestrate), not just a2a_call
+# ═════════════════════════════════════════════════════════════════════════════
+
+_STRICT_LITERAL_TOKEN = {
+    "a2a": {"strict_mode": True},
+    "a2a_agents": {
+        "peer": {
+            "url": "https://peer.invalid",
+            "auth": {"type": "bearer", "token": "literal-forbidden-in-strict"},
+            "capabilities": ["review"],
+        }
+    },
+}
+
+
+def _no_network(monkeypatch) -> list:
+    """Fail the test if any path actually tries to reach a peer."""
+    calls: list = []
+
+    def fake_send(agent_label, peer, message, context_id):
+        calls.append((agent_label, peer))
+        return "ok", "ctx", "completed"
+
+    monkeypatch.setattr(tools, "_send_task", fake_send)
+    return calls
+
+
+def test_strict_literal_token_is_refused_on_both_call_and_orchestrate(monkeypatch):
+    """Both entry points must enforce the strict credential policy, with no network."""
+    monkeypatch.setattr(tools, "_load_config", lambda: _STRICT_LITERAL_TOKEN)
+    calls = _no_network(monkeypatch)
+
+    assert tools.a2a_call({"agent": "peer", "message": "hi"}).startswith("Error: unknown agent")
+
+    for mode in ("all", "first", "best"):
+        out = tools.a2a_orchestrate({"capability": "review", "message": "hi", "mode": mode})
+        assert out.startswith("Error:") or out.startswith("All peers failed:"), out
+    assert calls == [], "strict mode must not attempt any outbound call"
+
+
+def test_strict_unresolved_token_env_is_refused_fail_closed(monkeypatch):
+    """A token_env that resolves to nothing must not silently fall back to no auth."""
+    cfg = {
+        "a2a": {"strict_mode": True},
+        "a2a_agents": {
+            "peer": {
+                "url": "https://peer.invalid",
+                "auth": {"type": "bearer", "token_env": "ABSENT_PEER_TOKEN"},
+                "capabilities": ["review"],
+            }
+        },
+    }
+    monkeypatch.setattr(tools, "_load_config", lambda: cfg)
+    monkeypatch.delenv("ABSENT_PEER_TOKEN", raising=False)
+    calls = _no_network(monkeypatch)
+
+    assert tools.a2a_call({"agent": "peer", "message": "hi"}).startswith("Error: unknown agent")
+    out = tools.a2a_orchestrate({"capability": "review", "message": "hi"})
+    assert out.startswith("Error:") or out.startswith("All peers failed:"), out
+    assert calls == [], "an unresolved token_env must fail closed on the fan-out path"
+
+
+def test_strict_resolved_token_env_reaches_the_peer_on_both_paths(monkeypatch):
+    """Nominal strict case: a resolved token_env is forwarded on call and orchestrate."""
+    cfg = {
+        "a2a": {"strict_mode": True},
+        "a2a_agents": {
+            "peer": {
+                "url": "https://peer.invalid",
+                "auth": {"type": "bearer", "token_env": "PEER_TOKEN"},
+                "capabilities": ["review"],
+            }
+        },
+    }
+    monkeypatch.setattr(tools, "_load_config", lambda: cfg)
+    monkeypatch.setenv("PEER_TOKEN", "resolved-value")
+    calls = _no_network(monkeypatch)
+
+    assert not tools.a2a_call({"agent": "peer", "message": "hi"}).startswith("Error:")
+    out = tools.a2a_orchestrate({"capability": "review", "message": "hi"})
+    assert out.startswith("Orchestrated 'review' to 1 peer(s):"), out
+    assert len(calls) == 2
+    for _label, peer in calls:
+        assert peer["auth"] == {"type": "bearer", "token": "resolved-value"}
+        assert peer["url"] == "https://peer.invalid"
+
+
+def test_non_strict_mode_keeps_fan_out_compatibility(monkeypatch):
+    """Without strict mode the historical permissive fan-out behaviour is preserved."""
+    cfg = {
+        "a2a_agents": {
+            "peer": {
+                "url": "https://peer.invalid",
+                "auth": {"type": "bearer", "token": "literal-ok-when-not-strict"},
+                "capabilities": ["review"],
+            }
+        }
+    }
+    monkeypatch.setattr(tools, "_load_config", lambda: cfg)
+    calls = _no_network(monkeypatch)
+
+    out = tools.a2a_orchestrate({"capability": "review", "message": "hi"})
+    assert out.startswith("Orchestrated 'review' to 1 peer(s):"), out
+    assert len(calls) == 1
+    assert calls[0][1]["auth"]["token"] == "literal-ok-when-not-strict"
+
+
+def test_orchestrate_all_mode_reports_success_failures_mixed(monkeypatch):
+    """A partially-failing fan-out still reports successes under the normal header."""
+    cfg = {
+        "a2a_agents": {
+            "good": {"url": "http://good.example", "capabilities": ["review"]},
+            "bad": {"url": "http://bad.example", "capabilities": ["review"]},
+        }
+    }
+    monkeypatch.setattr(tools, "_load_config", lambda: cfg)
+
+    def fake_send(agent_label, peer, message, context_id):
+        if agent_label == "bad":
+            raise urllib.error.URLError("connection refused")
+        return "fine", "ctx", "completed"
+
+    monkeypatch.setattr(tools, "_send_task", fake_send)
+    out = tools.a2a_orchestrate({"capability": "review", "message": "hi"})
+    assert out.startswith("Orchestrated 'review' to 2 peer(s):"), out
+    assert "--- good ---" in out
+    assert "Error:" in out

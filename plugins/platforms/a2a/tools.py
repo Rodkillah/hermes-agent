@@ -79,11 +79,6 @@ def _configured_peers() -> dict:
     return _load_config().get("a2a_agents") or {}
 
 
-def _peer_from_entry(entry: dict, **extra: Any) -> dict:
-    return {"url": entry.get("url", ""), "auth": entry.get("auth", {}) or {},
-            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)), **extra}
-
-
 def _resolve_peer(agent: str) -> Optional[dict]:
     """Resolve a peer name to {url, auth, timeout, capabilities}, or treat ``agent`` as a URL."""
     cfg = _load_config()
@@ -326,9 +321,17 @@ def _match_peers_by_capability(capability: str) -> list[tuple[str, dict]]:
 
 
 def _call_peer_sync(agent_name: str, peer_entry: dict, message: str, context_id: str = "") -> tuple[str, str]:
-    """Call a single peer synchronously -> (agent_name, reply_text)."""
+    """Call a single peer synchronously -> (agent_name, reply_text).
+
+    The peer is resolved through the same fail-closed primitive as ``a2a_call`` so the
+    Iron Rod strict policy (named peers only, ``token_env`` instead of literal
+    credentials) cannot be bypassed by the fan-out path.
+    """
     try:
-        reply, _ctx, _state = _send_task(agent_name, _peer_from_entry(peer_entry), message, context_id)
+        peer = _resolve_peer(agent_name)
+        if not peer or not peer.get("url"):
+            return (agent_name, f"Error: unknown agent '{agent_name}'.")
+        reply, _ctx, _state = _send_task(agent_name, peer, message, context_id)
         return (agent_name, reply or "(no reply)")
     except Exception as e:
         return (agent_name, f"Error: {e}")
@@ -368,6 +371,11 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
             return "\n".join(["All peers failed:"] + [f"  {name}: {reply}" for name, reply in results])
         name, reply = max(successes, key=lambda r: len(r[1])) if mode == "best" else successes[0]
         return f"[{mode}: {name}]\n{reply}"
+    if not successes:
+        # Every matched peer was refused (policy or transport): report an error-shaped
+        # result instead of a header that reads like a successful fan-out.
+        return "\n".join([f"Error: all {len(results)} peer(s) failed for capability '{capability}':"]
+                         + [f"  {name}: {reply}" for name, reply in results])
     return "\n".join([f"Orchestrated '{capability}' to {len(matches)} peer(s):"]
                      + [line for name, reply in results for line in (f"\n--- {name} ---", reply)])
 
