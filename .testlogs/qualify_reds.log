@@ -1,0 +1,10 @@
+############ t704base-up ############
+--- doctor_structural_corruption ---
+=== Summary: 1 files, 2 tests passed, 0 failed (100% complete) in 24.3s (8 workers) ===
+--- kanban_notify ---
+=== Summary: 1 files, 29 tests passed, 0 failed (100% complete) in 103.6s (8 workers) ===
+
+############ t704base-589 ############
+--- doctor_structural_corruption ---
+=== Summary: 1 files, 2 tests passed, 0 failed (100% complete) in 78.3s (8 workers) ===
+--- kanban_notify ---

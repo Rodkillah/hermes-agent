@@ -90,9 +90,13 @@ async def _load_profile_snapshot(
     profile_home.mkdir()
     (profile_home / "config.yaml").write_text(display, encoding="utf-8")
     # Explicit profile routing is fail-closed when the canonical profile was
-    # removed, so the synthetic adapter fixture must represent a live profile.
+    # removed, so the synthetic adapter fixture must represent a live profile:
+    # upstream requires an identity marker (config.yaml / .env / SOUL.md / ...)
+    # before a profiles/<name> directory counts as a profile.
     from hermes_cli.profiles import get_profile_dir
-    get_profile_dir("research").mkdir(parents=True, exist_ok=True)
+    research_dir = get_profile_dir("research")
+    research_dir.mkdir(parents=True, exist_ok=True)
+    (research_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
 
     assert await runner._start_one_profile_adapters("research", profile_home, {}) == 0
     adapter = _adapter()

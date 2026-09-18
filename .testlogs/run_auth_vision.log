@@ -1,0 +1,23 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 4 test files (~28 tests) under ['tests/agent/test_auxiliary_auth_rung_fallthrough.py', 'tests/agent/test_copilot_native_vision_headers.py', 'tests/agent/test_outbound_stale_vision.py', 'tests/agent/test_vision_routing.py']; running with -j 8
+[ 17.9% |     5/~28 | ✓7 | ✗0] ✓ tests/agent/test_auxiliary_auth_rung_fallthrough.py (7✓, 3.5s)
+[ 64.3% |    18/~28 | ✓20 | ✗ 0] ✓ tests/agent/test_outbound_stale_vision.py (13✓, 6.1s)
+[ 96.4% |    27/~28 | ✓29 | ✗ 0] ✓ tests/agent/test_vision_routing.py (9✓, 6.1s)
+[100.0% |    28/~28 | ✓30 | ✗ 0] ✓ tests/agent/test_copilot_native_vision_headers.py (1✓, 7.4s)
+
+=== Summary: 4 files, 30 tests passed, 0 failed (100% complete) in 7.4s (8 workers) ===
+  Durations cached to test_durations.json (4 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   4
+  Total subprocess CPU-wall: 23.0s  (runner wall: 7.4s, parallelism: 8x)
+  P50: 6.12s  P90: 7.36s  P95: 7.36s  P99: 7.36s  Max: 7.36s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      7.36s  tests/agent/test_copilot_native_vision_headers.py
+      6.12s  tests/agent/test_vision_routing.py
+      6.09s  tests/agent/test_outbound_stale_vision.py
+      3.47s  tests/agent/test_auxiliary_auth_rung_fallthrough.py

@@ -1,0 +1,9 @@
+===== attempt 1 =====
+[100.0% |     6/~6 | ✓6 | ✗0] ✓ tests/hermes_cli/test_cli_shutdown_memory_messages.py (6✓, 37.0s)
+=== Summary: 1 files, 6 tests passed, 0 failed (100% complete) in 37.0s (8 workers) ===
+===== attempt 2 =====
+[100.0% |     6/~6 | ✓6 | ✗0] ✓ tests/hermes_cli/test_cli_shutdown_memory_messages.py (6✓, 78.6s)
+=== Summary: 1 files, 6 tests passed, 0 failed (100% complete) in 78.6s (8 workers) ===
+===== attempt 3 =====
+[100.0% |     6/~6 | ✓6 | ✗0] ✓ tests/hermes_cli/test_cli_shutdown_memory_messages.py (6✓, 29.1s)
+=== Summary: 1 files, 6 tests passed, 0 failed (100% complete) in 29.1s (8 workers) ===

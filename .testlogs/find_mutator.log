@@ -1,0 +1,7 @@
+    clean : tests/hermes_cli/test_ensure_acp_launcher.py  (rc=0)
+    clean : tests/hermes_cli/test_linux_launcher_management.py  (rc=0)
+    clean : tests/hermes_cli/test_linux_desktop_entry.py  (rc=0)
+    clean : tests/hermes_cli/test_gui_command.py  (rc=0)
+    clean : tests/hermes_cli/test_doctor_command_install.py  (rc=0)
+    clean : tests/scripts/install/test_install_sh_acp_launcher.py  (rc=0)
+final: /mnt/usb-ext4/kanban-workspaces/iron-rod/t_c50ee5d3/.venv/bin/hermes

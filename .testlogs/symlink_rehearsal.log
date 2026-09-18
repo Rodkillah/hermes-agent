@@ -1,0 +1,22 @@
+rehearsal root: /tmp/symlink_rehearsal_c5uxFw
+
+### case 1: nominal atomic repoint (candidate) ###
+  before : /mnt/usb-ext4/hermes-agent-runtime/.venv/bin/hermes
+  after  : /home/rodrigue/hermes-candidates/t_704ceaa8/.venv/bin/hermes
+  exists : yes
+
+### case 2: rollback (restore served) ###
+  restored: /mnt/usb-ext4/hermes-agent-runtime/.venv/bin/hermes
+
+### case 3: broken/missing target detected before use ###
+  OK: dangling link detected (target absent) -> refuse to commit the swap
+  readlink still shows intent: /tmp/symlink_rehearsal_c5uxFw/nonexistent/runtime
+
+### case 4: wrong-target detection (points at stale runtime) ###
+  OK: refused — resolves to /mnt/usb-ext4/hermes-agent-runtime/.venv/bin/hermes, not the validated candidate
+
+### proof the ACTIVE launcher was not touched ###
+lrwxrwxrwx 1 rodrigue rodrigue 60 18 Sep 11:25 /home/rodrigue/.local/bin/hermes -> /home/rodrigue/hermes-candidates/t_704ceaa8/.venv/bin/hermes
+  active resolves to: /home/rodrigue/hermes-candidates/t_704ceaa8/.venv/bin/hermes
+
+rehearsal artifacts left at: /tmp/symlink_rehearsal_c5uxFw

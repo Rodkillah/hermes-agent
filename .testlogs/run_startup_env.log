@@ -1,0 +1,21 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 3 test files (~28 tests) under ['tests/tools/test_startup_latency_regressions.py', 'tests/tools/environments/test_local_path_completion.py', 'tests/agent/test_subprocess_env_guard.py']; running with -j 8
+[  7.1% |     2/~28 | ✓2 | ✗0] ✓ tests/agent/test_subprocess_env_guard.py (2✓, 2.4s)
+[ 14.3% |     4/~28 | ✓4 | ✗0] ✓ tests/tools/environments/test_local_path_completion.py (2✓, 2.5s)
+[100.0% |    28/~28 | ✓29 | ✗ 0] ✓ tests/tools/test_startup_latency_regressions.py (25✓, 4.5s)
+
+=== Summary: 3 files, 29 tests passed, 0 failed (100% complete) in 4.5s (8 workers) ===
+  Durations cached to test_durations.json (3 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   3
+  Total subprocess CPU-wall: 9.5s  (runner wall: 4.5s, parallelism: 8x)
+  P50: 2.53s  P90: 4.54s  P95: 4.54s  P99: 4.54s  Max: 4.54s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      4.54s  tests/tools/test_startup_latency_regressions.py
+      2.53s  tests/tools/environments/test_local_path_completion.py
+      2.41s  tests/agent/test_subprocess_env_guard.py

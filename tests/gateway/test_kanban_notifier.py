@@ -433,7 +433,12 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     db_path = tmp_path / "done-reopen-archive.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     from hermes_cli.profiles import get_profile_dir
-    get_profile_dir("reviewer").mkdir(parents=True, exist_ok=True)
+    # A directory alone is not a profile: upstream requires an identity marker
+    # (config.yaml / .env / SOUL.md / ...) before profile_exists() accepts it,
+    # and the wake route is fail-closed on an unknown notifier profile.
+    _reviewer_dir = get_profile_dir("reviewer")
+    _reviewer_dir.mkdir(parents=True, exist_ok=True)
+    (_reviewer_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
     kb.init_db()
 
     conn = kbc.connect()

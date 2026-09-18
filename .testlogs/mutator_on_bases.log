@@ -1,0 +1,11 @@
+=== t704base-up (rc=0) ===
+  MUTATES live launcher:
+    /mnt/usb-ext4/kanban-workspaces/iron-rod/t_c50ee5d3/.venv/bin/hermes
+ -> /home/rodrigue/hermes-candidates/t704base-up/.venv/bin/hermes
+=== t704base-589 (rc=0) ===
+  MUTATES live launcher:
+    /mnt/usb-ext4/kanban-workspaces/iron-rod/t_c50ee5d3/.venv/bin/hermes
+ -> /home/rodrigue/hermes-candidates/t704base-589/.venv/bin/hermes
+=== t704base-18e7 (rc=0) ===
+  no mutation
+final: /mnt/usb-ext4/kanban-workspaces/iron-rod/t_c50ee5d3/.venv/bin/hermes
