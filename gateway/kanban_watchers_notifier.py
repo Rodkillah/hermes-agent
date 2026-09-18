@@ -586,7 +586,8 @@ def _fmt_gave_up(ev, n) -> tuple:
     count = f"it failed {int(failures)} times in a row" if failures else "it kept failing"
     last = _clip(ev, "error", " (last: {})", 160)
     return (
-        f"⛔ {n.head} is now blocked: {count}{last}. Fix the cause, then `hermes kanban unblock "
+        f"⛔ {n.head} gave up after repeated failures: it is now blocked. {count}{last}. "
+        f"Fix the cause, then `hermes kanban unblock "
         f"{n.task_id}` (or `hermes kanban reassign {n.task_id}`). Logs: `hermes kanban log {n.task_id}`.",
         None, None,
     )
@@ -596,7 +597,8 @@ def _fmt_timed_out(ev, n) -> tuple:
     limit = int(_payload(ev, "limit_seconds") or 0)
     minutes = max(1, round(limit / 60)) if limit else 0
     span = f"its {minutes}-minute limit" if minutes else "its time limit"
-    return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
+    return (f"⏱ {n.head} timed out — it ran past {span} and was stopped; "
+            f"it will be retried automatically.", None, None)
 
 
 # archived / unblocked are claimed (so the cursor advances past them) but
@@ -607,7 +609,8 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
     "gave_up": _fmt_gave_up,
     "crashed": lambda ev, n: (
-        f"✖ {n.head} — its worker stopped unexpectedly; it will be retried automatically.", None, None,
+        f"✖ {n.head} worker crashed — its process stopped unexpectedly; "
+        f"it will be retried automatically.", None, None,
     ),
     "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
@@ -943,9 +946,10 @@ class _KanbanNotification:
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
-        logger.debug("kanban notifier: delivered %s event for %s to %s/%s via %s on board %s",
-                     ev.kind, self.task_id, self.platform_str, sub["chat_id"],
-                     getattr(self, "plat", "") or "", self.board_slug)
+        # Route identity stays out of the logs (chat/thread ids are private);
+        # task + platform + board + adapter profile is enough to follow a delivery.
+        logger.debug("kanban notifier: delivered %s event for %s on %s via %s on board %s",
+                     ev.kind, self.task_id, self.platform_str, self.adapter_profile or "", self.board_slug)
         # Upload artifact paths from the handoff payload / legacy result as
         # native files. Both handoff kinds stage files for exactly this: a
         # review-bound card's files exist precisely so the human sees them at
@@ -1066,6 +1070,7 @@ class _KanbanNotification:
         # subscriptions, config and adapters can all change between ticks.
         resolved = await self._current_route()
         if resolved is None:
+            logger.debug("kanban notifier: route revalidation failed for %s", self.task_id)
             await self._rewind_stale_authority()
             return
         adapter = resolved[0]

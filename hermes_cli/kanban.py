@@ -1235,8 +1235,9 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
                 delivery_mode=getattr(args, "delivery_mode", None),
                 delivery_metadata=delivery_metadata or None,
             )
-    print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
-          + f" to {args.task_id}")
+    # Keep the physical route out of stdout: chat/thread ids are private and
+    # the CLI output is routinely captured. Name the platform and the task.
+    print(f"Subscribed {args.platform} to {args.task_id}")
     return 0
 
 

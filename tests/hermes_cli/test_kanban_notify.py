@@ -461,7 +461,13 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
     from gateway.run import GatewayRunner
     from gateway.config import Platform
 
-    (kanban_home / "profiles" / "owner-profile").mkdir(parents=True)
+    # A bare directory is no longer a profile: profile_exists() requires a live
+    # identity marker (hermes_constants.named_profile_is_live) before a wake may
+    # resolve its home. Give the fixture a real one.
+    profile_dir = kanban_home / "profiles" / "owner-profile"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text("{}", encoding="utf-8")
+
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="group wake", assignee="worker1")
