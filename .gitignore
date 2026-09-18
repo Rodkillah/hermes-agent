@@ -301,3 +301,6 @@ native/fts5_cjk/*.so
 
 # Disposable profile created by scripts/probe_active_session_exclusivity.py
 .probe-home/
+
+# IronRod Ops scratch: local test logs/harnesses for the reconcile task
+.testlogs/
