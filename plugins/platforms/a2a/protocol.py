@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int
+from hermes_constants import get_hermes_home
 
 PROTOCOL_VERSION = "1.0"
 
@@ -53,14 +54,6 @@ def max_pingpong_turns() -> int:
 def now_iso() -> str:
     """ISO 8601 UTC timestamp with millisecond precision (A2A v1.0)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-
-def _hermes_home() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home())
-    except Exception:
-        return Path(os.path.expanduser("~/.hermes"))
 
 
 def build_agent_card(*, name: str, url: str, description: str, skills: Optional[list[dict]] = None,
@@ -414,10 +407,12 @@ class TaskStore:
         next_offset = offset + page_size if offset + page_size < total else 0
         return (page, next_offset, total) if with_total else (page, next_offset)
 
-    def fail_orphans(self, timeout_seconds: int = 300) -> list[str]:
+    def fail_orphans(self, timeout_seconds: float = 300, *, exclude: set[str] | None = None) -> list[str]:
+        excluded = exclude or set()
         with self._lock:
             stale = [tid for tid, rec in self._tasks.items()
-                     if rec["state"] not in TERMINAL_STATES and time.time() - rec["created_at"] > timeout_seconds]
+                     if tid not in excluded and rec["state"] not in TERMINAL_STATES
+                     and time.time() - rec["created_at"] > timeout_seconds]
         return [tid for tid in stale if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]")]
 
     def _trim_locked(self) -> None:
@@ -446,7 +441,7 @@ def persist_conversations_enabled() -> bool:
         try:
             from hermes_cli.config import load_config
 
-            value = (load_config() or {}).get("a2a", {}).get("persist_conversations")
+            value = ((load_config() or {}).get("a2a") or {}).get("persist_conversations")
             if value is not None:
                 return bool(value) if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
         except Exception:
@@ -455,31 +450,25 @@ def persist_conversations_enabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _conv_dir() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        base = Path(get_hermes_home())
-    except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
-    return base / "a2a_conversations"
-
-
-def _safe_name(context_id: str) -> str:
-    return "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
+def _conv_path(context_id: str) -> Path:
+    safe = "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
+    return get_hermes_home() / "a2a_conversations" / f"{safe}.jsonl"
 
 
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
-    """Append one message to the context's on-disk conversation log."""
+    """Append one message to the context's on-disk conversation log. Never raises.
+
+    No-op when conversation persistence is disabled; the log directory and the
+    log file stay owner-only (0700/0600) because they carry message content.
+    """
     if not persist_conversations_enabled():
         return
     try:
-        d = _conv_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        os.chmod(d, 0o700)
+        path = _conv_path(context_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
         rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
-        path = d / f"{_safe_name(context_id)}.jsonl"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        fd = os.open(path, flags, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "a", encoding="utf-8") as fh:
@@ -493,36 +482,30 @@ def persist_message(context_id: str, role: str, text: str, task_id: str = "") ->
 
 
 def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
-    """Load the last *limit* messages for a context (empty list if none)."""
+    """Last *limit* messages for a context (empty list if none / unreadable)."""
     if not persist_conversations_enabled():
         return []
-    path = _conv_dir() / f"{_safe_name(context_id)}.jsonl"
-    if not path.exists():
-        return []
-    out: list[dict] = []
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        lines = _conv_path(context_id).read_text(encoding="utf-8").splitlines()
     except Exception:
         return []
+    out: list[dict] = []
+    for line in lines:
+        if line.strip():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                out.append(entry)
     return out[-limit:]
 
 
 def list_conversations() -> list[str]:
-    """Return known context-ids that have persisted conversations."""
+    """Context-ids that have persisted conversations."""
     if not persist_conversations_enabled():
         return []
-    d = _conv_dir()
-    if not d.exists():
-        return []
-    return sorted(p.stem for p in d.glob("*.jsonl"))
+    return sorted(p.stem for p in (get_hermes_home() / "a2a_conversations").glob("*.jsonl"))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

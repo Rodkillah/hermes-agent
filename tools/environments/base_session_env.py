@@ -69,13 +69,20 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     return (
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "${!HERMES_BROWSER_CONTROL_*} "
-        # Execution lineage and dispatcher identity are injected per spawn,
-        # never shell state: a child shares this snapshot with its parent.
-        "HERMES_DELEGATED_CHILD_CONTEXT ${!HERMES_KANBAN_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
         # by every wrapper with ${VAR:-default} semantics; persisting them would
         # let the FIRST command's value override a later outer-harness value.
         "AI_AGENT HERMES_AGENT "
+        # Scope markers stamped onto a delegate_task child's / cron run's subprocess
+        # env; a snapshot taken inside that window would re-assert them on every
+        # later ``source`` and fence the PARENT session's kanban CLI (#90782).
+        "HERMES_DELEGATED_CHILD_CONTEXT HERMES_CRON_SESSION "
+        # Iron Rod: HERMES_KANBAN_TASK / _DB / _BOARD are per-run scope injected by the
+        # dispatcher onto a worker subprocess, never shell state. A snapshot captured
+        # inside that window re-asserts the board and DB override on every later
+        # ``source``, so an unrelated session writes to the live board (19 305 events
+        # lost on 2026-08-28). Kept in sync with _SNAPSHOT_EXCLUDED_ENV_REGEX above.
+        "${!HERMES_KANBAN_*} "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")

@@ -1,5 +1,6 @@
 """Graph identity is completion history, not prerequisite edges."""
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,13 @@ def test_parent_tenant_is_inherited_at_creation_boundary(tmp_path, monkeypatch):
         for explicit, expected in [(None, "business-a"), ("business-b", "business-b")]:
             child = kb.create_task(conn, title="child", parents=[unscoped, parent], tenant=explicit)
             assert kb.get_task(conn, child).tenant == expected
+        # Iron Rod : notre garde de creation est fail-closed. Sans config.yaml,
+        # `kanban.can_create` est indecidable et l'outil REFUSE, donc ce test
+        # amont n'atteignait jamais ses assertions sur le tenant. On lui donne
+        # la config qui lui manque plutot que de desarmer la garde.
+        cfg = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("toolsets:\n  - kanban\nkanban:\n  can_create: true\n", encoding="utf-8")
         result = json.loads(_handle_create({"title": "tool child", "assignee": "default", "parents": [parent]}))
         assert result["ok"]
         assert kb.get_task(conn, result["task_id"]).tenant == "business-a"
