@@ -344,11 +344,13 @@ def _run_job_script(
 
     try:
         from tools.environments.local import build_subprocess_env
-        # Iron Rod: la sortie d un script cron est un protocole TEXTE,
-        # decodee en UTF-8 sur tous les OS (pas la locale fr_FR/ISO-8859-1).
+        # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
+        # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
+        # ``errors=`` must not stay 'strict': one stray non-UTF-8 byte in the script's stdout
+        # or stderr raises UnicodeDecodeError in communicate() and fails the whole run,
+        # discarding the output (#105582; the Windows branch decodes lossily per #45099).
         popen_kwargs: dict[str, Any] = {
             "start_new_session": True,
-            "encoding": "utf-8",
             "errors": "replace",
         }
         if sys.platform == "win32":

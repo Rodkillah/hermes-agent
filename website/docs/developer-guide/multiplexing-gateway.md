@@ -110,6 +110,13 @@ B's turns and into every subprocess spawned with `env=dict(os.environ)`.
 - A small allowlist (`HERMES_HOME`, `HERMES_PROFILE`, proxy settings,
   `API_SERVER_*` listener settings — but deliberately not `API_SERVER_KEY`)
   stays global because those describe the process, not a profile.
+- Cloud SDK *default credential chains* are ambient by construction
+  (`google.auth.default()`, `DefaultAzureCredential`, `boto3.Session()` with
+  no keys): every source they walk — process env, CLI caches, instance
+  metadata — is the launch context's identity. Under multiplexing a served
+  profile without a complete credential of its own is **refused** by the
+  Vertex, Entra ID and Bedrock adapters rather than minting that identity
+  against its own `base_url`; standalone runs keep the chain.
 
 Because the per-turn `.env` reload is a no-op under multiplexing, rotated
 credentials are picked up through the profile scope on the next turn — never
@@ -221,6 +228,22 @@ conflating (`gateway/authz_mixin.py`):
 
 Outside multiplexing there is one adapter per platform, so both seams return
 it. `tests/gateway/test_multiplex_transport_matrix.py` asserts every row.
+
+### Restore, relay, callbacks and thread hops
+
+The routing entry persists `transport_profile` next to the key (and the
+`sessions.transport_profile` column in `state.db`), so after a restart a
+revived lane still knows which bot received it: `_restored_source(entry)`
+re-pins a `RoutingIdentity` with no live adapter and `_delivery_adapter_for`
+delivers through that bot's adapter or fails closed — a satellite routed
+through the default bot keeps answering from the default bot, a lane owned by
+a secondary never falls back to the default bot's credential. Entries written
+before the column existed carry `null` and keep the shared-bot heuristics.
+Over the relay, every outbound frame's `metadata.profile` (and `follow_up`'s
+key namespace) tells the connector which profile to stamp on the next
+`passthrough_forward`, so a button press after a routed slash command stays in
+the same profile. Deferred callbacks (`/model` picker) capture the routed home
+at command time and the gateway's executor hops copy the ContextVar scope.
 
 ## Control plane
 

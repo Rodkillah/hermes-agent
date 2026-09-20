@@ -97,6 +97,27 @@ class TestRunJobScript:
         assert success is True
         assert output == "hello from script"
 
+    def test_script_stdout_non_utf8_decoded_lossily(self, cron_env):
+        """A stray non-UTF-8 byte in script stdout must not fail the run (#105582).
+
+        The POSIX decode path used text=True without errors= (i.e. errors='strict'), so a
+        single bad byte raised UnicodeDecodeError in communicate() and the whole run failed
+        with "Script execution failed: 'utf-8' codec can't decode ...", discarding the
+        output. The Windows branch already decoded lossily (#45099).
+        """
+        from cron.scheduler_script import _run_job_script
+
+        script = cron_env / "scripts" / "binary_stdout.py"
+        script.write_text(
+            "import sys\n"
+            'sys.stdout.buffer.write(b"alert before \\x80 after\\n")\n'
+        )
+
+        success, output = _run_job_script(str(script))
+        assert success is True
+        assert "alert before" in output
+        assert "\ufffd" in output
+
     def test_script_relative_path(self, cron_env):
         from cron.scheduler_script import _run_job_script
 
@@ -292,7 +313,13 @@ class TestRunJobScript:
         sys.platform == "win32",
         reason="Windows always takes the overlay/creationflags branch",
     )
-    def test_non_windows_script_uses_utf8_text_decoding(self, cron_env, monkeypatch):
+    def test_non_windows_script_keeps_locale_encoding_with_lossy_errors(self, cron_env, monkeypatch):
+        """POSIX keeps the platform-default (locale) encoding — gating ``encoding=`` to win32
+        was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but decoding must be
+        lossy: ``errors='replace'`` so a stray non-UTF-8 byte in script output cannot raise
+        UnicodeDecodeError in communicate() and fail the whole run (#105582). Supersedes
+        ``test_non_windows_script_preserves_default_text_decoding``, which pinned strict
+        decoding as a side effect of the win32 encoding gate."""
         # No platform patching: the Linux CI host already takes this branch.
         from cron import scheduler as sched_mod
         from cron import scheduler_script as sched_script
@@ -330,23 +357,8 @@ class TestRunJobScript:
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
-        # Iron Rod : l encodage est force en UTF-8 sur TOUS les OS, la
-        # sortie d un script cron etant un protocole texte relivre tel quel
-        # (persistee, puis delivree verbatim sur Telegram).
-        #
-        # C est CE controle qui couvre le cas de la locale non UTF-8 : des
-        # lors qu un ``encoding`` explicite est passe a Popen, le
-        # TextIOWrapper ne consulte plus du tout la locale du processus.
-        # Le cas fr_FR/ISO-8859-1 devient donc impossible par construction,
-        # et c est la presence de cette cle qui le prouve.  Un test d aller-
-        # retour sur du texte accentue a ete essaye puis RETIRE le
-        # 2026-08-23 : il passait au vert meme sans le correctif, la locale
-        # etant resolue au niveau C, hors de portee d un monkeypatch.
-        assert captured["kwargs"]["encoding"] == "utf-8"
+        assert "encoding" not in captured["kwargs"]
         assert captured["kwargs"]["errors"] == "replace"
-        # start_new_session doit survivre au correctif : il porte le groupe
-        # de processus dont depend la terminaison propre du script.
-        assert captured["kwargs"]["start_new_session"] is True
 
     def test_non_overlay_branch_keeps_plain_argv(self, cron_env, monkeypatch):
         """When the Windows uv-venv overlay is NOT active, the invocation must

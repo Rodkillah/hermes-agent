@@ -23,11 +23,11 @@ Cron jobs can:
 All of this is available to Hermes itself through the `cronjob` tool, so you can create, pause, edit, and remove jobs by asking in plain language — no CLI required.
 
 :::tip
-**Which model does a cron job run on?** Resolution at fire time is: per-job pin → `cron.model` in `config.yaml` → the global default from `hermes model`.
+**Which model does a cron job run on?** Resolution at fire time is: per-job pin → `cron.model` in `config.yaml` → the main agent model from `hermes model`.
 
-- **Per-job pin** — set by *you* via the dashboard, `hermes cron create/edit --model … --provider …`, or by editing `~/.hermes/cron/jobs.json`. Once set, it sticks until you change it. The agent's `cronjob` tool cannot set or change per-job models — inference pins are user-owned.
+- **Per-job pin** — a job that carries its own model. Set it to a specific model via the dashboard, `hermes cron create/edit --model … --provider …`, or by editing `~/.hermes/cron/jobs.json`; or **lock in the current main model** with `hermes cron create/edit --pin` (the agent's `cronjob` tool can do this too with `pinned=true`, but only when you ask it to). `--unpin` (`pinned=false`) releases the lock. The agent cannot point a job at a *different* model — inference pins are user-owned.
 - **`cron.model` / `cron.model_provider`** — a cron-fleet default: every unpinned job runs on this model, independent of your chat model. Set it once (`hermes config set cron.model <name>`) and switching your chat model with `hermes model` or `/model` never touches your cron fleet.
-- **Global default** — only when neither of the above is set does a job follow `hermes model`. Hermes **snapshots** the provider and model at creation, and that snapshot is the job's effective pin: if you later switch the global default (`hermes model`, `/model`, `hermes config set model.default …`), the job **keeps running on the model and provider it was created under** and logs one INFO line per run noting the difference. A global model change never stops a scheduled job, and an unattended job never silently inherits a switch to a paid provider/model (#44585). To move a job to the new default, **resnap** it (`hermes cron resnap <job_id>`, or `--all` for every unpinned job) so it adopts the current default while staying unpinned, pin it (`hermes cron edit <job_id> --provider <provider> --model <model>`), or set `cron.model` to move the whole fleet at once. Jobs created before snapshots existed keep following the live global default.
+- **Main agent model** — when neither of the above is set, a job runs on whatever `hermes model` / `/model` is set to **at the moment it fires**. Change your main model and every unpinned job follows on its next run.
 
 Whichever provider a job resolves to, its provider-specific request settings (e.g. `request_overrides` such as `extra_body`/`extra_headers` for custom providers) carry into the scheduled run just like an interactive session.
 
@@ -99,6 +99,14 @@ alert is delivered (it is not repeated every tick), and **no LLM call is
 made** — a misconfigured job never spends tokens. The next healthy run clears
 the blocked state so a future configuration break alerts again.
 
+A missing-credential verdict names the profile and `HERMES_HOME` the scheduler
+read, e.g. `provider credential missing: No Codex credentials stored … [profile
+'default', HERMES_HOME /opt/data]`. When an interactive session with "the same"
+credential works, compare that path with the shell's `HERMES_HOME`: a gateway
+started without the shell's environment (Docker `HOME` vs `HERMES_HOME`, a
+service unit) or a multiplexed satellite profile reads a different `auth.json`
+and `.env` than the shell does.
+
 To disable the validation and restore the old behavior (the run proceeds and
 fails during execution):
 
@@ -111,28 +119,17 @@ Or: `hermes config set cron.preflight false`
 
 ## Moving unpinned jobs to a new global default
 
-An unpinned job stays on the provider/model it was created under, so changing your chat model
-never changes (or stops) your cron fleet. When you *do* want scheduled jobs to move:
+An unpinned job follows the main agent model, so `hermes model` moves your cron fleet with it.
+When you want a job to *stay* on a model:
 
 ```bash
-hermes cron edit <job_id> --provider <provider> --model <model>   # one job
-hermes config set cron.model <model>                               # every unpinned job
+hermes cron edit <job_id> --pin                                   # lock the current main model onto one job
+hermes cron edit <job_id> --provider <provider> --model <model>   # pin an explicit model
+hermes cron edit <job_id> --unpin                                 # follow the main model again
+hermes config set cron.model <model>                              # every unpinned job, without touching chat
 ```
 
-`hermes config set model.default …` and the Desktop model picker list the unpinned jobs that will
-keep their original model so you can decide deliberately. Stored snapshots are refreshed whenever
-you edit a job's provider, model, or base URL.
-
-Resnapping refreshes an unpinned job's stored snapshot to the current global resolution without
-pinning it, so it keeps tracking future changes:
-
-```bash
-hermes cron resnap <job_id>   # one job
-hermes cron resnap --all      # every unpinned agent job
-```
-
-The agent-facing `cronjob` tool accepts the same action (`action=resnap job_id=<id>` or
-`action=resnap all=true`). Pinned axes and `no_agent` script jobs are left untouched.
+`hermes cron list` and the `cronjob` tool report `pinned` per job.
 
 ## Skill-backed cron jobs
 
@@ -447,6 +444,22 @@ cron:
   retry_unreachable: false   # default true; disables the automatic re-runs
 ```
 
+### Holding a job through a closed provider usage window
+
+The mirror case: the provider says exactly how long it will stay closed. When
+the scheduler resolves a subscription provider (currently the OpenAI Codex
+usage probe) and the provider reports its usage limit exhausted with a
+`retry after <N>s` hint (often many hours), and the whole fallback chain is
+unavailable, re-firing a sub-hourly job into that window is guaranteed to fail
+identically on every tick — and to alert every time. A 429 the model API
+returns mid-run is not held this way; it is retried on the normal cadence.
+
+Instead, the scheduler **parks the job**: the one failure alert says the
+window is closed and that the job is held, `next_run_at` moves to the first
+scheduled occurrence after the window (`quota_hold_until` on the job record),
+and nothing fires or alerts until then. Any run that reaches the model clears
+the hold. One-shot jobs are not held.
+
 ### Failure incidents: alert once, remind on a cooldown, acknowledge
 
 A recurring job that keeps failing with the *same* error alerts you **once**,
@@ -698,7 +711,8 @@ Only the job's **own conversation** is ever touched:
 
 - the **origin chat** the job was created in;
 - the **home-channel fallback** when `deliver: origin` captured no origin (jobs
-  created by scripts or the API rather than from a live gateway chat) — the
+  created by scripts, or from a session on the request/response `api_server`
+  platform, which cannot receive a delivery) — the
   user's primary conversation standing in for the origin;
 - a job's **single explicit `platform:chat` target**, but only when the job
   itself opts in with `attach_to_session: true` — the job author declares that
@@ -850,6 +864,18 @@ cron:
 A timed-out delivery is recorded in `last_delivery_error`; the bot's turn may still complete on its own.
 
 The cap bounds the bot's **turn** only. When that turn messages a teammate (`message_agent`), the delivery process stays alive afterwards — bounded by `terminal.oneshot_completion_wait_seconds` — so the teammate's reply can land in the Bot Chat; that wait is not part of the delivery and is never counted against, or cut short by, this cap.
+
+## Standalone send timeout
+
+When the live gateway adapter cannot deliver (or no gateway is running), a target is sent through the platform's standalone sender. That send is bounded by a wall-clock timeout — 60 seconds by default — so a transport that is mid-reconnect cannot pin the job run (and a pending restart drain behind it) indefinitely:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  standalone_send_timeout_seconds: 120
+```
+
+A timed-out send is recorded in `last_delivery_error` as `standalone send to <target> timed out after Ns`; the message may still land if the adapter had already accepted it.
 
 ## No-agent mode (script-only jobs)
 
@@ -1243,8 +1269,8 @@ cronjob(action="create", name="process-feed",
 ```bash
 #!/bin/bash
 # ~/.hermes/scripts/flag-ready.sh
-if test -f /tmp/new-data-ready; then
-  rm -f /tmp/new-data-ready
+if test -f ~/.hermes/cache/scratch/new-data-ready; then
+  rm -f ~/.hermes/cache/scratch/new-data-ready
   echo '{"wakeAgent": true}'
 else
   echo '{"wakeAgent": false}'

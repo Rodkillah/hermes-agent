@@ -2426,10 +2426,6 @@ def save_config_value(key_path: str, value: any) -> bool:
             os.chmod(config_path, 0o600)
         except (OSError, NotImplementedError):
             pass
-        # Same unpinned-cron notice as `hermes config set` for every model switch.
-        from hermes_cli.config import warn_unpinned_cron_jobs_after_model_config_change
-
-        warn_unpinned_cron_jobs_after_model_config_change(key_path, value)
         return True
     except Exception as e:
         logger.error("Failed to save config: %s", e)
@@ -3766,7 +3762,14 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             pass
 
     def _tui_startup_background_maintenance(self):
-        """Best-effort startup passes: curator skill maintenance, personal + org skill sync."""
+        """Best-effort startup passes: curator skill maintenance, personal + org skill sync.
+
+        Off the main thread: the curator's deterministic pass snapshots and prunes the whole
+        skills tree (a due weekly pass held the prompt for 6 minutes on a large library), and
+        the sync pulls can hit the network. The REPL must never wait on housekeeping."""
+        threading.Thread(target=self._run_startup_maintenance, name="startup-maintenance", daemon=True).start()
+
+    def _run_startup_maintenance(self):
         with suppress(Exception):
             from agent.curator import maybe_run_curator
             maybe_run_curator(
@@ -4144,8 +4147,10 @@ _TRANSIENT_PROVIDER_REASONS = frozenset({
 # ``KANBAN_TERMINAL_PROVIDER_EXIT_CODE`` so the dispatcher parks the card after ONE spawn with
 # the provider's words as the reason, instead of re-spawning into the same wall until
 # ``kanban.failure_limit`` is spent. ``billing`` stays transient: credit comes back.
+# ``upstream_blocked`` (a WAF/CDN refusing the SDK's User-Agent) is terminal too: only a
+# header change heals it, never a retry.
 _TERMINAL_PROVIDER_REASONS = frozenset({
-    "auth", "auth_permanent", "model_not_found", "ssl_cert_verification",
+    "auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked",
 })
 
 
@@ -4214,11 +4219,17 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         # without this sync it would point at the ended parent after compression.
         _sync_cli_session_id_from_agent(cli)
         # The turn is over and persisted: the one-shot exit linger that follows protects nested
-        # notify_on_complete replies and is NOT part of the spawner's delivery (#113608).
-        write_turn_report(
-            turn_report_path, exit_code=_single_query_exit_code(result),
-            error=str(result.get("error") or "") if isinstance(result, dict) else "agent turn did not run",
-        )
+        # notify_on_complete replies and is NOT part of the spawner's delivery (#113608). The
+        # report carries what this run will print, so a spawner booking a child still lingering
+        # at its cap relays the answer instead of a timeout (#114980).
+        def _report_turn(res) -> None:
+            write_turn_report(
+                turn_report_path, exit_code=_single_query_exit_code(res),
+                error=str(res.get("error") or "") if isinstance(res, dict) else "agent turn did not run",
+                reply=res.get("final_response", "") if isinstance(res, dict) else str(res),
+            )
+
+        _report_turn(result)
         if isinstance(result, dict) and not result.get("failed"):
             history = result.get("messages") or cli.conversation_history
 
@@ -4251,6 +4262,8 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 cli._quiet_notify_linger_done = True
             if isinstance(continued, dict):
                 result = continued
+                # A teammate's reply displaced the answer this run prints; tell the spawner.
+                _report_turn(result)
         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.

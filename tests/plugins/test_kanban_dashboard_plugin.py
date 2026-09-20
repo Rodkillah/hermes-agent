@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -1506,3 +1507,28 @@ def test_dashboard_diagnostics_detect_sqlite_integer_required_probe(client):
     kinds = {item["kind"] for item in diagnostics[task_id]}
     assert "prod_failed_required_probe" in kinds
     assert "prod_without_receipt" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# Touch drag-vs-tap threshold (#115568)
+# ---------------------------------------------------------------------------
+
+def test_touch_card_tap_opens_instead_of_dragging():
+    """attachTouchDrag() must not claim a stationary tap: without a movement threshold,
+    every touch pointerdown called preventDefault() immediately, which suppresses the
+    synthesized click TaskCard.handleClick relies on to call props.onOpen() (#115568).
+    The bundle has no build step, so this runs the real function (extracted verbatim, not
+    regex-matched) through a real pointerdown/move/up sequence with a minimal DOM stub —
+    behavioral, not a source-text pin.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    bundle = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    probe = Path(__file__).parent / "fixtures" / "kanban_touch_drag_probe.js"
+    result = subprocess.run(
+        [node, str(probe), str(bundle)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "PASS" in result.stdout

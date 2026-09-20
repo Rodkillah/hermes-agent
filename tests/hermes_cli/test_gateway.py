@@ -1322,6 +1322,65 @@ def test_find_windows_gateway_services_rejects_transitional_ancestor(monkeypatch
         )
 
 
+@pytest.mark.windows_only
+def test_find_windows_gateway_services_ignores_task_scheduler_ancestor(monkeypatch):
+    """gateway <- cmd.exe <- svchost.exe(Schedule) <- services.exe: the Task Scheduler host is not the
+    gateway's supervisor, so a task-launched gateway is a plain process (#97208); the same tree under a
+    Hermes-owned service (by binary path) stays SCM-supervised."""
+    import psutil
+    import hermes_cli.gateway_windows as gateway_windows
+
+    monkeypatch.setattr(gateway_windows, "hermes_service_roots", lambda: (r"C:\hermes\hermes-agent",))
+    profile = SimpleNamespace(profile="default", pid=18480, create_time=18480.0)
+
+    class FakeService:
+        def __init__(self, name, binpath):
+            self._name, self._binpath = name, binpath
+
+        def as_dict(self):
+            return {"name": self._name, "binpath": self._binpath, "pid": 2360, "status": "running"}
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def parents(self):
+            return [FakeProcess(12296), FakeProcess(2360), FakeProcess(4)]
+
+        def children(self, recursive=False):
+            assert self.pid == 2360 and recursive is True
+            return [FakeProcess(12296), FakeProcess(18480)]
+
+        def create_time(self):
+            return float(self.pid)
+
+    def run(service):
+        return gateway.find_windows_gateway_services(
+            psutil_module=SimpleNamespace(
+                win_service_iter=lambda: [service], Process=FakeProcess, AccessDenied=psutil.AccessDenied),
+            profile_processes=[profile],
+        )
+
+    assert run(FakeService("Schedule", r"C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule")) == []
+    owned = run(FakeService("gw", r'"C:\hermes\hermes-agent\venv\Scripts\hermes.exe" gateway run'))
+    assert [(s.name, s.service_pid, s.gateway_pid) for s in owned] == [("gw", 2360, 18480)]
+
+    # QueryServiceConfig unreadable to this user (hardened or malformed third-party service): not
+    # Hermes's, and never a reason to abort; a Hermes-NAMED service is settled without asking binpath.
+    class UnreadableConfigService(FakeService):
+        def __init__(self, name, error):
+            super().__init__(name, "")
+            self._error = error
+
+        def binpath(self):
+            raise self._error
+
+    assert run(UnreadableConfigService("Hardened", psutil.AccessDenied(2360, "Hardened"))) == []
+    assert run(UnreadableConfigService("BrokenMui", OSError(15100, "MUI file missing"))) == []
+    named = run(UnreadableConfigService("HermesGateway", OSError(15100, "MUI file missing")))
+    assert [(s.name, s.service_pid, s.gateway_pid) for s in named] == [("HermesGateway", 2360, 18480)]
+
+
 def test_find_windows_gateway_services_rejects_shared_service_host_pid(monkeypatch):
     """A shared host PID cannot prove which service owns the gateway subtree."""
     monkeypatch.setattr(gateway.sys, "platform", "win32")
@@ -1348,7 +1407,10 @@ def test_find_windows_gateway_services_rejects_shared_service_host_pid(monkeypat
             return float(self.pid)
 
     fake_psutil = SimpleNamespace(
-        win_service_iter=lambda: [FakeService("ServiceA"), FakeService("ServiceB")],
+        win_service_iter=lambda: [
+            FakeService("HermesGatewayA"),
+            FakeService("HermesGatewayB"),
+        ],
         Process=FakeProcess,
     )
 
@@ -1378,6 +1440,33 @@ def test_find_windows_gateway_services_fails_closed_on_service_access_error(
             psutil_module=fake_psutil,
             profile_processes=[profile],
         )
+
+
+def test_find_windows_gateway_services_skips_unrelated_service_with_unreadable_config(monkeypatch):
+    """An unrelated service whose QueryServiceConfigW fails with a plain OSError (WinError 15100 MUI
+    loader, WinError 0 from OpenServiceW behind endpoint-security agents) is not Hermes's and must be
+    skipped, not turned into "SCM service enumeration failed" that aborts `hermes update` (#116173)."""
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+    import hermes_cli.gateway_windows as gateway_windows
+
+    monkeypatch.setattr(gateway_windows, "hermes_service_roots", lambda: (r"C:\hermes\hermes-agent",))
+
+    class MuiBrokenService:
+        def name(self):
+            return "IsolationSession"
+
+        def binpath(self):
+            raise OSError(15100, "The resource loader failed to find MUI file")
+
+    class AccessDenied(Exception):
+        pass
+
+    fake_psutil = SimpleNamespace(
+        win_service_iter=lambda: [MuiBrokenService()],
+        AccessDenied=AccessDenied,
+    )
+
+    assert gateway.find_windows_gateway_services(psutil_module=fake_psutil, profile_processes=[]) == []
 
 
 def test_find_windows_gateway_services_fails_closed_when_scm_scan_is_indeterminate(
