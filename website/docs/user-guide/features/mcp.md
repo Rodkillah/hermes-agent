@@ -391,6 +391,8 @@ Then run `hermes mcp login googledrive` — with the pre-registered client, Herm
 
 **Pitfall — config auto-reload race.** When you edit `~/.hermes/config.yaml` from inside a running Hermes session, the CLI auto-reloads MCP connections with a 30s timeout. That's not enough for an interactive OAuth flow. Add the entry, then run `hermes mcp login <server>` from a fresh terminal — it waits the full 5 minutes for you to complete auth.
 
+**Need longer than 5 minutes to approve?** Set `oauth.timeout` on the server entry (seconds). `hermes mcp login`, the dashboard and Desktop re-auth all wait `oauth.timeout` + 15 s (or the entry's `connect_timeout`, whichever is longer); a login that still runs out of time reports `Connecting to MCP server '<name>' timed out after Ns` naming both knobs instead of a blank failure line.
+
 ## mTLS / client certificates
 
 Remote HTTP MCP servers that require mutual TLS (client-certificate authentication) are supported via `client_cert` / `client_key`. Hermes passes the resolved certificate to the underlying HTTP client for the TLS handshake.

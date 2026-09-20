@@ -1908,12 +1908,17 @@ def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
     if not toolset_key:
         return
     from hermes_cli.config import load_config, save_config
+    from hermes_cli.toolset_validation import parse_platform_toolsets_value
     config = load_config()
     platform_toolsets = _child_dict(config, "platform_toolsets")
     changed = False
-    for ts_list in platform_toolsets.values():
-        if isinstance(ts_list, list) and enable != (toolset_key in ts_list):
+    for platform, raw in list(platform_toolsets.items()):
+        # A list-literal string (older `hermes config set`) is the user's real selection; toggling
+        # it re-saves the entry as a proper list so the string never persists.
+        ts_list = parse_platform_toolsets_value(raw)
+        if ts_list is not None and enable != (toolset_key in ts_list):
             (ts_list.append if enable else ts_list.remove)(toolset_key)
+            platform_toolsets[platform] = ts_list
             changed = True
     # Enabling with no platform lists yet: seed "cli" at minimum.
     if enable and not changed and not platform_toolsets:
