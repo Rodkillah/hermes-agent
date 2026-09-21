@@ -83,6 +83,9 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
             if not current:
                 failed.append(f"{rec['id']}: pending revision is stale or no longer active")
                 continue
+            if not wa.reconcile_superseded_predecessors(subsystem, current):
+                failed.append(f"{rec['id']}: supersession cleanup is incomplete; retry after persistence recovers")
+                continue
             ok, msg = _apply_one(subsystem, current, memory_store)
             if ok:
                 wa.discard_pending(subsystem, current["id"])

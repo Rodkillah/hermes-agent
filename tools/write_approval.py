@@ -70,6 +70,74 @@ def _pending_files(subsystem: str) -> list:
     return list(d.glob("*.json")) if d.exists() else []
 
 
+def _read_record(path: Path) -> Optional[Dict[str, Any]]:
+    """Read one store record without deciding whether it is still active."""
+    with suppress(Exception):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def _published_successor(subsystem: str, record: Dict[str, Any]) -> Optional[str]:
+    """Return the published successor recorded for ``record``, if any.
+
+    Supersession is prepared before publication.  Its archive becomes an
+    authoritative tombstone only when the referenced successor is present.
+    """
+    if subsystem != SKILLS or not record.get("id"):
+        return None
+    archive = (get_hermes_home() / "pending" / "superseded" / subsystem
+               / f"{record['id']}.json")
+    archived = _read_record(archive)
+    successor_id = archived.get("superseded_by") if archived else None
+    if not isinstance(successor_id, str) or not successor_id:
+        return None
+    if archived and archived.get("supersession_state") == "committed":
+        return successor_id
+    successor = _read_record(_pending_path(subsystem, successor_id))
+    if successor and _record_subject(successor) == _record_subject(record):
+        return successor_id
+    return None
+
+
+def reconcile_superseded_predecessors(subsystem: str, current: Dict[str, Any]) -> bool:
+    """Retire published predecessors before ``current`` may leave the queue.
+
+    The caller holds ``pending_lock``. Prepared archives become committed only
+    after their successor exists; committed tombstones remain authoritative.
+    """
+    if subsystem != SKILLS:
+        return True
+    subject = _record_subject(current)
+    if not subject:
+        return True
+    predecessors = []
+    for path in _pending_files(subsystem):
+        record = _read_record(path)
+        if not record or record.get("id") == current.get("id") or _record_subject(record) != subject:
+            continue
+        archive = (get_hermes_home() / "pending" / "superseded" / subsystem
+                   / f"{record.get('id')}.json")
+        archived = _read_record(archive)
+        successor_id = archived.get("superseded_by") if archived else None
+        successor_exists = isinstance(successor_id, str) and bool(
+            _read_record(_pending_path(subsystem, successor_id)))
+        if not archived or (archived.get("supersession_state") != "committed" and not successor_exists):
+            return False
+        predecessors.append((path, archive, archived))
+    try:
+        for path, archive, archived in predecessors:
+            if archived.get("supersession_state") != "committed":
+                archived["supersession_state"] = "committed"
+                atomic_json_write(archive, archived)
+            path.unlink()
+    except Exception as e:
+        logger.error("Failed to reconcile superseded %s predecessors: %s", subsystem, e,
+                     exc_info=True)
+        return False
+    return True
+
+
 def _skill_subject(payload: Dict[str, Any]) -> str:
     """Stable target set for coalescing equivalent proposals without losing sibling files."""
     operations = payload.get("operations", []) if payload.get("action") == "batch" else [payload]
@@ -131,10 +199,19 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
                 previous = dict(previous)
                 previous["superseded_at"] = now
                 previous["superseded_by"] = pid
+                previous["supersession_state"] = "prepared"
                 archived = (get_hermes_home() / "pending" / "superseded" / subsystem
                             / f"{previous['id']}.json")
                 atomic_json_write(archived, previous)
             atomic_json_write(_pending_path(subsystem, pid), record)
+            for previous in matches:
+                archived = (get_hermes_home() / "pending" / "superseded" / subsystem
+                            / f"{previous['id']}.json")
+                committed = _read_record(archived)
+                if not committed:
+                    raise OSError(f"missing supersession archive for {previous['id']}")
+                committed["supersession_state"] = "committed"
+                atomic_json_write(archived, committed)
             for previous in matches:
                 _pending_path(subsystem, previous["id"]).unlink()
     except Exception as e:
@@ -148,9 +225,11 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     for p in _pending_files(subsystem):
         try:
-            record = json.loads(p.read_text(encoding="utf-8"))
+            record = _read_record(p)
             if not isinstance(record, dict):
                 raise ValueError(f"expected a JSON object, got {type(record).__name__}")
+            if _published_successor(subsystem, record):
+                continue
             records.append(record)
         except Exception:
             logger.warning("Skipping unreadable pending record: %s", p)
@@ -163,10 +242,10 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     path = _pending_path(subsystem, pending_id)
     if not path.exists():
         return None
-    with suppress(Exception):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    return None
+    data = _read_record(path)
+    if not data or _published_successor(subsystem, data):
+        return None
+    return data
 
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
@@ -192,6 +271,8 @@ def reject_pending(subsystem: str, pending_id: str) -> bool:
             record = get_pending(subsystem, pending_id)
             if not record:
                 return False
+            if not reconcile_superseded_predecessors(subsystem, record):
+                return False
             record["rejected_at"] = time.time()
             rejected = get_hermes_home() / "pending" / "rejected" / subsystem / f"{pending_id}.json"
             atomic_json_write(rejected, record)
@@ -204,6 +285,8 @@ def reject_pending(subsystem: str, pending_id: str) -> bool:
 
 def pending_count(subsystem: str) -> int:
     """Cheap count of pending records (for notification badges)."""
+    if subsystem == SKILLS:
+        return len(list_pending(subsystem))
     d = _pending_path(subsystem, "").parent
     if not d.exists():
         return 0

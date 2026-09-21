@@ -152,6 +152,67 @@ def test_stage_write_reports_persistence_failure_without_fake_pending_id(hermes_
     assert wa.pending_count("skills") == 0
 
 
+def test_supersession_is_recoverable_on_both_sides_of_publication(hermes_home, monkeypatch):
+    """A prepared archive is inert until publication; after publication it is a tombstone."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    first = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v1"},
+                           summary="first", origin="foreground")
+    real_write = wa.atomic_json_write
+
+    def fail_successor_publication(path, data):
+        if path.parent == wa._pending_path("skills", "").parent and data.get("id") != first["id"]:
+            raise OSError("injected publication failure")
+        return real_write(path, data)
+
+    monkeypatch.setattr(wa, "atomic_json_write", fail_successor_publication)
+    with pytest.raises(RuntimeError, match="Could not persist pending skills write"):
+        wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v2"},
+                       summary="publication fails", origin="foreground")
+    assert wa.get_pending("skills", first["id"]) is not None
+    assert [record["id"] for record in wa.list_pending("skills")] == [first["id"]]
+
+    monkeypatch.setattr(wa, "atomic_json_write", real_write)
+    old_path = wa._pending_path("skills", first["id"])
+    real_unlink = type(old_path).unlink
+
+    def fail_predecessor_retirement(path, *args, **kwargs):
+        if path == old_path:
+            raise OSError("injected retirement failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(old_path), "unlink", fail_predecessor_retirement)
+    with pytest.raises(RuntimeError, match="Could not persist pending skills write"):
+        wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v3"},
+                       summary="retirement fails", origin="foreground")
+
+    archive = wa.get_hermes_home() / "pending" / "superseded" / "skills" / f"{first['id']}.json"
+    successor_id = json.loads(archive.read_text(encoding="utf-8"))["superseded_by"]
+    assert old_path.exists()
+    assert wa.get_pending("skills", first["id"]) is None
+    assert [record["id"] for record in wa.list_pending("skills")] == [successor_id]
+    refused = handle_pending_subcommand(wa.SKILLS, ["approve", first["id"]])
+    assert refused is not None and "No pending skills write" in refused
+    assert wa.get_pending("skills", successor_id) is not None
+
+    unresolved = handle_pending_subcommand(wa.SKILLS, ["approve", successor_id])
+    assert unresolved is not None and "Approved 0" in unresolved
+    assert "supersession cleanup is incomplete" in unresolved
+    assert wa.get_pending("skills", successor_id) is not None
+
+    monkeypatch.setattr(type(old_path), "unlink", real_unlink)
+    third = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v4"},
+                           summary="third revision", origin="foreground")
+    assert third["revision"] == 3
+    assert wa.get_pending("skills", first["id"]) is None
+    assert wa.get_pending("skills", successor_id) is None
+    assert wa.reject_pending("skills", third["id"]) is True
+    assert wa.list_pending("skills") == []
+    assert not old_path.exists()
+    assert wa.get_pending("skills", first["id"]) is None
+
+
 def test_concurrent_approval_and_rework_preserve_new_pending(hermes_home, monkeypatch):
     from hermes_cli import write_approval_commands as commands
     from tools import write_approval as wa
