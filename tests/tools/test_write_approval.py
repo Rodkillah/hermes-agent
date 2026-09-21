@@ -60,6 +60,71 @@ def test_list_pending_skips_non_dict_record(hermes_home):
     assert wa.get_pending("memory", "bad") is None
 
 
+def test_skill_proposals_for_same_subject_coalesce_and_reject_is_archived(hermes_home):
+    from tools import write_approval as wa
+
+    first = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v1"},
+                           summary="first", origin="background_review")
+    second = wa.stage_write("skills", {"action": "patch", "name": "demo", "content": "v2"},
+                            summary="rework", origin="foreground")
+
+    assert second["id"] == first["id"]
+    assert second["revision"] == 2
+    assert second["subject_key"] == "skills:demo:SKILL.md"
+    assert wa.pending_count("skills") == 1
+    current = wa.get_pending("skills", first["id"])
+    assert current is not None
+    assert current["payload"]["content"] == "v2"
+
+    assert wa.reject_pending("skills", first["id"]) is True
+    assert wa.get_pending("skills", first["id"]) is None
+    rejected = wa.get_hermes_home() / "pending" / "rejected" / "skills" / f"{first['id']}.json"
+    archived = json.loads(rejected.read_text(encoding="utf-8"))
+    assert archived["subject_key"] == "skills:demo:SKILL.md"
+    assert archived["rejected_at"] >= archived["updated_at"]
+
+
+def test_preexisting_skill_duplicates_collapse_to_newest_id(hermes_home):
+    from tools import write_approval as wa
+
+    pending = wa._pending_path("skills", "").parent
+    pending.mkdir(parents=True)
+    for pending_id, created, content in (("older", 1, "v1"), ("newer", 2, "v2")):
+        record = {
+            "id": pending_id, "subsystem": "skills", "action": "edit",
+            "summary": content, "origin": "background_review", "created_at": created,
+            "payload": {"action": "edit", "name": "demo", "content": content},
+        }
+        (pending / f"{pending_id}.json").write_text(json.dumps(record), encoding="utf-8")
+
+    staged = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v3"},
+                            summary="final", origin="foreground")
+
+    assert staged["id"] == "newer"
+    assert [record["id"] for record in wa.list_pending("skills")] == ["newer"]
+    superseded = wa.get_hermes_home() / "pending" / "superseded" / "skills" / "older.json"
+    archived = json.loads(superseded.read_text(encoding="utf-8"))
+    assert archived["superseded_by"] == "newer"
+
+
+def test_full_rewrite_patch_diff_uses_content(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+
+    skill_dir = wa.get_hermes_home() / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("old\n", encoding="utf-8")
+    monkeypatch.setattr(wa, "_find_skill_path", lambda name: skill_dir)
+    record = {"id": "p1", "payload": {
+        "action": "patch", "name": "demo", "content": "new\n",
+        "old_string": "", "new_string": "",
+    }}
+
+    diff = wa.skill_pending_diff(record)
+    assert "-old" in diff
+    assert "+new" in diff
+    assert "(no textual change)" not in diff
+
+
 def test_normalize_enabled_coerces_values():
     from tools import write_approval as wa
     # Real bools pass through.

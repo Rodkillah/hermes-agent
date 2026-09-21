@@ -70,21 +70,70 @@ def _pending_files(subsystem: str) -> list:
     return list(d.glob("*.json")) if d.exists() else []
 
 
+def _skill_subject(payload: Dict[str, Any]) -> str:
+    """Stable target set for coalescing equivalent proposals without losing sibling files."""
+    operations = payload.get("operations", []) if payload.get("action") == "batch" else [payload]
+    targets = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        name = operation.get("name", "").strip()
+        if not name:
+            continue
+        action = operation.get("action", "")
+        target = operation.get("file_path", "") or ("*" if action == "delete" else "SKILL.md")
+        targets.add(f"{name}:{target}")
+    return "skills:" + ",".join(sorted(targets)) if targets else ""
+
+
+def _record_subject(record: Dict[str, Any]) -> str:
+    return record.get("subject_key", "") or _skill_subject(record.get("payload", {}))
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
-    """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
-    kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
-    Best-effort: on disk failure it logs and still returns a record — the write is lost, which is
-    the safe failure for an approval gate (nothing silently committed)."""
-    pid = uuid.uuid4().hex[:8]
-    record = {
-        "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
-        "summary": (summary or "").strip(), "origin": origin or "foreground",
-        "created_at": time.time(), "payload": payload,
-    }
+    """Persist a pending write and return its record (``id`` + metadata).
+
+    Skill proposals for the same target set coalesce under one stable id so parallel reviews cannot
+    stack quasi-duplicates. Memory proposals retain their independent-record behavior.
+    """
+    now = time.time()
+    subject = _skill_subject(payload) if subsystem == SKILLS else ""
     try:
-        atomic_json_write(_pending_path(subsystem, pid), record)
+        from tools.skill_usage import skill_file_lock
+        lock_path = _pending_path(subsystem, "").parent / ".write-approval.lock"
+        with skill_file_lock(lock_path):
+            matches = [r for r in list_pending(subsystem)
+                       if subject and _record_subject(r) == subject]
+            existing = matches[-1] if matches else None
+            pid = existing["id"] if existing else uuid.uuid4().hex[:8]
+            record = {
+                "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
+                "summary": (summary or "").strip(), "origin": origin or "foreground",
+                "created_at": existing.get("created_at", now) if existing else now,
+                "updated_at": now,
+                "revision": int(existing.get("revision", 1)) + 1 if existing else 1,
+                "payload": payload,
+            }
+            if subject:
+                record["subject_key"] = subject
+            atomic_json_write(_pending_path(subsystem, pid), record)
+            for duplicate in matches[:-1]:
+                duplicate["superseded_at"] = now
+                duplicate["superseded_by"] = pid
+                archived = (get_hermes_home() / "pending" / "superseded" / subsystem
+                            / f"{duplicate['id']}.json")
+                atomic_json_write(archived, duplicate)
+                _pending_path(subsystem, duplicate["id"]).unlink()
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
+        pid = uuid.uuid4().hex[:8]
+        record = {
+            "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
+            "summary": (summary or "").strip(), "origin": origin or "foreground",
+            "created_at": now, "updated_at": now, "revision": 1, "payload": payload,
+        }
+        if subject:
+            record["subject_key"] = subject
     return record
 
 
@@ -124,6 +173,27 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
     except Exception as e:  # pragma: no cover
         logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
     return False
+
+
+def reject_pending(subsystem: str, pending_id: str) -> bool:
+    """Move a rejection out of the active queue while retaining a durable audit record."""
+    path = _pending_path(subsystem, pending_id)
+    if not path.exists():
+        return False
+    try:
+        from tools.skill_usage import skill_file_lock
+        with skill_file_lock(path.parent / ".write-approval.lock"):
+            record = get_pending(subsystem, pending_id)
+            if not record:
+                return False
+            record["rejected_at"] = time.time()
+            rejected = get_hermes_home() / "pending" / "rejected" / subsystem / f"{pending_id}.json"
+            atomic_json_write(rejected, record)
+            path.unlink()
+        return True
+    except Exception as e:  # pragma: no cover
+        logger.error("Failed to reject pending %s/%s: %s", subsystem, pending_id, e)
+        return False
 
 
 def pending_count(subsystem: str) -> int:
@@ -273,7 +343,11 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
             p = skill_dir / target_label
             current = p.read_text(encoding="utf-8") if p.exists() else ""
 
-    if action == "patch":
+    if action == "patch" and payload.get("content") is not None:
+        # Some callers represent a complete rewrite as a patch. Its full candidate
+        # must win over empty old/new_string fields or /skills diff lies with no change.
+        new = payload.get("content") or ""
+    elif action == "patch":
         old_s, new_s = payload.get("old_string") or "", payload.get("new_string") or ""
         new = current.replace(old_s, new_s) if current else f"(patch {old_s!r} → {new_s!r})"
     else:

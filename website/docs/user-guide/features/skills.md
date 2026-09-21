@@ -638,14 +638,18 @@ When `write_approval: true`, every `skill_manage` write (create / edit /
 patch / delete / write_file / remove_file) is **staged** instead of committed —
 a SKILL.md is too large to review inline, so staging applies regardless of
 whether the write came from a foreground turn or the background review.
-Staged writes survive restarts under `~/.hermes/pending/skills/` and are
-reviewed with the same familiar approve/deny flow as dangerous commands:
+Staged writes survive restarts under `~/.hermes/pending/skills/`. Repeated
+proposals for the same skill target (for example, `SKILL.md` versus a specific
+supporting file) coalesce under one pending id: the newest candidate replaces
+the earlier revision instead of stacking a near-duplicate. Distinct supporting
+files remain distinct review subjects. They are reviewed with the same familiar
+approve/deny flow as dangerous commands:
 
 ```
 /skills pending             # list staged skill writes + a one-line gist each
 /skills diff <id>           # full unified diff (best viewed in CLI or dashboard)
 /skills approve <id>        # apply it (or 'all')
-/skills reject <id>         # drop it (or 'all')
+/skills reject <id>         # remove from active queue; retain a rejected audit record (or 'all')
 /skills approval on         # turn the gate on (or 'off') and persist it
 ```
 
