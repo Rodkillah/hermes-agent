@@ -76,12 +76,19 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
     applied, failed = 0, []
     for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store)
-        if ok:
-            wa.discard_pending(subsystem, rec["id"])
-            applied += 1
-        else:
-            failed.append(f"{rec['id']}: {msg}")
+        # Hold the same cross-process lock as stage_write. If a newer revision won first,
+        # the reviewed id is already archived and must not be applied from this stale snapshot.
+        with wa.pending_lock(subsystem):
+            current = wa.get_pending(subsystem, rec["id"])
+            if not current:
+                failed.append(f"{rec['id']}: pending revision is stale or no longer active")
+                continue
+            ok, msg = _apply_one(subsystem, current, memory_store)
+            if ok:
+                wa.discard_pending(subsystem, current["id"])
+                applied += 1
+            else:
+                failed.append(f"{current['id']}: {msg}")
 
     out = [f"Approved {applied} {subsystem} write(s)."]
     if failed:

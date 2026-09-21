@@ -17,7 +17,7 @@ import logging
 import re
 import time
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -90,50 +90,56 @@ def _record_subject(record: Dict[str, Any]) -> str:
     return record.get("subject_key", "") or _skill_subject(record.get("payload", {}))
 
 
+@contextmanager
+def pending_lock(subsystem: str):
+    """Serialize stage/review transitions for one subsystem across processes."""
+    from tools.skill_usage import skill_file_lock
+    lock_path = _pending_path(subsystem, "").parent / ".write-approval.lock"
+    with skill_file_lock(lock_path):
+        yield
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return its record (``id`` + metadata).
 
-    Skill proposals for the same target set coalesce under one stable id so parallel reviews cannot
-    stack quasi-duplicates. Memory proposals retain their independent-record behavior.
+    A skill subject is stable, but every revision gets an immutable approval id. Older active
+    revisions are archived before the new one is published, so an approval can never silently
+    switch to content that was staged after the human reviewed it. Memory proposals retain their
+    independent-record behavior.
     """
     now = time.time()
     subject = _skill_subject(payload) if subsystem == SKILLS else ""
     try:
-        from tools.skill_usage import skill_file_lock
-        lock_path = _pending_path(subsystem, "").parent / ".write-approval.lock"
-        with skill_file_lock(lock_path):
+        with pending_lock(subsystem):
             matches = [r for r in list_pending(subsystem)
                        if subject and _record_subject(r) == subject]
-            existing = matches[-1] if matches else None
-            pid = existing["id"] if existing else uuid.uuid4().hex[:8]
+            previous_revision = max((int(r.get("revision", 1)) for r in matches), default=0)
+            pid = uuid.uuid4().hex[:8]
             record = {
                 "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
                 "summary": (summary or "").strip(), "origin": origin or "foreground",
-                "created_at": existing.get("created_at", now) if existing else now,
+                "created_at": now,
                 "updated_at": now,
-                "revision": int(existing.get("revision", 1)) + 1 if existing else 1,
+                "revision": previous_revision + 1 if subject else 1,
                 "payload": payload,
             }
             if subject:
                 record["subject_key"] = subject
-            atomic_json_write(_pending_path(subsystem, pid), record)
-            for duplicate in matches[:-1]:
-                duplicate["superseded_at"] = now
-                duplicate["superseded_by"] = pid
+            # Archive first, publish the new immutable id second, then retire active predecessors.
+            # A failure before publication leaves every previous proposal reviewable.
+            for previous in matches:
+                previous = dict(previous)
+                previous["superseded_at"] = now
+                previous["superseded_by"] = pid
                 archived = (get_hermes_home() / "pending" / "superseded" / subsystem
-                            / f"{duplicate['id']}.json")
-                atomic_json_write(archived, duplicate)
-                _pending_path(subsystem, duplicate["id"]).unlink()
-    except Exception as e:  # pragma: no cover - disk failure path
+                            / f"{previous['id']}.json")
+                atomic_json_write(archived, previous)
+            atomic_json_write(_pending_path(subsystem, pid), record)
+            for previous in matches:
+                _pending_path(subsystem, previous["id"]).unlink()
+    except Exception as e:
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
-        pid = uuid.uuid4().hex[:8]
-        record = {
-            "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
-            "summary": (summary or "").strip(), "origin": origin or "foreground",
-            "created_at": now, "updated_at": now, "revision": 1, "payload": payload,
-        }
-        if subject:
-            record["subject_key"] = subject
+        raise RuntimeError(f"Could not persist pending {subsystem} write") from e
     return record
 
 

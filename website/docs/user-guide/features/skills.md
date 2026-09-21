@@ -640,10 +640,14 @@ a SKILL.md is too large to review inline, so staging applies regardless of
 whether the write came from a foreground turn or the background review.
 Staged writes survive restarts under `~/.hermes/pending/skills/`. Repeated
 proposals for the same skill target (for example, `SKILL.md` versus a specific
-supporting file) coalesce under one pending id: the newest candidate replaces
-the earlier revision instead of stacking a near-duplicate. Distinct supporting
-files remain distinct review subjects. They are reviewed with the same familiar
-approve/deny flow as dangerous commands:
+supporting file) share one stable subject but receive a new, immutable pending
+id for every revision. Publishing a revision archives and retires the earlier
+active id, so approval of an id always refers to the exact content that was
+reviewed; a superseded id is refused. This also prevents near-duplicates from
+stacking in the active queue. Distinct supporting files remain distinct review
+subjects. Review transitions and staging are serialized so a concurrent rework
+cannot be lost while an approval or rejection is being applied. They are
+reviewed with the same familiar approve/deny flow as dangerous commands:
 
 ```
 /skills pending             # list staged skill writes + a one-line gist each

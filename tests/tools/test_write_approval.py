@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import shutil
+import threading
 
 import pytest
 
@@ -60,7 +61,7 @@ def test_list_pending_skips_non_dict_record(hermes_home):
     assert wa.get_pending("memory", "bad") is None
 
 
-def test_skill_proposals_for_same_subject_coalesce_and_reject_is_archived(hermes_home):
+def test_skill_rework_gets_immutable_id_and_reject_is_archived(hermes_home):
     from tools import write_approval as wa
 
     first = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v1"},
@@ -68,17 +69,21 @@ def test_skill_proposals_for_same_subject_coalesce_and_reject_is_archived(hermes
     second = wa.stage_write("skills", {"action": "patch", "name": "demo", "content": "v2"},
                             summary="rework", origin="foreground")
 
-    assert second["id"] == first["id"]
+    assert second["id"] != first["id"]
     assert second["revision"] == 2
     assert second["subject_key"] == "skills:demo:SKILL.md"
     assert wa.pending_count("skills") == 1
-    current = wa.get_pending("skills", first["id"])
+    assert wa.get_pending("skills", first["id"]) is None
+    superseded = wa.get_hermes_home() / "pending" / "superseded" / "skills" / f"{first['id']}.json"
+    archived_first = json.loads(superseded.read_text(encoding="utf-8"))
+    assert archived_first["superseded_by"] == second["id"]
+    current = wa.get_pending("skills", second["id"])
     assert current is not None
     assert current["payload"]["content"] == "v2"
 
-    assert wa.reject_pending("skills", first["id"]) is True
-    assert wa.get_pending("skills", first["id"]) is None
-    rejected = wa.get_hermes_home() / "pending" / "rejected" / "skills" / f"{first['id']}.json"
+    assert wa.reject_pending("skills", second["id"]) is True
+    assert wa.get_pending("skills", second["id"]) is None
+    rejected = wa.get_hermes_home() / "pending" / "rejected" / "skills" / f"{second['id']}.json"
     archived = json.loads(rejected.read_text(encoding="utf-8"))
     assert archived["subject_key"] == "skills:demo:SKILL.md"
     assert archived["rejected_at"] >= archived["updated_at"]
@@ -100,11 +105,91 @@ def test_preexisting_skill_duplicates_collapse_to_newest_id(hermes_home):
     staged = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v3"},
                             summary="final", origin="foreground")
 
-    assert staged["id"] == "newer"
-    assert [record["id"] for record in wa.list_pending("skills")] == ["newer"]
+    assert staged["id"] not in {"older", "newer"}
+    assert staged["revision"] == 2
+    assert [record["id"] for record in wa.list_pending("skills")] == [staged["id"]]
     superseded = wa.get_hermes_home() / "pending" / "superseded" / "skills" / "older.json"
     archived = json.loads(superseded.read_text(encoding="utf-8"))
-    assert archived["superseded_by"] == "newer"
+    assert archived["superseded_by"] == staged["id"]
+    newer_archive = wa.get_hermes_home() / "pending" / "superseded" / "skills" / "newer.json"
+    assert json.loads(newer_archive.read_text(encoding="utf-8"))["superseded_by"] == staged["id"]
+
+
+def test_stale_skill_approval_cannot_apply_new_revision(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    skill_dir = wa.get_hermes_home() / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("original", encoding="utf-8")
+    first = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "reviewed"},
+                           summary="reviewed", origin="foreground")
+    second = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "unreviewed"},
+                            summary="unreviewed", origin="foreground")
+
+    stale = handle_pending_subcommand(wa.SKILLS, ["approve", first["id"]])
+    assert stale is not None
+    assert "No pending skills write" in stale
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == "original"
+    current = wa.get_pending("skills", second["id"])
+    assert current is not None
+    assert current["payload"]["content"] == "unreviewed"
+
+
+def test_stage_write_reports_persistence_failure_without_fake_pending_id(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+
+    real_write = wa.atomic_json_write
+    def fail_active(path, data):
+        if path.parent == wa._pending_path("skills", "").parent:
+            raise OSError("disk unavailable")
+        return real_write(path, data)
+    monkeypatch.setattr(wa, "atomic_json_write", fail_active)
+
+    with pytest.raises(RuntimeError, match="Could not persist pending skills write"):
+        wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "v1"},
+                       summary="must fail", origin="foreground")
+    assert wa.pending_count("skills") == 0
+
+
+def test_concurrent_approval_and_rework_preserve_new_pending(hermes_home, monkeypatch):
+    from hermes_cli import write_approval_commands as commands
+    from tools import write_approval as wa
+
+    first = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "reviewed"},
+                           summary="reviewed", origin="foreground")
+    applying = threading.Event()
+    release = threading.Event()
+    results = {}
+
+    def controlled_apply(subsystem, record, memory_store):
+        applying.set()
+        assert release.wait(timeout=5)
+        return True, ""
+
+    monkeypatch.setattr(commands, "_apply_one", controlled_apply)
+    approve_thread = threading.Thread(target=lambda: results.setdefault(
+        "approval", commands.handle_pending_subcommand(wa.SKILLS, ["approve", first["id"]])))
+    approve_thread.start()
+    assert applying.wait(timeout=5)
+
+    stage_thread = threading.Thread(target=lambda: results.setdefault(
+        "staged", wa.stage_write("skills", {"action": "edit", "name": "demo", "content": "rework"},
+                                 summary="rework", origin="foreground")))
+    stage_thread.start()
+    stage_thread.join(timeout=0.1)
+    assert stage_thread.is_alive()  # stage waits for the atomic review transition
+    release.set()
+    approve_thread.join(timeout=5)
+    stage_thread.join(timeout=5)
+
+    assert "Approved 1" in results["approval"]
+    staged = results["staged"]
+    assert staged["id"] != first["id"]
+    current = wa.get_pending("skills", staged["id"])
+    assert current is not None
+    assert current["payload"]["content"] == "rework"
+    assert wa.pending_count("skills") == 1
 
 
 def test_full_rewrite_patch_diff_uses_content(hermes_home, monkeypatch):
