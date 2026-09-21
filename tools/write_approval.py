@@ -100,6 +100,45 @@ def _published_successor(subsystem: str, record: Dict[str, Any]) -> Optional[str
     return None
 
 
+def reconcile_published_supersessions(subsystem: str) -> bool:
+    """Finish durable supersessions whose successor was already published.
+
+    The caller holds ``pending_lock``.  This recovery runs before a later stage
+    can retire the published successor: otherwise a prepared predecessor could
+    become active again when its successor disappears from the pending queue.
+    A prepared record whose successor was never published remains untouched and
+    reviewable.
+    """
+    if subsystem != SKILLS:
+        return True
+    try:
+        for path in _pending_files(subsystem):
+            record = _read_record(path)
+            if not record or not record.get("id"):
+                continue
+            archive = (get_hermes_home() / "pending" / "superseded" / subsystem
+                       / f"{record['id']}.json")
+            archived = _read_record(archive)
+            if not archived:
+                continue
+            successor_id = archived.get("superseded_by")
+            committed = archived.get("supersession_state") == "committed"
+            successor = (_read_record(_pending_path(subsystem, successor_id))
+                         if isinstance(successor_id, str) and successor_id else None)
+            published = bool(successor and _record_subject(successor) == _record_subject(record))
+            if not committed and not published:
+                continue
+            if not committed:
+                archived["supersession_state"] = "committed"
+                atomic_json_write(archive, archived)
+            path.unlink()
+    except Exception as e:
+        logger.error("Failed to reconcile published %s supersessions: %s", subsystem, e,
+                     exc_info=True)
+        return False
+    return True
+
+
 def reconcile_superseded_predecessors(subsystem: str, current: Dict[str, Any]) -> bool:
     """Retire published predecessors before ``current`` may leave the queue.
 
@@ -179,6 +218,8 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     subject = _skill_subject(payload) if subsystem == SKILLS else ""
     try:
         with pending_lock(subsystem):
+            if not reconcile_published_supersessions(subsystem):
+                raise OSError("published supersession cleanup is incomplete")
             matches = [r for r in list_pending(subsystem)
                        if subject and _record_subject(r) == subject]
             previous_revision = max((int(r.get("revision", 1)) for r in matches), default=0)

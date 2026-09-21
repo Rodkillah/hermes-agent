@@ -213,6 +213,45 @@ def test_supersession_is_recoverable_on_both_sides_of_publication(hermes_home, m
     assert wa.get_pending("skills", first["id"]) is None
 
 
+def test_interrupted_tombstone_commit_recovers_before_later_stage(hermes_home, monkeypatch):
+    """A later revision must not retire a successor before its predecessor is durable."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    skill_dir = wa.get_hermes_home() / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    skill = skill_dir / "SKILL.md"
+    content = lambda version: f"---\nname: demo\ndescription: Offline fixture.\n---\n\n{version}\n"
+    skill.write_text(content("v0"), encoding="utf-8")
+    first = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": content("v1")},
+                           summary="v1", origin="foreground")
+    real_write = wa.atomic_json_write
+
+    def fail_commit(path, data):
+        if data.get("supersession_state") == "committed":
+            raise OSError("injected tombstone commit failure")
+        return real_write(path, data)
+
+    monkeypatch.setattr(wa, "atomic_json_write", fail_commit)
+    with pytest.raises(RuntimeError, match="Could not persist pending skills write"):
+        wa.stage_write("skills", {"action": "edit", "name": "demo", "content": content("v2")},
+                       summary="v2", origin="foreground")
+    archive = wa.get_hermes_home() / "pending" / "superseded" / "skills" / f"{first['id']}.json"
+    second_id = json.loads(archive.read_text(encoding="utf-8"))["superseded_by"]
+    assert wa.get_pending("skills", first["id"]) is None
+    assert wa.get_pending("skills", second_id) is not None
+
+    monkeypatch.setattr(wa, "atomic_json_write", real_write)
+    third = wa.stage_write("skills", {"action": "edit", "name": "demo", "content": content("v3")},
+                           summary="v3", origin="foreground")
+    assert [record["id"] for record in wa.list_pending("skills")] == [third["id"]]
+    assert wa.get_pending("skills", first["id"]) is None
+    assert wa.get_pending("skills", second_id) is None
+    approved = handle_pending_subcommand(wa.SKILLS, ["approve", third["id"]])
+    assert approved is not None and "Approved 1" in approved
+    assert skill.read_text(encoding="utf-8") == content("v3")
+
+
 def test_concurrent_approval_and_rework_preserve_new_pending(hermes_home, monkeypatch):
     from hermes_cli import write_approval_commands as commands
     from tools import write_approval as wa
