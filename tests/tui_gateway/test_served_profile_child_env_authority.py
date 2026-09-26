@@ -96,3 +96,50 @@ def test_real_child_observes_only_the_routed_profile(homes):
     seen = json.loads(out.stdout.strip().splitlines()[-1])
     assert seen == {"HERMES_HOME": str(b), "A_MARKER": None, "B_MARKER": "b", "OPENAI_API_KEY": None}
     assert Path(seen["HERMES_HOME"]) == b
+
+def test_served_profile_cli_resolves_after_target_path_overlay(homes, tmp_path, monkeypatch):
+    """An A2A-style bare ``hermes`` spawn works when both profile PATHs omit its bin dir."""
+    import subprocess
+    from tools.environments import local
+
+    a, b = homes
+    bin_dir = tmp_path / "cli-bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "hermes"
+    shim.write_text("#!/bin/sh\nprintf 'CLI_PATH_OK\\n'\n", encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setattr(local, "_HERMES_BIN_DIR", str(bin_dir))
+    for home in (a, b):
+        with (home / ".env").open("a", encoding="utf-8") as dotenv:
+            dotenv.write("PATH=/usr/bin:/bin\n")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    for home in (a, b, a):
+        env = served_profile_child_env(target_home=home, inherit_credentials=True)
+        assert env["PATH"].split(os.pathsep)[0] == str(bin_dir)
+        assert env["PATH"].split(os.pathsep).count(str(bin_dir)) == 1
+        assert env["PATH"].endswith("/usr/bin:/bin")
+        result = subprocess.run(["hermes", "--version"], env=env, capture_output=True,
+                                text=True, encoding="utf-8", timeout=10, check=True)
+        assert result.stdout.strip() == "CLI_PATH_OK"
+        assert env["HERMES_HOME"] == str(home)
+        assert ("A_MARKER" in env) == (home == a)
+        assert ("B_MARKER" in env) == (home == b)
+        assert ("OPENAI_API_KEY" in env) == (home == a)
+
+
+def test_raw_base_served_child_keeps_secret_isolation_and_path(homes, tmp_path, monkeypatch):
+    """A relay-style raw base cannot leak A's credential into B while repairing PATH."""
+    from tools.environments import local
+
+    _, b = homes
+    bin_dir = tmp_path / "cli-bin"
+    bin_dir.mkdir()
+    monkeypatch.setattr(local, "_HERMES_BIN_DIR", str(bin_dir))
+    raw = dict(os.environ, PATH="/usr/bin:/bin")
+    env = served_profile_child_env(base=raw, target_home=b, inherit_credentials=True)
+    assert env["PATH"].split(os.pathsep) == [str(bin_dir), "/usr/bin", "/bin"]
+    assert env["HERMES_HOME"] == str(b)
+    assert env["B_MARKER"] == "b"
+    assert "OPENAI_API_KEY" not in env and "A_MARKER" not in env
+    assert raw["PATH"] == "/usr/bin:/bin"

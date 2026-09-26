@@ -395,6 +395,12 @@ def served_profile_child_env(
                     "no profile secret scope bound while multiplexing is on; the child would inherit the "
                     "launch profile's credentials. Bind the profile scope (or pass target_home) at the spawn site.")
         env.update((k, v) for k, v in (secrets or {}).items() if v is not None)
+    # The target's .env can replace PATH after the launch env was sanitized.
+    # Restore just the Hermes CLI directory after that overlay, without
+    # borrowing credentials or other PATH entries from the launch profile.
+    path_key = _path_env_key(env)
+    if path_key is not None:
+        env[path_key] = _prepend_hermes_bin_dir(env.get(path_key, ""))
     return env
 
 

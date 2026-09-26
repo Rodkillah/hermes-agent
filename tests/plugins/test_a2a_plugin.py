@@ -1666,7 +1666,12 @@ if '--resume' not in sys.argv:
 print('fake reply')
 """)
         hermes.chmod(0o755)
-        monkeypatch.setenv("PATH", str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
+        # The served profile's dotenv PATH shadows the gateway unit's PATH.
+        # A2A still needs to locate its CLI after that overlay.
+        (profile_home / ".env").write_text("PATH=/usr/bin:/bin\n", encoding="utf-8")
+        from tools.environments import local
+        monkeypatch.setattr(local, "_HERMES_BIN_DIR", str(fakebin))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
         monkeypatch.setenv("FAKE_HERMES_CALLS", str(calls))
         monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda profile: str(profile_home))
 
