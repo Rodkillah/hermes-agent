@@ -72,15 +72,16 @@ def _handle(name: str) -> str:
 def _roster(root: Path) -> list[tuple[str, Path]]:
     """(name, dir) for the default profile + every live named profile, sorted. Same identity
     predicate as ``profile list``: infra dirs (``sessions/``, ``logs/``) and tombstones are not
-    teammates (#99392)."""
-    from hermes_constants import named_profile_is_live
+    teammates (#99392), and neither is a marker-carrying dir whose name is not a profile id —
+    a parked backup or staging dir must never become a ``message_agent`` target (#116905)."""
+    from hermes_constants import PROFILE_ID_RE, named_profile_is_live
 
     profiles = root / "profiles"
     named = _swallow(
         lambda: [
             (c.name, c)
             for c in sorted(profiles.iterdir())
-            if c.name != "default" and named_profile_is_live(c)
+            if c.name != "default" and PROFILE_ID_RE.match(c.name) and named_profile_is_live(c)
         ]
         if profiles.is_dir()
         else [],
@@ -364,7 +365,17 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         skills_root = resolved / "skills"
         if not skills_root.is_dir():
             return []
-        return sorted(str(p.parent.relative_to(skills_root)) for p in skills_root.glob("**/SKILL.md"))
+        # The same walk every other reader of this tree uses (skills_list/skill_view, the prompt's
+        # skills index, skill_count): it prunes EXCLUDED_SKILL_DIRS — ``.archive``, ``.curator_backups``,
+        # ``node_modules`` … — and each skill's support dirs. A raw ``**/SKILL.md`` glob counted files
+        # the model can never invoke, so archiving a skill, or the curator writing a backup, flipped the
+        # epoch and forced every Bot Chat to rebuild a system prompt whose skills index had not changed.
+        # iter_skill_index_files is also org-token-gated, so the epoch moves on an org switch as well —
+        # intended: a different org sees a different skills index, so it needs a different prompt.
+        from agent.skill_utils import iter_skill_index_files
+
+        return sorted(str(p.parent.relative_to(skills_root))
+                      for p in iter_skill_index_files(skills_root, "SKILL.md"))
 
     surface["soul"] = _swallow(_soul, "")
     surface["skills"] = _swallow(_skills, [])

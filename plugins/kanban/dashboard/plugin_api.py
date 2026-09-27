@@ -271,6 +271,18 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": _ids("parent_id", "child_id"), "children": _ids("child_id", "parent_id")}
 
 
+def _link_tasks(conn: sqlite3.Connection, links: dict[str, list[str]]) -> list[dict]:
+    """One {id, title, status} row per linked task, so UIs can render titles
+    instead of raw ids. Dropped/foreign rows are simply absent — callers fall
+    back to the id."""
+    rows = []
+    for task_id in dict.fromkeys([*links["parents"], *links["children"]]):
+        task = kanban_db.get_task(conn, task_id)
+        if task:
+            rows.append({"id": task.id, "title": task.title, "status": task.status})
+    return rows
+
+
 # --- GET /board -------------------------------------------------------------
 
 def get_board(
@@ -379,6 +391,7 @@ def get_task(
             "links": links,
             "production_receipt": (
                 _receipt.to_dict() if (_receipt := kanban_db.get_production_receipt(conn, task_id)) else None),
+            "link_tasks": _link_tasks(conn, links),
             "child_results": [
                 {"id": c.id, "title": c.title, "status": c.status, "latest_summary": child_summaries.get(c.id), "result": c.result}
                 for c in children],
@@ -589,13 +602,7 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
 
 
 def _set_priority(conn, task_id: str, priority: int, board: Optional[str]) -> None:
-    with kanban_db.write_txn(conn):
-        conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (int(priority), task_id))
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'reprioritized', ?, ?)",
-            (task_id, json.dumps({"priority": int(priority)}), int(time.time())))
-    # Mutation-boundary observer (post-commit): this direct-SQL write bypasses every kanban_db mutator.
-    kanban_db.notify_task_updated(conn, task_id, ("priority",), board=board)
+    kanban_db.edit_task(conn, task_id, priority=int(priority), board=board)
 
 
 def _apply_model_override(conn, task_id: str, p) -> bool:
@@ -634,7 +641,7 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected):
+        with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)

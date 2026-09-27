@@ -27,7 +27,8 @@ function relabelMemberControlFrames(text: string) {
  *  profile name (legacy call sites and single-connection jobs). */
 export type GroupChatLineViewer =
   | string
-  | (Pick<GroupMember, 'name'> & Partial<Pick<GroupMember, 'connectionId' | 'connectionLabel' | 'installId' | 'remoteSource'>>)
+  | (Pick<GroupMember, 'name'> &
+      Partial<Pick<GroupMember, 'connectionId' | 'connectionLabel' | 'installId' | 'remoteSource'>>)
 
 /** Room-log line as a member sees it: `Name (user): …` / `Name: …` /
  *  `Name (you): …`. */
@@ -71,6 +72,7 @@ export function formatGroupDeltaLines(delta: GroupMessage[], viewer: GroupChatLi
 
   for (let i = delta.length - 1; i >= 0 && lines.length < GROUP_CHAT_HISTORY_LIMIT; i--) {
     const entry = delta[i]
+
     const line = formatGroupChatLine(
       { ...entry, text: compactGroupChatSyncText(entry.text, GROUP_CHAT_HISTORY_LINE_CHARS).text },
       viewer,
@@ -110,7 +112,9 @@ function viewerConnectionSources(viewer: GroupChatLineViewer): string[] {
   return [viewer.connectionLabel, viewer.connectionId].filter((token): token is string => Boolean(token))
 }
 
-function isGroupChatSelf(from: GroupMessageAuthor, viewer: GroupChatLineViewer): boolean {
+/** Whether `from` is the viewer itself — the one authorship rule for the
+ *  `(you)` suffix and for the round's own-entry watermark walk. */
+export function isGroupChatSelf(from: GroupMessageAuthor, viewer: GroupChatLineViewer): boolean {
   if (!from.name || from.name !== viewerNameOf(viewer)) {
     return false
   }
@@ -141,6 +145,10 @@ interface GroupChatTurnPromptInput {
   viewer: GroupMember
 }
 
+/** Opens every room-fed turn prompt; group-external-writes.ts tells the room's
+ *  own prompts apart from outside writes by it. */
+export const GROUP_PROMPT_HEADER_PREFIX = '[Group chat: "'
+
 /** The full per-turn payload for one member: participation rules + the room
  *  delta. Rules travel in the turn payload (not SOUL) so every existing bot
  *  can join a group chat without a profile migration. */
@@ -157,7 +165,7 @@ export function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLine
     .join(', ')
 
   return [
-    `[Group chat: "${groupName}"] You are @${botMentionTag(viewer)}, one participant in a group chat with ${peerNames || 'no one else yet'} and the user.`,
+    `${GROUP_PROMPT_HEADER_PREFIX}${groupName}"] You are @${botMentionTag(viewer)}, one participant in a group chat with ${peerNames || 'no one else yet'} and the user.`,
     '',
     'New messages in the room since your last turn (oldest first):',
     ...deltaLines.map(line => `  ${line}`),

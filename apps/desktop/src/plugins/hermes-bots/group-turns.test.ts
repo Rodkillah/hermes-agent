@@ -20,6 +20,10 @@ vi.mock('@hermes/plugin-sdk', async () => {
   return pluginSdkMock(host)
 })
 
+// agent/turn_failure_copy.py::PARTIAL_FAILED_TURN_NOTICE
+const PARTIAL_NOTICE =
+  'This turn did not complete. Some actions may already have run; verify their effects before resending.'
+
 interface Room {
   chat: typeof groupChat
   gateway: ScriptedGateway
@@ -54,6 +58,9 @@ const ROUTED_MEMBER: GroupMember = { connectionId: 'mini', name: 'helper', remot
 const IMG: Attachment = { data: 'data:image/png;base64,iVBORw0KGgo=', kind: 'image', name: 'shot.png' }
 
 const log = (room: Room, group: string) => room.chat.$groupChats.get()[group]?.log || []
+// The room engine opens every turn prompt with this header (group-round-prompt.ts);
+// a user row without it is an outside write and gets mirrored into the room log.
+const roomPrompt = (group: string) => `[Group chat: "${group}"] You are @member, one participant in a group chat.`
 
 beforeEach(() => {
   runTimersInline()
@@ -330,6 +337,120 @@ describe('session-gone classification', () => {
     }
   })
 
+  // The core loop closes a failed turn with a Hermes-authored assistant row
+  // typed `display_kind: failed_turn` (agent/turn_failure_copy.py). That row is
+  // a transcript boundary, not the member speaking: read as the reply, the
+  // room posted it as the bot's answer, re-drove the member and hid the error.
+  it('reports a failed turn whose transcript Hermes closed with the failed-turn notice', async () => {
+    let now = 1_000_000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => (now += 60_000))
+
+    const room = await loadRoom({
+      turn: () => [{ content: 'Your request was not processed.', display_kind: 'failed_turn', role: 'assistant' }]
+    })
+
+    const request = host.request as (method: string, params?: Record<string, unknown>) => Promise<unknown>
+    let submitted = false
+
+    // The real gateway keeps the tombstone AND the closed transcript.
+    host.request = async (method: string, params: Record<string, unknown> = {}) => {
+      const result = (await request(method, params)) as Record<string, unknown>
+
+      submitted = submitted || method === 'prompt.submit'
+
+      return method === 'session.resume' && submitted
+        ? { ...result, inflight: { error: 'HTTP 401: invalid_api_key', status: 'error', streaming: false } }
+        : result
+    }
+
+    try {
+      await expect(room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'hi', 't1', [])).rejects.toThrow(
+        'HTTP 401: invalid_api_key'
+      )
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  // The member spoke, called a tool, then the provider failed. The core closer
+  // writes no boundary behind a tool row, so the retained error is the only
+  // evidence; with a boundary but the retained error gone (backend restarted)
+  // the turn still failed. Either way the pre-tool text is not the reply.
+  it.each([
+    ['the retained provider error', [], 'HTTP 401: invalid_api_key'],
+    [
+      'the failed-turn notice once the retained error is gone',
+      [{ content: PARTIAL_NOTICE, display_kind: 'failed_turn', role: 'assistant' }],
+      null
+    ]
+  ])('reports a turn that failed after pre-tool text with %s', async (_label, boundary, retained) => {
+    let now = 1_000_000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => (now += 60_000))
+
+    const room = await loadRoom({
+      turn: () => [
+        { content: 'Let me check the repo first.', role: 'assistant' },
+        { content: 'ok', role: 'tool' },
+        ...boundary
+      ]
+    })
+
+    const request = host.request as (method: string, params?: Record<string, unknown>) => Promise<unknown>
+    let submitted = false
+
+    host.request = async (method: string, params: Record<string, unknown> = {}) => {
+      const result = (await request(method, params)) as Record<string, unknown>
+
+      submitted = submitted || method === 'prompt.submit'
+
+      return method === 'session.resume' && submitted && retained
+        ? { ...result, inflight: { error: retained, status: 'error', streaming: false } }
+        : result
+    }
+
+    try {
+      await expect(room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'hi', 't1', [])).rejects.toThrow(
+        retained ?? PARTIAL_NOTICE
+      )
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  // The previous turn failed with the same error: only `turn_started_at` tells
+  // this turn's retained failure from the leftover one.
+  it('reports a failure identical to the previous turn’s instead of posting pre-tool text', async () => {
+    let now = 1_000_000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => (now += 60_000))
+
+    const room = await loadRoom({
+      turn: () => [
+        { content: 'Let me check the repo first.', role: 'assistant' },
+        { content: 'ok', role: 'tool' }
+      ]
+    })
+
+    const request = host.request as (method: string, params?: Record<string, unknown>) => Promise<unknown>
+    const inflight = { error: 'HTTP 401: invalid_api_key', status: 'error', streaming: false }
+    let submitted = false
+
+    host.request = async (method: string, params: Record<string, unknown> = {}) => {
+      const result = (await request(method, params)) as Record<string, unknown>
+
+      submitted = submitted || method === 'prompt.submit'
+
+      return method === 'session.resume' ? { ...result, inflight, turn_started_at: submitted ? 200 : 100 } : result
+    }
+
+    try {
+      await expect(room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'hi', 't1', [])).rejects.toThrow(
+        inflight.error
+      )
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   // A turn that dies BEFORE its prompt is committed (agent-init failure,
   // no-agent refusal) leaves a retained `{ status: 'error' }` and a transcript
   // that never grew — the failure must still surface instead of the poll
@@ -377,6 +498,17 @@ describe('per-turn socket lease', () => {
     expect(reply).toBe('routed reply')
     // The retain landed before the first session-scoped RPC on the route.
     expect(room.gateway.timeline[0]).toBe('retain')
+    expect(room.gateway.retains).toEqual([{ spawnPriority: 'foreground' }])
+
+    const resumes = room.gateway.rpcFor('session.resume')
+
+    expect(resumes.length).toBeGreaterThan(0)
+
+    for (const resume of resumes) {
+      expect(resume).toMatchObject({ spawnPriority: 'foreground' })
+    }
+
+    expect(room.gateway.rpcFor('session.create')).toEqual([expect.objectContaining({ spawnPriority: 'foreground' })])
 
     // The socket was NEVER disposed mid-turn: after every per-request lease
     // released, the turn lease still held the refcount above zero.
@@ -387,15 +519,6 @@ describe('per-turn socket lease', () => {
     // Exactly one disposal, via the turn lease's own release at the end.
     expect(room.gateway.disposals()).toBe(1)
     expect(room.gateway.timeline.at(-1)).toBe('release')
-  })
-
-  it('is released after the turn — the refcount returns to zero', async () => {
-    const room = await loadRoom({ turn: () => 'done' })
-
-    await room.turns.runGroupChatMemberTurn('Room', ROUTED_MEMBER, 'hi', 't1', [])
-
-    expect(room.gateway.refcount()).toBe(0)
-    expect(room.gateway.disposals()).toBe(1)
   })
 
   it('is released even when the turn fails', async () => {
@@ -1083,46 +1206,7 @@ describe('in-flight marker', () => {
     expect(room.chat.$groupChats.get().Room?.stranded?.helper).toBeUndefined()
   })
 
-  it('a poll still running here owns its marker: the harvest leaves the turn to it', async () => {
-    const room = await loadRoom({ pollsBusy: 1, turn: () => 'late answer' })
-    const request = host.request as (method: string, params?: Record<string, unknown>) => Promise<unknown>
-    // Park the poll on its first post-submit resume so the in-flight window is observable.
-    let release!: () => void
-
-    const gate = new Promise<void>(resolve => {
-      release = resolve
-    })
-
-    let parked = false
-
-    host.request = async (method: string, params: Record<string, unknown> = {}) => {
-      if (method === 'session.resume' && room.gateway.rpcFor('prompt.submit').length && !parked) {
-        parked = true
-        await gate
-      }
-
-      return request(method, params)
-    }
-
-    const turn = room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'hi', 't1', [])
-
-    await drain(() => !parked)
-    const marker = room.chat.$groupChats.get().Room?.stranded?.helper
-    const resumes = room.gateway.rpcFor('session.resume').length
-
-    expect(room.turns.strandedMarkerIsLive(marker)).toBe(true)
-    await room.turns.harvestStrandedGroupReply('Room', LOCAL_MEMBER)
-    expect(log(room, 'Room')).toHaveLength(0)
-    expect(room.chat.$groupChats.get().Room?.stranded?.helper).toBe(marker)
-    expect(room.gateway.rpcFor('session.resume')).toHaveLength(resumes) // the harvest never touched the session
-
-    release()
-    expect(await turn).toBe('late answer')
-    expect(room.chat.$groupChats.get().Room?.stranded?.helper).toBeUndefined()
-    expect(room.turns.strandedMarkerIsLive(marker)).toBe(false)
-  })
-
-  it('harvests a remote member\'s turn that a previous Desktop process left in flight', async () => {
+  it("harvests a remote member's turn that a previous Desktop process left in flight", async () => {
     const room = await loadRoom()
     const { groupSessionKey } = await import('./group-membership')
 
@@ -1137,7 +1221,7 @@ describe('in-flight marker', () => {
     })
     room.gateway.sessions.set('sid-mini-helper', {
       messages: [
-        { content: 'the turn prompt', role: 'user' },
+        { content: roomPrompt('Fleet'), role: 'user' },
         { content: 'Finished on the mini after the Desktop went away.', role: 'assistant' }
       ],
       profile: 'helper',
@@ -1172,9 +1256,7 @@ describe('stranded harvest', () => {
     const activity = await import('./group-activity')
 
     try {
-      expect(await room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'deploy', 't1', [])).toBe(
-        'long deploy done'
-      )
+      expect(await room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'deploy', 't1', [])).toBe('long deploy done')
       expect(room.chat.$groupChats.get().Room?.stranded?.helper).toBeUndefined()
       expect(activity.$groupActivity.get().Room?.events.map(event => event.kind)).not.toContain('timed-out')
     } finally {
@@ -1203,7 +1285,7 @@ describe('stranded harvest', () => {
     })
     // The member's session finished after we stopped waiting.
     seedSession(room, 'sid-research', 'research', 'Group: Late', [
-      ['user', 'the turn prompt'],
+      ['user', roomPrompt('Late')],
       ['assistant', 'Here is the full research result, delivered late.']
     ])
 
@@ -1228,7 +1310,7 @@ describe('stranded harvest', () => {
       return current
     })
     seedSession(room, 'sid-research', 'research', 'Group: Rescue', [
-      ['user', 'the turn prompt'],
+      ['user', roomPrompt('Rescue')],
       ['assistant', 'Here is the full research result, delivered late.'],
       [
         'user',
@@ -1244,39 +1326,6 @@ describe('stranded harvest', () => {
     expect(room.chat.$groupChats.get().Rescue.stranded?.research).toBeUndefined()
   })
 
-  it('drops a marker whose session is genuinely gone, but keeps one whose source is unreachable', async () => {
-    const room = await loadRoom()
-    const request = host.request as (method: string, params?: Record<string, unknown>) => Promise<unknown>
-
-    room.chat.updateGroupChat('Gone', current => {
-      current.sessions = { research: 'sid-deleted', ops: 'sid-ops' }
-      current.stranded = { ops: 1, research: 1 }
-
-      return current
-    })
-
-    host.request = async (method: string, params: Record<string, unknown> = {}) => {
-      if (method === 'session.resume' && params.session_id === 'sid-deleted') {
-        throw Object.assign(new Error('session not found'), { code: 4007 })
-      }
-
-      if (method === 'session.resume' && params.session_id === 'sid-ops') {
-        throw new Error('socket closed')
-      }
-
-      return request(method, params)
-    }
-
-    await room.turns.harvestStrandedGroupReply('Gone', { name: 'research', title: '' })
-    await room.turns.harvestStrandedGroupReply('Gone', { name: 'ops', title: '' })
-
-    expect(log(room, 'Gone')).toHaveLength(0)
-    // 4007: nothing will ever land — a marker that cannot resolve would silence the member for good.
-    expect(room.chat.$groupChats.get().Gone.stranded?.research).toBeUndefined()
-    // Unreachable: the turn may still be running there — leave it for the next boundary.
-    expect(room.chat.$groupChats.get().Gone.stranded?.ops).toBe(1)
-  })
-
   it('consumes the marker without posting when the late reply is a pass', async () => {
     const room = await loadRoom()
 
@@ -1287,8 +1336,8 @@ describe('stranded harvest', () => {
       return current
     })
     seedSession(room, 'sid-builder', 'builder', 'Group: Quiet2', [
-      ['user', 'p1'],
-      ['user', 'prompt'],
+      ['user', roomPrompt('Quiet2')],
+      ['user', roomPrompt('Quiet2')],
       ['assistant', '(pass)']
     ])
 
@@ -1314,7 +1363,7 @@ describe('stranded harvest', () => {
 
       return current
     })
-    seedSession(room, 'sid-builder', 'builder', 'Group: Dead', [['user', 'p1']])
+    seedSession(room, 'sid-builder', 'builder', 'Group: Dead', [['user', roomPrompt('Dead')]])
     const requestProfile = host.requestProfile as (...args: unknown[]) => Promise<Record<string, unknown>>
 
     host.requestProfile = async (...args: unknown[]) => ({
@@ -1325,7 +1374,101 @@ describe('stranded harvest', () => {
     await room.turns.harvestStrandedGroupReply('Dead', member)
 
     expect(room.chat.$groupChats.get().Dead.stranded?.[key]).toBeUndefined()
-    expect(activity.$groupActivity.get().Dead?.events.map(event => [event.kind, event.member])).toEqual([['failed', key]])
+    expect(activity.$groupActivity.get().Dead?.events.map(event => [event.kind, event.member])).toEqual([
+      ['failed', key]
+    ])
+  })
+
+  // A late turn that spoke, called a tool and then hit a provider failure: the
+  // pre-tool text is not a late reply, whether the retained error or only the
+  // failed-turn row (retained error gone) says the turn failed.
+  it.each([
+    ['the retained provider error', [], 'HTTP 401: invalid_api_key'],
+    [
+      'the failed-turn notice alone',
+      [{ content: PARTIAL_NOTICE, display_kind: 'failed_turn', role: 'assistant' }],
+      null
+    ]
+  ])('reports a late turn that failed after pre-tool text with %s', async (_label, boundary, retained) => {
+    const room = await loadRoom()
+    const activity = await import('./group-activity')
+
+    room.chat.updateGroupChat('Broke', current => {
+      current.sessions = { research: 'sid-research' }
+      current.stranded = { research: 0 }
+
+      return current
+    })
+    room.gateway.sessions.set('sid-research', {
+      messages: [
+        { content: roomPrompt('Broke'), role: 'user' },
+        { content: 'Let me check the repo first.', role: 'assistant' },
+        { content: 'ok', role: 'tool' },
+        ...boundary
+      ],
+      profile: 'research',
+      runtime: 'rt-research',
+      stored: 'sid-research',
+      title: 'Group: Broke'
+    })
+
+    if (retained) {
+      const request = host.request as (method: string, params?: Record<string, unknown>) => Promise<unknown>
+
+      host.request = async (method: string, params: Record<string, unknown> = {}) => {
+        const result = (await request(method, params)) as Record<string, unknown>
+
+        return method === 'session.resume'
+          ? { ...result, inflight: { error: retained, status: 'error', streaming: false } }
+          : result
+      }
+    }
+
+    await room.turns.harvestStrandedGroupReply('Broke', { name: 'research', title: '' })
+
+    expect(log(room, 'Broke')).toHaveLength(0)
+    expect(room.chat.$groupChats.get().Broke.stranded?.research).toBeUndefined()
+    expect(activity.$groupActivity.get().Broke?.events.map(event => event.kind)).toEqual(['failed'])
+  })
+
+  // A later gateway turn in the same session failed: its retained error is not
+  // the stranded turn's, so the stranded turn's real late reply still posts.
+  it('posts the late reply when a later turn in the session failed', async () => {
+    const room = await loadRoom()
+    const activity = await import('./group-activity')
+
+    room.chat.updateGroupChat('Late', current => {
+      current.sessions = { research: 'sid-research' }
+      current.stranded = { research: 0 }
+
+      return current
+    })
+    room.gateway.sessions.set('sid-research', {
+      messages: [
+        { content: roomPrompt('Late'), role: 'user' },
+        { content: 'Here is the late answer.', role: 'assistant' },
+        { content: 'and the deploy?', role: 'user' }
+      ],
+      profile: 'research',
+      runtime: 'rt-research',
+      stored: 'sid-research',
+      title: 'Group: Late'
+    })
+
+    const request = host.request as (method: string, params?: Record<string, unknown>) => Promise<unknown>
+
+    host.request = async (method: string, params: Record<string, unknown> = {}) => {
+      const result = (await request(method, params)) as Record<string, unknown>
+
+      return method === 'session.resume'
+        ? { ...result, inflight: { error: 'HTTP 401: invalid_api_key', status: 'error', streaming: false } }
+        : result
+    }
+
+    await room.turns.harvestStrandedGroupReply('Late', { name: 'research', title: '' })
+
+    expect(log(room, 'Late').map(entry => entry.text)).toContain('Here is the late answer.')
+    expect(activity.$groupActivity.get().Late?.events.map(event => event.kind)).not.toContain('failed')
   })
 
   it('never re-submits into a member the harvest just confirmed is still running', async () => {

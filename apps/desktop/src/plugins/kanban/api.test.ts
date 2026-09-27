@@ -21,12 +21,24 @@ const { atomMock, queryClientMock } = vi.hoisted(() => {
     }
   }
 
-  return { atomMock, queryClientMock: { invalidateQueries: vi.fn() } }
+  return {
+    atomMock,
+    queryClientMock: {
+      invalidateQueries: vi.fn(),
+      setQueryDefaults: vi.fn()
+    }
+  }
 })
 
 vi.mock('@hermes/plugin-sdk', () => ({
   atom: atomMock,
-  queryClient: queryClientMock
+  captureGatewayFileDownload: vi.fn(() => vi.fn()),
+  host: {
+    activeConnectionId: vi.fn(() => null),
+    state: { connectionId: atomMock<null | string>(null) }
+  },
+  queryClient: queryClientMock,
+  useValue: <T>(value: { get: () => T }) => value.get()
 }))
 
 afterEach(() => {

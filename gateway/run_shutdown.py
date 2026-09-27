@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
+from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -221,6 +222,20 @@ class GatewayShutdownMixin:
         """API-server work that is outside ``_running_agents``."""
         try:
             return self._api_server_hook("active_agent_work_count")
+        except Exception:
+            return 0
+
+    def _active_api_worker_count(self) -> int:
+        """API-server executor threads still inside an agent turn (#116535).
+
+        Module-level, like the cron registry above: the handler-side adapter count is already
+        unreachable here (``adapters`` was cleared a phase earlier) and, worse, drops on handler
+        cancellation while the worker thread lives on. Read live at the close gate instead of
+        snapshotting.
+        """
+        try:
+            from gateway.platforms.api_server_runs import api_worker_live_count
+            return max(0, int(api_worker_live_count()))
         except Exception:
             return 0
 
@@ -1207,7 +1222,7 @@ class GatewayShutdownMixin:
 
         try:
             await asyncio.wait_for(
-                self._run_in_executor_with_context(self._run_release_in_profile_scope, _call, (), session_key),
+                self._run_housekeeping_in_executor(self._run_release_in_profile_scope, _call, (), session_key),
                 timeout=self._FINALIZE_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
@@ -1225,7 +1240,7 @@ class GatewayShutdownMixin:
 
         The teardown fires the memory-provider lifecycle hooks (``flush_pending`` → ``on_session_end`` →
         ``shutdown`` → ``close``), which read credentials/home at call time. In-turn callers carry the
-        profile scope through ``_run_in_executor_with_context``; shutdown does not (it runs on the main
+        profile scope through ``_run_housekeeping_in_executor``; shutdown does not (it runs on the main
         loop, outside any adapter handler), so under multiplexing ``on_session_end`` failed closed and the
         session tail was never committed (#110622). ``_run_release_in_profile_scope`` enters the OWNING
         profile's scope from ``session_key`` when the caller has none, exactly like cache eviction."""
@@ -1237,7 +1252,7 @@ class GatewayShutdownMixin:
         ctx_label = f" ({context})" if context else ""
         try:
             await asyncio.wait_for(
-                self._run_in_executor_with_context(
+                self._run_housekeeping_in_executor(
                     self._run_release_in_profile_scope, self._cleanup_agent_resources, (agent,), session_key,
                 ),
                 timeout=self._CLEANUP_TIMEOUT_S,
@@ -1314,7 +1329,7 @@ class GatewayShutdownMixin:
             atomic_json_write(path, {key: counts.get(key, 0) + 1 for key in active_session_keys}, indent=None)
 
     def _suspend_stuck_loop_sessions(self) -> int:
-        """Suspend sessions active across too many restarts (startup, AFTER suspend_recently_active())."""
+        """Suspend sessions active across too many restarts (startup, AFTER crash-turn recovery)."""
         path = self._stuck_loop_counts_path()
         if not path.exists():
             return 0
@@ -1621,7 +1636,9 @@ class GatewayShutdownMixin:
         # self._restart_task: a bare asyncio.create_task() keeps only a weak reference, so the event loop
         # may garbage-collect a still-pending task mid-flight. The cancel loop in _stop_impl explicitly
         # skips _restart_task for the same reason it skips _stop_task.
-        self._restart_task = asyncio.create_task(_run_restart())
+        # Empty Context: /restart is handled inside the requester's profile scope, and a copied context
+        # would run the HOST restart as that profile (watcher HERMES_HOME, stop()'s flushes).
+        self._restart_task = Context().run(lambda: asyncio.create_task(_run_restart()))
         return True
 
     def _start_systemd_watchdog(self) -> bool:
@@ -1977,13 +1994,18 @@ class GatewayShutdownMixin:
         # outlived the drain is mid-write for the same #101093 reasons; the drain already spent its
         # budget, so no second wait — leave the handles open (#102198). The API count is the snapshot
         # taken before the adapters were released; a run whose handler task was cancelled at disconnect
-        # has already left it, so this term under-counts rather than over-counts.
-        _cron_live, _api_live, _deferred_live = self._active_cron_job_count(), ctx.api_live, ctx.deferred_count()
-        if _cron_live or _api_live or _deferred_live:
+        # has already left it, so that term under-counts — the live worker-scoped count below covers
+        # the cancelled-handler case (#116535).
+        _cron_live = self._active_cron_job_count()
+        _api_live = ctx.api_live
+        _api_worker_live = self._active_api_worker_count()
+        _deferred_live = ctx.deferred_count()
+        if _cron_live or _api_live or _api_worker_live or _deferred_live:
             logger.warning(
-                "Shutdown phase: %d cron job(s) / %d API-server run(s) / %d deferred worker(s) still running "
-                "after the executor quiesce — skipping the SessionDB close/checkpoint, leaving state.db open "
-                "for the live writer (#102198)", _cron_live, _api_live, _deferred_live,
+                "Shutdown phase: %d cron job(s) / %d API-server run(s) / %d API-server worker(s) / "
+                "%d deferred worker(s) still running after the executor quiesce — skipping the SessionDB "
+                "close/checkpoint, leaving state.db open for the live writer (#102198, #116535)",
+                _cron_live, _api_live, _api_worker_live, _deferred_live,
             )
             return
         _step = GatewayShutdownMixin._quiet_step
@@ -2021,15 +2043,15 @@ class GatewayShutdownMixin:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()
-        # Clean-shutdown marker skips suspend_recently_active() next boot; a timed-out drain left
-        # half-finished sessions, so no marker — the next startup suspends them.
+        # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
+        # half-finished sessions, so no marker — the next startup recovers their turn markers.
         if not ctx.timed_out:
             with suppress(Exception):
                 (_hermes_home / ".clean_shutdown").touch()
         else:
             logger.info(
                 "Skipping .clean_shutdown marker — drain timed out with "
-                "interrupted agents; next startup will suspend recently active sessions."
+                "interrupted agents; next startup will recover their interrupted turns."
             )
         # Stuck-loop counter: sessions active across 3 consecutive restarts are auto-suspended next boot.
         if ctx.active_agents:
