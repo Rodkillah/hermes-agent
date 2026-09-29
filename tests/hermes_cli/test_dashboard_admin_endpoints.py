@@ -795,6 +795,10 @@ class TestUpdateCheckEndpoint:
 
     def test_git_install_reports_behind_count(self, monkeypatch):
 
+        monkeypatch.setattr(
+            "hermes_cli.update_release_policy.release_policy_active",
+            lambda *a, **k: False,
+        )
         monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda *a, **k: "git")
         # Stub the shared checker so the contract is deterministic (no network).
         import hermes_cli.banner as banner
@@ -822,6 +826,10 @@ class TestUpdateCheckEndpoint:
 
     def test_managed_runtime_dashboard_is_not_applyable(self, monkeypatch):
 
+        monkeypatch.setattr(
+            "hermes_cli.update_release_policy.release_policy_active",
+            lambda *a, **k: False,
+        )
         monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: True)
         monkeypatch.setattr(
             _cfg_mod,

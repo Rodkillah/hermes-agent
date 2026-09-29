@@ -219,12 +219,6 @@ def _update_refused(error: str, message: str, update_command: str) -> Dict[str, 
 @router.post("/api/hermes/update")
 async def update_hermes():
     """Kick off ``hermes update`` in the background."""
-    if _dashboard_local_update_managed_externally():
-        message = _MANAGED_EXTERNALLY_MESSAGE + " The built-in local updater is disabled here."
-        return _update_refused("dashboard_update_managed_externally", message, "managed outside dashboard")
-
-    # Shared admission gate: marker-first, then the docker/nix/apt heuristics —
-    # one decision with the CLI paths.
     from hermes_cli.update_contract import evaluate_update_admission, record_refusal_receipt
 
     refusal = evaluate_update_admission(_server_path("PROJECT_ROOT"))
@@ -234,6 +228,9 @@ async def update_hermes():
         )
         record_refusal_receipt(refusal)
         return response
+    if _dashboard_local_update_managed_externally():
+        message = _MANAGED_EXTERNALLY_MESSAGE + " The built-in local updater is disabled here."
+        return _update_refused("dashboard_update_managed_externally", message, "managed outside dashboard")
 
     existing = _ACTION_PROCS.get("hermes-update")
     if existing is not None and existing.poll() is None:
@@ -266,17 +263,17 @@ async def check_hermes_update(force: bool = False, profile: Optional[str] = None
     non-applyable methods) and, for git installs that are behind, commits
     [{sha, summary, author, at}] (additive; existing consumers ignore it).
     """
+    from hermes_cli.update_release_policy import release_policy_active, release_status
+
+    if release_policy_active(_server_path("PROJECT_ROOT")):
+        return await asyncio.to_thread(release_status, force=force)
+
     if _dashboard_local_update_managed_externally():
         return {
             "install_method": "managed-runtime", "current_version": __version__, "behind": None,
             "update_available": False, "can_apply": False,
             "update_command": "managed outside dashboard", "message": _MANAGED_EXTERNALLY_MESSAGE,
         }
-
-    from hermes_cli.update_release_policy import release_policy_active, release_status
-
-    if release_policy_active(_server_path("PROJECT_ROOT")):
-        return await asyncio.to_thread(release_status, force=force)
 
     install_method = detect_install_method(_server_path("PROJECT_ROOT"))
     payload: Dict[str, Any] = {

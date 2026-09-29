@@ -95,15 +95,20 @@ def _default_hermes_root_is_opt_data() -> bool:
 
 
 def _dashboard_local_update_managed_externally() -> bool:
-    """True when the dashboard should not offer ``hermes update``.
+    """True when the dashboard must not offer an in-place ``hermes update``.
 
-    Containerized dashboards are updated by the outer launcher/image — except a
-    ``git`` install (bind-mounted checkout, e.g. the hermes-webui image), where
-    the update button is the correct path. pip stays blocked in containers: its
-    apply path mutates the running container filesystem.
+    Release-only source checkouts are reconciled in an isolated candidate.
+    Containerized dashboards are updated by the outer launcher/image — except
+    a ``git`` install (bind-mounted checkout, e.g. the hermes-webui image),
+    where the update button is the correct path. pip stays blocked in
+    containers: its apply path mutates the running container filesystem.
     """
     from hermes_cli.web_server import PROJECT_ROOT
     from hermes_cli.config import detect_install_method
+    from hermes_cli.update_release_policy import release_policy_active
+
+    if release_policy_active(PROJECT_ROOT):
+        return True
     if _default_hermes_root_is_opt_data():
         return True
     try:

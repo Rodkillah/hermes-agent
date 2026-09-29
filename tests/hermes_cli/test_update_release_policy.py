@@ -64,3 +64,14 @@ def test_apply_refused_before_snapshot_or_spawn(tmp_path, monkeypatch, branch):
     assert result["ok"] is False and result["pid"] is None
     assert result["error"] == "release_update_managed"
     assert evaluate_update_admission(tmp_path).code == "release-only"
+
+
+def test_release_only_marker_disables_dashboard_update_capability(tmp_path, monkeypatch):
+    from hermes_cli import web_server
+    from hermes_cli import web_server_files
+
+    (tmp_path / policy.MARKER).write_text("release-only")
+    monkeypatch.setattr(web_server, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(web_server_files, "_default_hermes_root_is_opt_data", lambda: False)
+
+    assert web_server_files._dashboard_local_update_managed_externally() is True
