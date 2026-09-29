@@ -257,7 +257,7 @@ def test_concurrent_approval_and_rework_preserve_new_pending(hermes_home, monkey
     def controlled_apply(subsystem, record, memory_store):
         applying.set()
         assert release.wait(timeout=5)
-        return True, ""
+        return True, "", {}
 
     monkeypatch.setattr(commands, "_apply_one", controlled_apply)
     approve_thread = threading.Thread(target=lambda: results.setdefault(
