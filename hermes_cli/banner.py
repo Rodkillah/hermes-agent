@@ -390,6 +390,11 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
     if passive and _quiet(_read_config_opt_out) is True:
         return None
 
+    from hermes_cli.update_release_policy import release_policy_active, release_status
+
+    if release_policy_active():
+        return release_status()["behind"]
+
     cache_file = get_hermes_home() / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
     # Docker images have no working tree (the image excludes `.git`) and set no HERMES_REVISION.

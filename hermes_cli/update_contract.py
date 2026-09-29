@@ -42,6 +42,11 @@ def evaluate_update_admission(project_root: Path) -> Optional[UpdateRefusal]:
     ``None`` means the install is eligible for in-place update (git checkout or unknown-but-
     mutable). Never raises; on any internal error it falls back to the heuristic layer only.
     """
+    from hermes_cli.update_release_policy import release_policy_active, MESSAGE, COMMAND
+
+    if release_policy_active(project_root):
+        return UpdateRefusal("release-only", MESSAGE, COMMAND)
+
     # Layer 1: baked provenance marker — authoritative when present.
     try:
         from hermes_cli.image_provenance import read_image_provenance

@@ -2394,6 +2394,12 @@ def _update_preflight_handled(args) -> bool:
         record_refusal_receipt,
     )
 
+    from hermes_cli.update_release_policy import release_policy_active, release_status
+
+    if getattr(args, "check", False) and release_policy_active(PROJECT_ROOT):
+        print(release_status(force=True)["message"])
+        return True
+
     refusal = evaluate_update_admission(PROJECT_ROOT)
     if refusal is not None:
         print(refusal.message)

@@ -59,7 +59,7 @@ _MANAGED_EXTERNALLY_MESSAGE = "Hermes updates are managed outside this dashboard
 _UPDATE_REFUSAL_ERROR_CODES = {
     "docker": "docker_update_unsupported", "image-marker": "docker_update_unsupported",
     "image-marker-invalid": "docker_update_unsupported", "apt": "apt_update_required",
-    "nix": "nix_update_unsupported",
+    "nix": "nix_update_unsupported", "release-only": "release_update_managed",
 }
 
 
@@ -272,6 +272,11 @@ async def check_hermes_update(force: bool = False, profile: Optional[str] = None
             "update_available": False, "can_apply": False,
             "update_command": "managed outside dashboard", "message": _MANAGED_EXTERNALLY_MESSAGE,
         }
+
+    from hermes_cli.update_release_policy import release_policy_active, release_status
+
+    if release_policy_active(_server_path("PROJECT_ROOT")):
+        return await asyncio.to_thread(release_status, force=force)
 
     install_method = detect_install_method(_server_path("PROJECT_ROOT"))
     payload: Dict[str, Any] = {
