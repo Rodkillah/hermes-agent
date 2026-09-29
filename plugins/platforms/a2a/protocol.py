@@ -430,61 +430,24 @@ class TaskStore:
         return task
 
 
-def persist_conversations_enabled() -> bool:
-    """Return whether A2A conversation content may be written to disk.
-
-    Persistence stays upstream-compatible by default, while the pilot can set
-    ``A2A_PERSIST_CONVERSATIONS=false`` to avoid duplicating message content.
-    """
-    raw = os.getenv("A2A_PERSIST_CONVERSATIONS")
-    if raw is None:
-        try:
-            from hermes_cli.config import load_config
-
-            value = ((load_config() or {}).get("a2a") or {}).get("persist_conversations")
-            if value is not None:
-                return bool(value) if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
-        except Exception:
-            pass
-        return True
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _conv_path(context_id: str) -> Path:
     safe = "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
     return get_hermes_home() / "a2a_conversations" / f"{safe}.jsonl"
 
 
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
-    """Append one message to the context's on-disk conversation log. Never raises.
-
-    No-op when conversation persistence is disabled; the log directory and the
-    log file stay owner-only (0700/0600) because they carry message content.
-    """
-    if not persist_conversations_enabled():
-        return
+    """Append one message to the context's on-disk conversation log. Never raises."""
     try:
         path = _conv_path(context_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
-        rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8") as fh:
-                fd = -1
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        finally:
-            if fd != -1:
-                os.close(fd)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), "role": role, "text": text, "task_id": task_id}, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
 
 def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
     """Last *limit* messages for a context (empty list if none / unreadable)."""
-    if not persist_conversations_enabled():
-        return []
     try:
         lines = _conv_path(context_id).read_text(encoding="utf-8").splitlines()
     except Exception:
@@ -503,8 +466,6 @@ def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
 
 def list_conversations() -> list[str]:
     """Context-ids that have persisted conversations."""
-    if not persist_conversations_enabled():
-        return []
     return sorted(p.stem for p in (get_hermes_home() / "a2a_conversations").glob("*.jsonl"))
 
 

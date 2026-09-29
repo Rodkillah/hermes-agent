@@ -63,6 +63,13 @@ _METHODS: dict[str, tuple[str, bool]] = {
 }
 
 
+def _audit_rejection(peer: str, http: int, code: int, method: str = "") -> None:
+    """Iron Rod: trace a refused request, metadata only. Upstream audits accepted exchanges only,
+    and /metrics counts no authentication failure, so probing would otherwise leave no trace."""
+    safe_method = re.sub(r"[^A-Za-z0-9/_.-]", "?", method or "")[:64]
+    security.audit("inbound", peer, "", f"rejected http={http} code={code} method={safe_method}")
+
+
 def _reply_timeout() -> float:
     """Seconds to wait for the agent to answer an inbound task."""
     try:
@@ -74,38 +81,6 @@ def _reply_timeout() -> float:
 def _orphan_timeout() -> float:
     """Orphan grace must never expire before a configured reply window, but stays bounded."""
     return min(float(_MAX_ORPHAN_TIMEOUT), max(float(_MIN_ORPHAN_TIMEOUT), _reply_timeout()))
-
-
-def _bool_setting(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _iron_rod_mode(extra: dict) -> bool:
-    mode = str(extra.get("mode") or "").strip().lower()
-    return bool(
-        _bool_setting(extra.get("iron_rod_mode"))
-        or _bool_setting(extra.get("strict_mode"))
-        or mode in {"iron-rod", "iron_rod", "strict"}
-        or _bool_setting(os.getenv("A2A_IRON_ROD_MODE"))
-    )
-
-
-def _bounded_int(value: Any, default: int, minimum: int = 1, maximum: int = 2**31 - 1) -> int:
-    try:
-        return max(minimum, min(int(value), maximum))
-    except (TypeError, ValueError):
-        return default
-
-
-def _positive_float(value: Any, default: float) -> float:
-    try:
-        return max(0.1, float(value))
-    except (TypeError, ValueError):
-        return default
 
 
 def _default_agent_name() -> str:
@@ -244,46 +219,16 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self._json(200, payload)
 
     def do_POST(self):  # noqa: N802
-        slots = self.adapter._request_slots
-        if slots is not None and not slots.acquire(blocking=False):
-            self._json(429, protocol.jsonrpc_error(
-                None, protocol.ERR_RATE_LIMITED, "A2A concurrency limit reached"))
-            return
-        try:
-            self._do_POST()
-        finally:
-            if slots is not None:
-                slots.release()
-
-    def _do_POST(self):  # noqa: N802
         adapter = self.adapter
-        client_ip = self._client_ip()
-        try:
-            declared_length: Optional[int] = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            declared_length = None
-
-        def reject_audit(code: int, *, peer: str = client_ip, method: str = "", request_bytes: Optional[int] = None):
-            security.audit(
-                "inbound",
-                peer,
-                "",
-                method=method,
-                decision="rejected",
-                request_bytes=request_bytes,
-                rejection_code=code,
-            )
-
         # Identity comes from the credential (or the socket in localhost-only mode) — never the body.
-        identity = adapter._security_context.authenticate(self.headers.get("Authorization"), client_ip)
+        identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())
         if identity is None:
-            reject_audit(protocol.ERR_UNAUTHORIZED, request_bytes=declared_length)
+            _audit_rejection(f"ip:{self._client_ip()}", 401, protocol.ERR_UNAUTHORIZED)
             return self._error(401, None, protocol.ERR_UNAUTHORIZED, "unauthorized")
         try:
             length = int(self.headers.get("Content-Length", 0))
-            self.connection.settimeout(adapter._read_timeout_seconds)
-            if length > adapter._max_body_bytes:
-                reject_audit(protocol.ERR_PARSE, peer=identity, request_bytes=length)
+            if length > _MAX_BODY:
+                _audit_rejection(identity, 413, protocol.ERR_PARSE)
                 return self._error(413, None, protocol.ERR_PARSE, "payload too large")
             req = json.loads((self.rfile.read(length) if length else b"{}").decode("utf-8"))
         except Exception:
@@ -304,16 +249,16 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             (lambda: not adapter._rate_limiter.allow(identity), 429, protocol.ERR_RATE_LIMITED, "rate limit exceeded"),
             (lambda: not adapter._security_context.is_trusted_peer(identity), 403, protocol.ERR_UNTRUSTED_PEER, f"peer '{identity}' not trusted"),
             (lambda: not handler_name, 200, protocol.ERR_METHOD_NOT_FOUND, f"method not found: {method}"),
+            # Iron Rod: optional allow-list (platforms.a2a.extra.allowed_methods); unset = upstream.
+            (lambda: not adapter._method_allowed(handler_name), 200, protocol.ERR_METHOD_NOT_FOUND, "A2A method is not enabled"),
         )
         for failed, http, code, msg in checks:
             if failed():
                 if code == protocol.ERR_RATE_LIMITED:
                     protocol.metrics.rate_limit_triggers += 1
+                elif code in (protocol.ERR_UNTRUSTED_PEER, protocol.ERR_METHOD_NOT_FOUND):
+                    _audit_rejection(identity, http, code, method)
                 return self._error(http, req_id, code, msg)
-        if not adapter._method_allowed(method):
-            code = protocol.ERR_PUSH_NOT_SUPPORTED if handler_name.startswith("_rpc_push_") else protocol.ERR_METHOD_NOT_FOUND
-            reject_audit(code, peer=identity, method=method, request_bytes=length)
-            return self._error(200, req_id, code, "A2A method is not enabled")
         agent = route["agent"]
         if handler_name == "_rpc_message_send":
             self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1))
@@ -331,54 +276,30 @@ class A2AAdapter(BasePlatformAdapter):
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("a2a"))
         extra = getattr(config, "extra", {}) or {}
-        # Scope-aware: a secondary multiplex profile must not borrow the
-        # default profile's bridged A2A_PORT (mirrors the Buzz/SimpleX fix
-        # for #98738) — an unconfigured profile falls closed to the module
-        # default port instead. advertised_toolsets follows the same explicit-
-        # config-over-env precedence, while preserving None (dynamic registry
-        # discovery) and [] (an intentional empty allowlist) as distinct values.
+        # Scope-aware: a secondary multiplex profile must not borrow the default profile's bridged
+        # A2A_PORT (falls closed to the module default). advertised_toolsets is deliberately unscoped.
+        # (advertised_toolsets has the same env-leak shape but is left unscoped here — see the "Scope note"
+        # in this fix's PR description: open PR #98937 is actively rewriting this field's None-vs-empty-list
+        # semantics.)
         self._security_context = security.A2ASecurityContext.capture()
         _port_env = _get_scoped_secret("A2A_PORT")
         self.port = int(_port_env or extra.get("port", _DEFAULT_PORT))
         self.host = self._security_context.resolve_bind_host()
         self.agent_name = _default_agent_name()
-        self._iron_rod_mode = _iron_rod_mode(extra)
-        if "advertised_toolsets" in extra:
-            advertised = extra.get("advertised_toolsets")
-        elif self._iron_rod_mode:
-            advertised = []
-        else:
-            raw_advertised = _get_scoped_secret("A2A_ADVERTISED_TOOLSETS", "")
-            advertised = None if raw_advertised == "" else raw_advertised.split(",")
-        advertised_values = advertised if isinstance(advertised, (list, tuple)) else [advertised]
-        self._advertised_toolsets = None if advertised is None else [
-            str(t).strip() for t in advertised_values if str(t).strip()
-        ]
+        configured_toolsets = list(extra.get("advertised_toolsets") or []) or _get_scoped_secret("A2A_ADVERTISED_TOOLSETS", "").split(",")
+        self._advertised_toolsets = [t.strip() for t in configured_toolsets if str(t).strip()]
+        # Iron Rod: optional JSON-RPC allow-list, e.g. ``allowed_methods: [SendMessage]``. Matched by
+        # handler, so a pre-1.0 alias of an allowed method stays allowed; an unknown name allows nothing.
         methods = extra.get("allowed_methods")
-        if methods is None:
-            methods = ["SendMessage"] if self._iron_rod_mode else None
         if isinstance(methods, str):
             methods = [methods]
-        self._allowed_methods = None if methods is None else frozenset(str(m) for m in methods)
-        self._max_body_bytes = _bounded_int(
-            extra.get("max_body_bytes"),
-            65536 if self._iron_rod_mode else _MAX_BODY,
-            maximum=_MAX_BODY,
-        )
-        self._read_timeout_seconds = _positive_float(
-            extra.get("read_timeout"), 10.0 if self._iron_rod_mode else 300.0
-        )
-        self._reply_timeout_seconds = _positive_float(
-            extra.get("reply_timeout"), 90.0 if self._iron_rod_mode else _reply_timeout()
-        )
-        concurrency = extra.get("max_concurrency")
-        if concurrency is None and self._iron_rod_mode:
-            concurrency = 1
-        self._request_slots = (
-            threading.BoundedSemaphore(_bounded_int(concurrency, 1))
-            if concurrency is not None else None
-        )
-
+        if methods is None:
+            self._allowed_handlers: Optional[frozenset] = None
+        else:
+            unknown = [m for m in methods if m not in _METHODS]
+            if unknown:
+                logger.warning("A2A: ignoring unknown allowed_methods entries %s", unknown)
+            self._allowed_handlers = frozenset(_METHODS[m][0] for m in methods if m in _METHODS)
         self._active_profile = _active_profile_name()
         # Captured here (construction runs inside _profile_runtime_scope), not read at request time:
         # do_GET/do_POST run on ThreadingHTTPServer's per-connection OS threads, which never inherit
@@ -474,8 +395,7 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _load_served_agents(self, extra: dict) -> dict[str, dict]:
         """Served-agent routing from ``platforms.a2a.extra.agents`` (top-level ``a2a_served_agents``
-        fallback for scripts/tests). Root/default maps to the live gateway session unless
-        ``forward_active_profile`` is explicitly enabled for an isolated profile subprocess."""
+        fallback for scripts/tests). Root/default always maps to the live gateway session."""
         raw = extra.get("agents") or extra.get("served_agents")
         if raw is None:
             try:
@@ -488,8 +408,7 @@ class A2AAdapter(BasePlatformAdapter):
         # Scope-aware like port: a secondary profile must not inherit A2A_AGENT_DESCRIPTION.
         default_desc = _get_scoped_secret("A2A_AGENT_DESCRIPTION", _DEFAULT_DESCRIPTION)
         agents: dict[str, dict] = {"": {
-            "slug": "", "path": "", "tenant": "", "profile": self._active_profile,
-            "local": not _bool_setting(extra.get("forward_active_profile")),
+            "slug": "", "path": "", "tenant": "", "profile": self._active_profile, "local": True,
             "name": self.agent_name, "description": default_desc, "advertised_toolsets": self._advertised_toolsets,
         }}
         reserved = {"health", "metrics", ".well-known"}
@@ -506,12 +425,7 @@ class A2AAdapter(BasePlatformAdapter):
                 logger.warning("A2A: ignoring served agent %r with reserved/invalid path %r", slug, path_segment)
                 continue
             profile = str(val.get("profile") or slug).strip()
-            if "advertised_toolsets" in val:
-                toolsets = val["advertised_toolsets"]
-            elif "toolsets" in val:
-                toolsets = val["toolsets"]
-            else:
-                toolsets = val.get("capabilities")
+            toolsets = val.get("advertised_toolsets") or val.get("toolsets") or val.get("capabilities") or []
             if isinstance(toolsets, str):
                 toolsets = [t.strip() for t in toolsets.split(",") if t.strip()]
             tenant = str(val.get("tenant") or slug).strip()
@@ -526,7 +440,7 @@ class A2AAdapter(BasePlatformAdapter):
                 "local": bool(val.get("local")) or profile in ("", "default", self._active_profile),
                 "name": str(val.get("name") or f"Hermes {slug}"),
                 "description": str(val.get("description") or f"Hermes profile '{profile or slug}' exposed over A2A."),
-                "advertised_toolsets": None if toolsets is None else list(toolsets or []),
+                "advertised_toolsets": list(toolsets or []),
                 "timeout": int(val.get("timeout") or _reply_timeout()),
             }
         return agents
@@ -567,8 +481,7 @@ class A2AAdapter(BasePlatformAdapter):
         return protocol.build_agent_card(
             name=agent.get("name") or self.agent_name, url=_join_url(self._base_url(public_url), agent.get("path", "")),
             description=agent.get("description") or _DEFAULT_DESCRIPTION, skills=self._advertised_skills(agent),
-            streaming=False if self._iron_rod_mode else bool(agent.get("local", True)),
-            push_notifications=False if self._iron_rod_mode else True,
+            streaming=bool(agent.get("local", True)), push_notifications=True,
             auth_required=not self._security_context.localhost_only(), tenant=str(agent.get("tenant") or ""),
         )
 
@@ -578,19 +491,17 @@ class A2AAdapter(BasePlatformAdapter):
         configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
         try:
             from tools.registry import registry as tool_registry
-            if configured == []:
-                return protocol.skills_from_toolsets([])
-            allowed = set(configured) if configured is not None else None
+            allowed = set(configured or []) or None
             mapping = {n: tool_registry.get_tool_names_for_toolset(n)
                        for n in tool_registry.get_registered_toolset_names() if allowed is None or n in allowed}
             if mapping:
                 return protocol.skills_from_toolsets(mapping)
         except Exception:
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
-        return protocol.skills_from_toolsets(configured)
+        return protocol.skills_from_toolsets(configured or [])
 
-    def _method_allowed(self, method: str) -> bool:
-        return self._allowed_methods is None or method in self._allowed_methods
+    def _method_allowed(self, handler_name: str) -> bool:
+        return self._allowed_handlers is None or handler_name in self._allowed_handlers
 
     def _add_pending(self, task_id: str, context_id: str) -> Future:
         fut: Future = Future()
@@ -660,15 +571,7 @@ class A2AAdapter(BasePlatformAdapter):
         if not text:
             return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
         framed = security.wrap_inbound(peer, text)
-        security.audit(
-            "inbound",
-            peer,
-            task_id,
-            method="SendMessage",
-            decision="accepted",
-            context_id=context_id,
-            request_bytes=len(text.encode("utf-8")),
-        )
+        security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
         self._register_inline_push(task_id, params, agent=agent)
@@ -684,8 +587,7 @@ class A2AAdapter(BasePlatformAdapter):
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
         fut = self._add_pending(task_id, context_id)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
-                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer,
-                                                      role_authorized=True))
+                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception as e:
@@ -715,19 +617,6 @@ class A2AAdapter(BasePlatformAdapter):
             # TERMINAL_* residue dropped, the target's own secrets overlaid), not the gateway's raw environ.
             from tools.environments.local import served_profile_child_env
             env = served_profile_child_env(target_home=_profile_home(profile), inherit_credentials=True)
-            # Iron Rod : le tour forwarde n herite ni du marqueur de gateway, ni de l identite
-            # de worker du dispatcher. Le finalizer d env REINJECTE HERMES_SESSION_* depuis les
-            # ContextVars de la session gateway, et scrub_kanban_env n efface que les cinq cles
-            # HERMES_KANBAN_* enumerees (ni _DB, ni _BOARD) : on purge les deux prefixes en
-            # entier apres coup. La session cible est deja designee par --resume/--source.
-            # NE PAS nommer cette variable ``key`` : elle masquerait la cle du cache de
-            # sessions calculee plus haut, et la session forwardee serait memorisee sous un
-            # nom de variable d environnement.
-            for env_name in list(env):
-                if env_name in {"_HERMES_GATEWAY", "HERMES_GATEWAY", "HERMES_GATEWAY_MODE"}:
-                    env.pop(env_name, None)
-                elif env_name.startswith("HERMES_SESSION_") or env_name.startswith("HERMES_KANBAN_"):
-                    env.pop(env_name, None)
             env["HERMES_A2A_PEER"] = peer
             start = time.time()
             try:
@@ -752,15 +641,7 @@ class A2AAdapter(BasePlatformAdapter):
                         started: Optional[float] = None) -> None:
         """Persist + audit + count a finished task, mark it terminal, and fire its push callback."""
         protocol.persist_message(context_id, "agent", reply, task_id)
-        security.audit(
-            "outbound",
-            peer,
-            task_id,
-            method="SendMessage",
-            state=state,
-            context_id=context_id,
-            response_bytes=len(reply.encode("utf-8")),
-        )
+        security.audit("outbound", peer, task_id, reply)
         m = protocol.metrics
         if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
             m.outbound_total, m.tasks_completed = m.outbound_total + 1, m.tasks_completed + 1
@@ -804,7 +685,7 @@ class A2AAdapter(BasePlatformAdapter):
                 return on_timeout
 
     def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
-        return self._await_future(pending["future"], pending["started"] + self._reply_timeout_seconds, keepalive,
+        return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
@@ -872,7 +753,7 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent))) is None:
                 return self._sse_write(handler, protocol.sse_done())
-            state, reply = self._await_future(fut, time.time() + self._reply_timeout_seconds, self._keepalive(handler),
+            state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
                                               (rec["state"], rec.get("reply", "")))
             self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):

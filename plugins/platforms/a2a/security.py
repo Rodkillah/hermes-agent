@@ -15,7 +15,6 @@ import re
 import time
 import urllib.parse
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 from gateway.platforms._shared import profile_scoped as _profile_scoped
 
@@ -199,78 +198,14 @@ def is_safe_callback_url(url: str, *, localhost_mode: Optional[bool] = None) -> 
     return True
 
 
-def _audit_path() -> Path:
-    """Where the audit trail lives.
-
-    Iron Rod helper (f15844fa); upstream inlines the same path inside ``audit()``. We keep it
-    named so the hardened writer below resolves the path in exactly one place.
-
-    The ``except Exception: ~/.hermes`` fallback this helper used to carry was ours as well, and
-    it was dead in both directions: ``hermes_constants.get_hermes_home()`` never raises (ContextVar
-    override, then ``HERMES_HOME``, then the platform default), and the import cannot fail since
-    this module already imports ``gateway.platforms._shared`` at module scope. We retire it in the
-    spirit of upstream e7d9e07dbc, which removed the equivalent fallbacks from a2a/protocol.py,
-    photon/auth, google_chat and openviking. Upstream did NOT ask for it here: its diff on this
-    file is the import swap alone, so nothing about this removal is dictated by the merge. Should
-    the resolution ever fail anyway, ``audit()`` swallows it rather than scattering records next
-    to a stale default.
-    """
-    from hermes_constants import get_hermes_home
-
-    return Path(get_hermes_home()) / "a2a_audit.jsonl"
-
-
-def audit(
-    direction: str,
-    peer: str,
-    task_id: str,
-    summary: str = "",
-    *,
-    context_id: str = "",
-    method: str = "",
-    decision: str = "",
-    state: str = "",
-    latency_ms: Optional[float] = None,
-    request_bytes: Optional[int] = None,
-    response_bytes: Optional[int] = None,
-    rejection_code: Optional[int] = None,
-) -> None:
-    """Append metadata only; content arguments are intentionally discarded.
-
-    ``summary`` remains accepted for source compatibility with older callers,
-    but no message, prompt, argument, header, or exception text is persisted.
-    Best-effort: never raises into the caller.
-    """
+def audit(direction: str, peer: str, task_id: str, summary: str) -> None:
+    """Append an audit record (direction: inbound | outbound | push). Never raises."""
     try:
-        rec = {
-            "ts": time.time(),
-            "direction": direction,  # "inbound" | "outbound" | "push"
-            "peer": peer,
-            "task_id": task_id,
-        }
-        metadata = {
-            "context_id": context_id,
-            "method": method,
-            "decision": decision,
-            "state": state,
-            "latency_ms": latency_ms,
-            "request_bytes": request_bytes,
-            "response_bytes": response_bytes,
-            "rejection_code": rejection_code,
-        }
-        rec.update({key: value for key, value in metadata.items() if value not in (None, "")})
-        path = _audit_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8") as fh:
-                fd = -1
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        finally:
-            if fd != -1:
-                os.close(fd)
+        from hermes_constants import get_hermes_home
+        rec = {"ts": time.time(), "direction": direction, "peer": peer, "task_id": task_id, "summary": (summary or "")[:500]}
+        get_hermes_home().mkdir(parents=True, exist_ok=True)
+        with (get_hermes_home() / "a2a_audit.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         logger.debug("A2A: audit write failed", exc_info=True)
 
