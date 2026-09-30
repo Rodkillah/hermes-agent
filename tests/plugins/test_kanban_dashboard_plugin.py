@@ -1177,4 +1177,5 @@ def test_dispatch_nudge_respects_per_profile_cap(kanban_home, client, monkeypatc
     assert r.status_code == 200, r.text
     body = r.json()
     spawned_for_a = [s for s in body.get("spawned", []) if s[1] == "worker-a"]
-    assert len(spawned_for_a) <= 1, body
+    assert len(spawned_for_a) == 1, body
+    assert body.get("skipped_per_profile_capped"), body
