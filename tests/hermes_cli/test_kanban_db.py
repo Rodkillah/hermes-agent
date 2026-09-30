@@ -41,60 +41,6 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
-def test_kanban_writes_repair_utf8_mojibake_without_touching_legitimate_text(kanban_home):
-    with kbc.connect() as conn:
-        task_id = kb.create_task(
-            conn,
-            title="IRON ROD TRAINING â\x80\x94 contrat des Ã©quipements",
-            body="schemaâ\x86\x94migrations sur une rÃ©plique",
-        )
-        kb.add_comment(
-            conn,
-            task_id,
-            author="amber",
-            body="Rodrigue a demandÃ© la procÃ©dure",
-        )
-        legitimate_id = kb.create_task(
-            conn,
-            title="Âge et SÃO restent intacts",
-        )
-
-        repaired = kb.get_task(conn, task_id)
-        legitimate = kb.get_task(conn, legitimate_id)
-        assert repaired is not None
-        assert legitimate is not None
-        assert repaired.title == "IRON ROD TRAINING — contrat des équipements"
-        assert repaired.body == "schema↔migrations sur une réplique"
-        assert kb.list_comments(conn, task_id)[0].body == "Rodrigue a demandé la procédure"
-        assert legitimate.title == "Âge et SÃO restent intacts"
-
-
-def test_block_and_completion_repair_mojibake_in_run_summaries(kanban_home):
-    with kbc.connect() as conn:
-        blocked_id = kb.create_task(conn, title="blocked", assignee="ops")
-        assert kb.block_task(
-            conn,
-            blocked_id,
-            kind="needs_input",
-            reason="aucune rÃ©ponse requise avant rÃ©plique",
-        )
-        blocked_runs = kb.list_runs(conn, blocked_id)
-        assert blocked_runs[-1].summary == "aucune réponse requise avant réplique"
-
-        completed_id = kb.create_task(conn, title="completed", assignee="ops")
-        assert kb.complete_task(
-            conn,
-            completed_id,
-            result="livrable validÃ©",
-            summary="recette terminÃ©e",
-        )
-        completed = kb.get_task(conn, completed_id)
-        assert completed is not None
-        assert completed.result == "livrable validé"
-        completed_runs = kb.list_runs(conn, completed_id)
-        assert completed_runs[-1].summary == "recette terminée"
-
-
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -1455,16 +1401,6 @@ def test_create_task_with_open_parent_emits_dependency_wait(kanban_home):
         assert wait[-1].payload["parent"] == parent
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Contrat Iron Rod : un parent archived ne libere PAS ses descendants "
-        "(verdict PROD_NO_GO du 2026-08-28). Ce test amont affirme l'inverse. "
-        "strict=True : s'il repasse au vert, c'est que notre contrat a saute, "
-        "et pytest le signale en echec. Notre version du contrat : "
-        "tests/hermes_cli/test_kanban_parent_still_gates.py"
-    ),
-)
 def test_link_tasks_archived_parent_is_terminal_no_gate(kanban_home):
     """archived is terminal for recompute_ready, so linking under an archived
     parent must not demote a ready child (it would only flap back to ready)."""

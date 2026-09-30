@@ -417,27 +417,6 @@ parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
-To resolve the resulting human gate, an orchestrator must use the dedicated
-transition rather than generic `unblock`, `promote`, or `specify`:
-
-```bash
-EVENT_ID="$(hermes kanban show t_abc --json | jq -r '[.events[] | select(.kind == "block_loop_detected")][-1].id')"
-hermes kanban resolve-block-loop t_abc retry --expected-event-id "$EVENT_ID" --reason "retry after fixing the input"
-hermes kanban resolve-block-loop t_abc complete --expected-event-id "$EVENT_ID" --reason "accepted as-is" \
-    --summary "Reviewed the existing outcome; no further execution is required."
-hermes kanban resolve-block-loop t_abc archive --expected-event-id "$EVENT_ID" --reason "superseded by the replacement task"
-```
-
-The transition is fail-closed: the task must still be `triage`, have no active
-run, retain its latest `block_loop_detected` provenance, and receive the exact
-`--expected-event-id` read from that current event. `hermes kanban show --json`
-and the `kanban_show` tool expose every event's stable `id` for this purpose.
-Missing or stale event ids
-are rejected without mutation. `retry` restores
-`review` or parent-gated `ready`/`todo` without erasing loop memory; `complete`
-resets that memory and promotes dependants; `archive` does not promote them.
-Every decision records the actor and reason in a `block_loop_resolved` event.
-
 ## Enabling tools for a chat profile
 
 The Desktop Kanban plugin displays the board; it does not grant the chat agent
@@ -458,16 +437,6 @@ prompt cache. `agent.disabled_toolsets` remains authoritative. Legacy top-level
 `toolsets: [kanban]` is honoured as a fallback only when no platform selection was
 saved; `all` alone is not a Kanban opt-in.
 
-**Iron Rod: the toolset does not grant creation.** Enabling `kanban` is necessary but
-not sufficient to create cards on this fork. `kanban_create` and `kanban_link` are
-additionally gated by `kanban.can_create` in the calling profile's `config.yaml`: the
-expert profiles (colbert, julien, ruth and the other specialists) analyse and propose,
-Amber alone creates. The guard is fail-closed, so a profile whose configuration cannot
-be read is refused creation instead of being let through, and it is re-checked inside
-the handler, not only when the tool schema is built. The rest of the lifecycle stays
-open to a gated profile: `kanban_show`, `kanban_comment`, `kanban_heartbeat`,
-`kanban_block`, `kanban_complete` and the other tools on the cards assigned to it.
-
 Dispatcher-owned workers receive their task lifecycle tools automatically.
 `delegate_task` children do not gain permission to mutate the board.
 
@@ -482,14 +451,13 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
-| `kanban_resolve_block_loop` | Orchestrator-only human decision for a `block_loop_detected` triage task: `retry`, `complete`, or `archive`. Requires an actor, durable reason, and the current `expected_event_id` CAS token; `complete` also requires a handoff. | `decision`, `reason`, `expected_event_id` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |
-| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. Returns `gated: true` + `gated_by` when an open parent parked the new card in `todo`. Iron Rod: refused unless the calling profile carries `kanban.can_create` (fail-closed). | `title`, `assignee` |
+| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. Returns `gated: true` + `gated_by` when an open parent parked the new card in `todo`. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. Returns `gated: true` when the child was `ready` and got demoted back to `todo` because the parent is not done — the child will only run after the parent completes. Refused with `child is already running` when the child is already claimed — an edge added after the claim cannot serialise the run (a worker may still link its *own* running card ahead of a `kind=dependency` block). | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
 
@@ -1401,22 +1369,7 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 
 **Bulk close caveat.** `hermes kanban complete a b c --summary X` is refused — structured handoff is per-run, so copy-pasting the same summary to N tasks is almost always wrong. Bulk close *without* `--summary` / `--metadata` still works for the common "I finished a pile of admin tasks" case.
 
-**Dependency refusal on complete names the parents.** `kanban_complete` / `hermes kanban complete` / the dashboard's "mark done" and "request review" actions (single and bulk) on a card whose direct parent has not really completed (an archived parent, a parent reopened mid-run, or an edge that predates the running-child refusal) reports `unsatisfied parent dependencies: t_… (todo)` instead of the generic "unknown id, stale run, or already terminal" text; the card stays in-flight. `kanban_show` lists the same parents under `unsatisfied_parents`, and `hermes kanban show` / `hermes kanban diagnostics` / the dashboard raise a `running_with_open_parents` warning on a running card in that state. Finish the parent or `hermes kanban unlink <parent> <child>`; there is no force path through the dependency gate.
-
-:::caution Iron Rod: only a real completion releases a child
-The dependency gate on this fork is narrower than upstream, and deliberately so. A
-parent releases its descendants only when the work actually happened: status `done`,
-status `prod`, or a delivered card parked back in `todo` with a non-null
-`work_completed_at` while it waits for deployment. **`archived` releases nothing.**
-Archiving a parent leaves every descendant gated, so abandoning a card never opens the
-work that depended on it. The contract lives in `_parents_satisfied`
-(`hermes_cli/kanban_db.py`), comment included. Every surface that names open parents
-(the completion refusal above, `unsatisfied_parents`, the `running_with_open_parents`
-warning, the dispatcher's promotion) has to read that same set: a second definition
-hardcoding `done`/`archived` would reopen the gate this one closes. To free a child
-whose parent was abandoned, remove the edge with `hermes kanban unlink <parent> <child>`,
-or complete the parent. Do not archive it and expect a promotion.
-:::
+**Dependency refusal on complete names the parents.** `kanban_complete` / `hermes kanban complete` / the dashboard's "mark done" and "request review" actions (single and bulk) on a card whose direct parent is not `done`/`archived` (a parent reopened mid-run, or an edge that predates the running-child refusal) reports `unsatisfied parent dependencies: t_… (todo)` instead of the generic "unknown id, stale run, or already terminal" text; the card stays in-flight. `kanban_show` lists the same parents under `unsatisfied_parents`, and `hermes kanban show` / `hermes kanban diagnostics` / the dashboard raise a `running_with_open_parents` warning on a running card in that state. Finish the parent or `hermes kanban unlink <parent> <child>`; there is no force path through the dependency gate.
 
 **Live-claim guard on complete.** A `running` task whose worker holds a live claim is only completed by that worker (`kanban_complete` from inside the run) or by an explicit operator override: `hermes kanban complete <id> --force` and the dashboard's "mark done" action. A claim-less `hermes kanban complete <id>` or an orchestrator session's `kanban_complete` is refused with a pointer to `--force` / `hermes kanban reclaim`, so a second session can no longer close a live worker's run underneath it. Completing `ready`, `blocked` or `review` cards without a claim is unchanged.
 
