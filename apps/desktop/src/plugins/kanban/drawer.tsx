@@ -49,17 +49,14 @@ import {
   logKey,
   patchTask,
   profilesKey,
-  promoteTaskToProd,
   reassignTask,
   reclaimTask,
-  resolveBlockLoopTask,
   routedToScope,
   taskKey,
   uploadAttachment,
   useKanbanScope
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
-import { latestBlockLoopEventId } from './resolve'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -884,16 +881,13 @@ export function TaskDrawer({
     onSettled: invalidate
   })
 
-  const mutate = (fn: () => Promise<unknown>, onDone?: () => void, onError?: () => void) => () =>
+  const mutate = (fn: () => Promise<unknown>, onDone?: () => void) => () =>
     fn().then(
       () => {
         invalidate()
         onDone?.()
       },
-      (err: unknown) => {
-        host.notify({ kind: 'error', message: errText(err) })
-        onError?.()
-      }
+      (err: unknown) => host.notify({ kind: 'error', message: errText(err) })
     )
 
   const commentMut = useMutation({
@@ -916,36 +910,6 @@ export function TaskDrawer({
       invalidate()
     }
   })
-
-  const resolveBlockLoop = (decision: 'archive' | 'complete' | 'retry') => {
-    const expectedEventId = latestBlockLoopEventId(detail?.events ?? [])
-
-    if (!task || task.status !== 'triage' || expectedEventId === null) {
-      return
-    }
-
-    const reason = window.prompt('Reason for this block-loop decision:')?.trim()
-
-    if (!reason) {
-      return
-    }
-
-    const summary = decision === 'complete'
-      ? window.prompt('Completion handoff (required):')?.trim()
-      : undefined
-
-    if (decision === 'complete' && !summary) {
-      return
-    }
-
-    void mutate(() => resolveBlockLoopTask(task.id, {
-      actor: 'desktop',
-      decision,
-      expected_event_id: expectedEventId,
-      reason,
-      ...(summary ? { summary } : {})
-    }), undefined, invalidate)()
-  }
 
   const uploadMut = useMutation({
     mutationFn: async (file: File) =>
@@ -982,55 +946,6 @@ export function TaskDrawer({
     moveMut.mutate(status)
   }
 
-  // Production promotion remains a separate, non-optimistic flow: the
-  // backend validates and persists the evidence receipt atomically.
-  const promote = () => {
-    if (!task || task.status !== 'done') {
-      return
-    }
-
-    const raw = window.prompt(
-      'Production receipt JSON (include candidate_sha, backup_ref, rollback_ref and probes):',
-      '{"schema_version":1,"environment":"production","target":"","deployed_at_utc":"","candidate_sha":"","deployed_identity_kind":"git_sha","deployed_identity_value":"","backup_ref":"","rollback_ref":"","verification_mode":"system_verified","probes":[]}'
-    )
-
-    if (raw == null) {
-      return
-    }
-
-    const key = window.prompt('Unique idempotency key:')?.trim()
-
-    if (!key) {
-      host.notify({ kind: 'error', message: 'An idempotency key is required.' })
-
-      return
-    }
-
-    let receipt: Record<string, unknown>
-
-    try {
-      const parsed: unknown = JSON.parse(raw)
-
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('receipt must be an object')
-      }
-
-      receipt = parsed as Record<string, unknown>
-    } catch (err) {
-      host.notify({ kind: 'error', message: `Invalid production receipt: ${String(err)}` })
-
-      return
-    }
-
-    promoteTaskToProd(task.id, receipt, key).then(
-      () => {
-        host.notify({ kind: 'info', message: 'Task promoted to Prod.' })
-        invalidate()
-      },
-      err => host.notify({ kind: 'error', message: errText(err) })
-    )
-  }
-
   // The shared Dialog owns the chrome tokens, focus trap, Esc and outside-click
   // dismissal, and publishes itself as the portal container so the status,
   // assignee, actions and model menus open inside it (no z-index rung needed).
@@ -1048,7 +963,7 @@ export function TaskDrawer({
         <header className="flex flex-col gap-2 px-5 pt-4 pb-3">
           <div className="flex items-center gap-2">
             {task ? (
-              <StatusMenu columns={columns} onMove={move} onPromoteToProd={promote} status={task.status} />
+              <StatusMenu columns={columns} onMove={move} status={task.status} />
             ) : (
               <span className="font-mono text-sm text-(--ui-text-tertiary)">{shortId(id)}</span>
             )}
@@ -1125,19 +1040,6 @@ export function TaskDrawer({
                       <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-secondary)">
                         {k.readyUnassignedBody}
                       </p>
-                    </Callout>
-                  )}
-
-                  {task.status === 'triage' && latestBlockLoopEventId(detail.events) !== null && (
-                    <Callout title={k.notify.blockLoopTitle} tone={SEVERITY_TONE.error}>
-                      <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-secondary)">
-                        This triage card came from a repeated block loop. Choose an explicit human decision.
-                      </p>
-                      <div className="flex flex-wrap gap-1.5">
-                        <Button onClick={() => resolveBlockLoop('retry')} size="xs" variant="secondary">Retry</Button>
-                        <Button onClick={() => resolveBlockLoop('complete')} size="xs" variant="outline">Complete</Button>
-                        <Button onClick={() => resolveBlockLoop('archive')} size="xs" variant="outline">{k.archive}</Button>
-                      </div>
                     </Callout>
                   )}
 
