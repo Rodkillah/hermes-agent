@@ -1153,3 +1153,28 @@ def test_touch_card_tap_opens_instead_of_dragging():
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_dispatch_nudge_respects_per_profile_cap(kanban_home, client, monkeypatch):
+    """Iron Rod 2026-09-11 : un clic sur « Nudge dispatcher » a lancé 6 cartes
+    en 2 s, dont 3 sur un même profil. Le nudge doit appliquer les mêmes
+    plafonds que le distributeur de la gateway."""
+    from hermes_cli import kanban_db_dispatch as kbd_mod
+
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  max_in_progress: 8\n  max_in_progress_per_profile: 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kbd_mod, "_profile_exists_fn", lambda: (lambda name: True))
+    for i in range(3):
+        r = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"carte {i}", "assignee": "worker-a"},
+        )
+        assert r.status_code == 200, r.text
+
+    r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=8")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    spawned_for_a = [s for s in body.get("spawned", []) if s[1] == "worker-a"]
+    assert len(spawned_for_a) <= 1, body
