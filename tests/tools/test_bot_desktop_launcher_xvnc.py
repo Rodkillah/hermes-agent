@@ -13,13 +13,17 @@ LAUNCHER = Path(__file__).resolve().parents[2] / "tools" / "bot_desktop" / "laun
 pytestmark = pytest.mark.linux_only
 
 
-def test_xvnc_never_sends_the_holders_clipboard_to_watchers(tmp_path):
+@pytest.mark.parametrize("prefer_tiger", [False, True])
+def test_xvnc_never_sends_the_holders_clipboard_to_watchers(tmp_path, prefer_tiger):
     """Whoever holds control may paste INTO the screen (AcceptCutText), but the screen's clipboard must
     not be pushed to every connected viewer (SendCutText off): watchers are not the holder."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     argv_log = tmp_path / "xvnc-argv"
     (bindir / "Xvnc").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{argv_log}"\nexec sleep 3\n', encoding="utf-8")
+    if prefer_tiger:
+        (bindir / "Xtigervnc").write_text((bindir / "Xvnc").read_text(), encoding="utf-8")
+        (bindir / "Xvnc").write_text("#!/bin/sh\nexit 77\n", encoding="utf-8")
     for stub in ("xdpyinfo", "setxkbmap", "xsetroot", "xset", "dbus-run-session"):
         (bindir / stub).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     for exe in bindir.iterdir():
@@ -36,6 +40,9 @@ def test_xvnc_never_sends_the_holders_clipboard_to_watchers(tmp_path):
     }
     subprocess.run(["bash", str(LAUNCHER)], env=env, check=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
     argv = argv_log.read_text(encoding="utf-8").split("\n")
+    assert argv[argv.index("-rfbport") + 1] == "-1"
+    assert argv[argv.index("-rfbunixmode") + 1] == "0600"
+    assert "-rfbunixpath" in argv
     assert "-SendCutText=0" in argv, argv
     assert not any(a.startswith("-AcceptCutText") for a in argv), "paste into the screen must keep working"
     # Xvnc's own cut-text cap and the bridge filter's must agree, or one side drops a paste the other admits.

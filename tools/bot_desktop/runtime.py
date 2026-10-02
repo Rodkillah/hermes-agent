@@ -80,7 +80,8 @@ def is_supported_host() -> bool:
 
 
 def missing_binaries() -> list[str]:
-    return [b for b in REQUIRED_BINARIES if shutil.which(b) is None]
+    return [b for b in REQUIRED_BINARIES
+            if not (b == "Xvnc" and shutil.which("Xtigervnc")) and shutil.which(b) is None]
 
 
 def package_manager() -> Optional[str]:
@@ -238,7 +239,7 @@ def _reap_orphaned_server(sd: Path) -> bool:
     import psutil
 
     def _binds_our_socket(cmdline: list) -> bool:
-        return "Xvnc" in Path(cmdline[0] if cmdline else "").name and str(sd / "rfb.sock") in cmdline
+        return Path(cmdline[0] if cmdline else "").name in {"Xvnc", "Xtigervnc"} and str(sd / "rfb.sock") in cmdline
 
     recorded = _read(sd / "display")
     pid = _x_lock_pid(int(recorded)) if recorded and recorded.isdigit() else None

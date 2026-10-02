@@ -257,7 +257,9 @@ fi
 # -SendCutText=0: watchers must never receive the holder's clipboard; -AcceptCutText stays on so
 # paste INTO the screen keeps working. -MaxCutText caps a client cut-text at 256 KiB — the same bound
 # the bridge enforces (tools/bot_desktop/rfb_filter.py _MAX_CUT_TEXT); keep the two in sync.
-Xvnc "$DISPLAY" -geometry "$GEOM" -depth "$DEPTH" -dpi 96 \
+# Debian may also provide RealVNC as Xvnc; prefer TigerVNC by its explicit name.
+VNC_SERVER="$(command -v Xtigervnc || command -v Xvnc)"
+"$VNC_SERVER" "$DISPLAY" -geometry "$GEOM" -depth "$DEPTH" -dpi 96 \
   -rfbport -1 -rfbunixpath "$HERMES_BD_SOCKET" -rfbunixmode 0600 \
   -SecurityTypes None -AlwaysShared -AcceptSetDesktopSize -FrameRate 30 -SendCutText=0 -MaxCutText 262144 \
   -desktop "hermes:$HERMES_BD_PROFILE" -auth "$XAUTHORITY" -nolisten tcp \
