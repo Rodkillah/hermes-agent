@@ -9,8 +9,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
+from agent.compression_marker import elide
+
 
 _MAX_CHANGED_PATHS_IN_NUDGE = 8
+_MAX_STATUS_SUMMARY_CHARS = 1200
 
 # Prose/data extensions and extension-less prose filenames (case-insensitive) with
 # no verifiable runtime behavior: a turn touching ONLY these suppresses the nudge
@@ -149,14 +152,14 @@ def _status_detail(status: dict[str, Any]) -> str:
     if command:
         parts.append(f"last command `{command}`")
     if summary:
-        if len(summary) > 1200:
-            summary = summary[:1200].rstrip() + "\n... [truncated]"
+        summary = elide(summary, _MAX_STATUS_SUMMARY_CHARS)
         parts.append(f"last output:\n{summary}")
     return "\n".join(parts)
 
 
 def build_verify_on_stop_nudge(
     *, session_id: str | None, changed_paths: Iterable[str], attempts: int=0, max_attempts: int=2,
+    platform: str | None = None,
 ) -> str | None:
     """Return a synthetic follow-up when edited code lacks fresh verification."""
     # Prose-only turns (markdown, skills, README, LICENSE, ...) have nothing to verify.
@@ -213,6 +216,19 @@ def build_verify_on_stop_nudge(
             "summarize it explicitly as ad-hoc verification rather than suite "
             "green."
         )
+        if platform == "cron" and attempts == 0:
+            command_instruction = (
+                "No canonical test/lint/build command was detected. Create a focused "
+                f"temporary verification script under `{temp_dir}` using an OS-safe "
+                "`tempfile` path with a `hermes-verify-` filename prefix, run it "
+                "against the changed behavior, and clean it up when possible. "
+                "Only after fresh passing ad_hoc evidence is recorded for every "
+                "changed workspace, and there is no new useful information, "
+                "new business finding or blocker, reply exactly AD_HOC_PASS "
+                "with no other text. This is an ad-hoc receipt, not suite green. "
+                "Otherwise report the useful findings, errors or concrete blockers; "
+                "do not use the receipt marker."
+            )
 
     return (
         "[System: You edited code in this turn, but the workspace does not have "

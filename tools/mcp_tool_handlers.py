@@ -2,6 +2,7 @@
 ladder: trust gating, circuit breaker, auth (401) refresh, session-expired reconnect and dead-stdio respawn retry."""
 
 import logging
+import os
 import asyncio
 import contextvars
 import inspect
@@ -18,10 +19,11 @@ from tools.ansi_strip import strip_unicode_tags
 from tools.mcp_tool_common import _exc_str, _sanitize_error, mcp_field, _core
 from tools import mcp_tool_loop as _loop
 from tools.mcp_tool_content import (
-    _MCP_HARD_RESULT_CAP_CHARS, _cache_mcp_audio_block, _cache_mcp_image_block,
+    _MCP_HARD_RESULT_CAP_CHARS, _cache_mcp_audio_block, _cache_mcp_image_block, _mcp_result_with_native_images,
     _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
     _truncate_mcp_text_result)
-from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error
+from tools.mcp_tool_errors import (
+    _auth_error_detail, _is_auth_error, _is_session_expired_error, _mcp_call_failed_message)
 
 logger = logging.getLogger("tools.mcp_tool")
 _MISSING = object()
@@ -29,7 +31,7 @@ _MISSING = object()
 declaration.on_change = invalidate_check_fn_cache
 
 _NEEDS_REAUTH_MSG = (
-    "MCP server '{s}' requires re-authentication. Run `hermes mcp login {s}` (or delete the tokens file under "
+    "MCP server '{s}' requires re-authentication.{detail} Run `hermes mcp login {s}` (or delete the tokens file under "
     "~/.hermes/mcp-tokens/ and restart). Do NOT retry this tool — ask the user to re-authenticate.")
 _STDIO_NO_RESPAWN_MSG = (
     "MCP server '{s}' stdio subprocess had exited (this is not a timeout — the call never reached the server). A "
@@ -210,7 +212,8 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
         result = _retry_once(server_name, retry_call, op_description, "auth recovery")
         if result is not None:
             return result
-    return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name), needs_reauth=True, server=server_name)
+    return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name, detail=_auth_error_detail(exc)),
+                   needs_reauth=True, server=server_name)
 
 
 def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str,
@@ -345,7 +348,7 @@ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float,
             if recovered is not None:
                 return recovered
         on_final_failure(exc)
-        return tool_error(_sanitize_error(f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"))
+        return tool_error(_mcp_call_failed_message(exc))
 
 
 @asynccontextmanager
@@ -437,13 +440,16 @@ def _error_result_text(result) -> str:
     return "".join(str(t) for t in texts if t)
 
 
-def _render_content_blocks(result, server_name: str) -> Tuple[str, int]:
+def _render_content_blocks(result, server_name: str) -> Tuple[str, int, List[str]]:
     """Text passes through; image/audio blocks are cached (MEDIA: tags); resource blocks are
     materialized rather than silently dropped; unsupported blocks become an inline drop notice
-    (kimi-code#3227). Returns ``(text, usable_parts)`` — the count of REAL rendered blocks
-    (whitespace-only text and drop notices excluded) that the structuredContent arbitration uses."""
+    (kimi-code#3227). Returns ``(text, usable_parts, image_paths)``: ``usable_parts`` counts REAL
+    rendered blocks (whitespace-only text and drop notices excluded) for the structuredContent
+    arbitration; ``image_paths`` are the files THIS call's image blocks were cached to — never
+    parsed back out of the text, where a server-written ``MEDIA:`` line could name any local file."""
     parts: List[str] = []
     usable_parts = 0
+    image_paths: List[str] = []
     # MCP tool results can also include ImageContent blocks (screenshot / Blockbench / Playwright etc.);
     # cache those via the gateway's image-cache helper so they flow through Hermes' MEDIA: tag convention
     # and out to messaging adapters that render images natively. Without this, image blocks were silently
@@ -456,7 +462,10 @@ def _render_content_blocks(result, server_name: str) -> Tuple[str, int]:
             if block.text.strip():
                 usable_parts += 1
             continue
-        rendered = _cache_mcp_image_block(block) or _cache_mcp_audio_block(block) or _render_mcp_resource_block(block, server_name)
+        image = _cache_mcp_image_block(block)
+        if image.startswith("MEDIA:"):
+            image_paths.append(image[len("MEDIA:"):])
+        rendered = image or _cache_mcp_audio_block(block) or _render_mcp_resource_block(block, server_name)
         if rendered:
             parts.append(rendered)
             usable_parts += 1
@@ -470,7 +479,7 @@ def _render_content_blocks(result, server_name: str) -> Tuple[str, int]:
             # believing the tool returned less than it did, with no way to recover.
             parts.append(_render_mcp_dropped_block_notice(block, block_type))
     # Hard-cap pathological payloads; ordinary large results pass to spillover.
-    return _truncate_mcp_text_result("\n".join(parts)), usable_parts
+    return _truncate_mcp_text_result("\n".join(parts)), usable_parts, image_paths
 
 
 def _capped_structured_content(result):
@@ -514,8 +523,36 @@ def _content_dual_emits_structured(result, structured) -> bool:
     return False
 
 
-def _render_call_tool_result(result, server_name: str) -> str:
-    """Pure: ``CallToolResult`` -> handler JSON. ``content`` and ``structuredContent`` are both
+def _ruth_gmail_exact_text_copy(result, server_name, structured, text_result) -> bool:
+    """Reserved CLI-only pilot delta; ambiguous scope/shape keeps native output.
+
+    These cooperative markers are not authentication of a hostile Unix caller.
+    Routed/Desktop contexts deliberately fail closed; no profile/config is read.
+    """
+    if (server_name != "ruth-brain-ro"
+            or os.environ.get("HOME") != "/home/rodrigue"
+            or os.environ.get("HERMES_HOME") != "/home/rodrigue/.hermes/profiles/gmail-pilot"
+            or os.environ.get("IRONROD_RUTH_GMAIL_BRAIN_CONTEXT") != "ruth-gmail-v1"
+            or os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT") != "1"):
+        return False
+    from hermes_constants import get_hermes_home_override
+    if get_hermes_home_override() is not None:
+        return False
+    if type(structured) is not dict or set(structured) != {"content"}:
+        return False
+    blocks = result.content or []
+    if len(blocks) != 1 or getattr(blocks[0], "type", None) != "text":
+        return False
+    raw = getattr(blocks[0], "text", None)
+    # Compare AFTER native sanitization/hard-cap. Never parse JSON-looking notes.
+    return (type(raw) is str and bool(raw.strip())
+            and type(structured["content"]) is str
+            and raw == text_result == structured["content"])
+
+
+def _render_call_tool_result(result, server_name: str, image_paths: Optional[List[str]] = None) -> str:
+    """Pure: ``CallToolResult`` -> handler JSON (``image_paths``, when given, receives the files this
+    call's image blocks were cached to). ``content`` and ``structuredContent`` are both
     forwarded, except that a ``structuredContent`` whose JSON also sits verbatim in a text block
     (the spec's backwards-compat dual-emit; compared as parsed JSON) is dropped, because that copy
     would reach the model twice (kimi-code#3234). Any other usable text — a status line, a prose
@@ -527,12 +564,16 @@ def _render_call_tool_result(result, server_name: str) -> str:
     (structuredContent-only servers); ``_meta`` minus reserved keys is always surfaced."""
     if mcp_field(result, "is_error", "isError", False):
         return tool_error(_sanitize_error(_truncate_mcp_text_result(_error_result_text(result) or "MCP tool returned an error")))
-    text_result, usable_parts = _render_content_blocks(result, server_name)
+    text_result, usable_parts, cached_images = _render_content_blocks(result, server_name)
+    if image_paths is not None:
+        image_paths.extend(cached_images)
     structured = _capped_structured_content(result)
     meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
     # A str here is the over-cap truncation stand-in (wire structuredContent is always an object): next to
     # usable text it would be a second multi-MB copy — the flood #56059 caps — so it only fills an empty result.
     if structured is not None and usable_parts > 0 and (isinstance(structured, str) or _content_dual_emits_structured(result, structured)):
+        structured = None
+    if _ruth_gmail_exact_text_copy(result, server_name, structured, text_result):
         structured = None
     if structured is None and meta is None:
         return json.dumps({"result": text_result}, ensure_ascii=False)
@@ -552,41 +593,507 @@ def _render_call_tool_result(result, server_name: str) -> str:
         return json.dumps({"result": text_result}, ensure_ascii=False)
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _ruth_office_identity(server_name):
+    """Same cooperative Unix CLI scope as the reviewed renderer, not host auth."""
+    from hermes_constants import get_hermes_home_override
+    return (server_name == 'gmail-pilot'
+            and os.environ.get('HOME') == '/home/rodrigue'
+            and os.environ.get('HERMES_HOME') == '/home/rodrigue/.hermes/profiles/gmail-pilot'
+            and os.environ.get('IRONROD_RUTH_GMAIL_BRAIN_CONTEXT') == 'ruth-gmail-v1'
+            and os.environ.get('HERMES_DELEGATED_CHILD_CONTEXT') == '1'
+            and get_hermes_home_override() is None)
+
+
+def _office_schema(raw):
+    if not isinstance(raw, dict) or raw.get('schema_version') != 1:
+        raise ValueError('schema')
+    account, files = raw.get('account'), raw.get('files')
+    if not isinstance(account, str) or '@' not in account or not account.strip() == account:
+        raise ValueError('account')
+    if not isinstance(files, dict) or not 1 <= len(files) <= 16:
+        raise ValueError('files')
+    import re
+    for file_id, f in files.items():
+        if not isinstance(file_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{5,200}', file_id):
+            raise ValueError('id')
+        if not isinstance(f, dict) or type(f.get('write')) is not bool:
+            raise ValueError('write')
+        if not isinstance(f.get('name'), str) or '/' in f['name']:
+            raise ValueError('name')
+        suffix = f['name'].rsplit('.', 1)[-1].lower()
+        expected = {'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}
+        if suffix not in expected or f.get('mime_type') != expected[suffix]:
+            raise ValueError('Office MIME')
+        if not isinstance(f.get('parent_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{5,200}', f['parent_id']):
+            raise ValueError('parent')
+        if f['write']:
+            path = f.get('file_path')
+            if (not isinstance(path, str) or not path.startswith('/home/rodrigue/.workspace-mcp/attachments/')
+                    or any(p in ('', '.', '..') for p in path.split('/')[1:])
+                    or not path.lower().endswith('.' + suffix)
+                    or not isinstance(f.get('sha256'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', f['sha256'])):
+                raise ValueError('copy')
+    return raw
+
+
+def _office_copy_digest(path):
+    import hashlib
+    import stat
+    # No symlink in any component; pinned FD, bounded regular Office copy only.
+    parts = path.split('/')[1:]
+    parent = os.open('/', os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    fd = None
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        start = os.fstat(fd)
+        if (not stat.S_ISREG(start.st_mode) or start.st_uid != os.getuid()
+                or start.st_mode & 0o022 or start.st_size > 128 * 1024 * 1024):
+            raise ValueError('copy file')
+        digest = hashlib.sha256()
+        while block := os.read(fd, 1024 * 1024):
+            digest.update(block)
+        end = os.fstat(fd)
+        if (start.st_ino, start.st_size, start.st_mtime_ns, start.st_ctime_ns) != (end.st_ino, end.st_size, end.st_mtime_ns, end.st_ctime_ns):
+            raise ValueError('copy changed')
+        return digest.hexdigest()
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent)
+
+
+def _ruth_office_guard(server_name, tool_name, args):
+    """Fail before transport on an Office request outside the immutable mandate."""
+    if not _ruth_office_identity(server_name):
+        return None
+    raw = os.environ.get('IRONROD_RUTH_GMAIL_OFFICE_MANDATE_JSON')
+    def blocked(reason):
+        return tool_error('RUTH_OFFICE_SCOPE_BLOCKED: ' + reason)
+    if not raw:
+        if tool_name == 'create_drive_file':
+            name = str(args.get('file_name', '')).lower()
+            mimes = [str(args.get(k, '')).strip().lower() for k in ('mime_type', 'content_mime_type')]
+            if (name.endswith(('.xlsx', '.docx', '.pptx', '.xls', '.doc', '.ppt', '.xlsm', '.docm', '.pptm'))
+                    or any(v.startswith(('application/vnd.openxmlformats-officedocument.',
+                                         'application/vnd.ms-', 'application/vnd.msword'))
+                           or v == 'application/msword' for v in mimes)):
+                return blocked('Office creation requires a bound Office mandate')
+        if tool_name == 'update_drive_file' and any(args.get(k) is not None for k in ('content', 'file_path', 'file_url')):
+            return blocked('content replacement requires a bound Office mandate')
+        return None
+    try:
+        if len(raw.encode('utf-8')) > 32768:
+            return blocked('mandate too large')
+        decoded = json.loads(raw)
+        if type(decoded) is not dict:
+            raise ValueError('mandate object required')
+        if decoded.get('schema_version') == 2:
+            mandate, state = _office_create_context()
+            if tool_name == 'create_drive_file':
+                _office_prepare_create(mandate, state, args)
+            else:
+                _office_create_read_guard(mandate, state, tool_name, args)
+            return None
+        mandate = _office_schema(decoded)
+        if not isinstance(args, dict) or args.get('user_google_email') != mandate['account']:
+            return blocked('account outside mandate')
+        files = mandate['files']
+        if tool_name in ('get_drive_file_content', 'get_drive_file_download_url', 'get_drive_file_permissions'):
+            if args.get('file_id') not in files or args.get('export_format') is not None:
+                return blocked('read target outside mandate; use the exact mandated Office ID')
+            return None
+        if tool_name == 'list_drive_items':
+            if args.get('folder_id') not in {f['parent_id'] for f in files.values()}:
+                return blocked('folder outside mandate')
+            return None
+        if tool_name == 'search_drive_files':
+            import re
+            query = args.get('query', '')
+            if not isinstance(query, str):
+                return blocked('search must use canonical name + parent + trashed=false')
+            def canonical_pattern(f):
+                literal = f['name'].replace('\\', '\\\\').replace("'", "\\'")
+                return (r"\s*name\s*=\s*'" + re.escape(literal)
+                        + r"'\s+and\s+'" + re.escape(f['parent_id'])
+                        + r"'\s+in\s+parents\s+and\s+trashed\s*=\s*false\s*")
+            if not any(re.fullmatch(canonical_pattern(f), query) for f in files.values()):
+                return blocked('search must use canonical name + parent + trashed=false')
+            return None
+        if tool_name != 'update_drive_file':
+            return blocked('only mandated Office reads and content replacement are allowed')
+        f = files.get(args.get('file_id'))
+        if not f or not f['write']:
+            return blocked('write target outside mandate')
+        allowed = {'user_google_email', 'file_id', 'file_path', 'mode'}
+        if any(value is not None for key, value in args.items() if key not in allowed):
+            return blocked('metadata, rights, URL, conversion and other mutations are excluded')
+        if args.get('file_path') != f['file_path'] or args.get('mode', 'replace') != 'replace':
+            return blocked('copy path or mode outside mandate')
+        if _office_copy_digest(f['file_path']) != f['sha256']:
+            return blocked('copy bytes differ from the verified mandate')
+        return None
+    except (ValueError, TypeError, KeyError, OSError, UnicodeError):
+        return blocked('invalid mandate or changed/unreadable copy')
+
+
+
+# schema_v2 creation: cooperative local mandate, never a model-supplied proof.
+_OFFICE_ATTACHMENTS = '/home/rodrigue/.workspace-mcp/attachments/'
+_OFFICE_BRAIN_PATHS = (
+    'contract/ruth-mail-autonomy.md', '00-Index/Etat-Systeme-Iron-Rod.md',
+    '00-Index/MOC-Iron-Rod.md', '00-Index/Charte-Brain.md',
+    '04-Projets/Immobilier/SCI-M-Invest.md',
+    '05-Finance/Rapprochement-SCI-M-Invest-2023.md',
+    '05-Finance/SCI-M-Invest-2023-Index-Pieces-Drive.md',
+    '09-Daily/2026-10-03-Ruth-SCI-Classement.md')
+_OFFICE_CREATE_STATE = {}  # observed renderer results only; reset with process/session
+
+
+def _office_bytes(path, limit=128 * 1024 * 1024):
+    import stat
+    if not isinstance(path, str) or not path.startswith('/') or any(
+            x in ('', '.', '..') for x in path.split('/')[1:]):
+        raise ValueError('absolute canonical source required')
+    parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    fd = None
+    try:
+        for part in path.split('/')[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        fd = os.open(path.split('/')[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_mode & 0o022 or before.st_size > limit):
+            raise ValueError('unsafe source')
+        chunks, size = [], 0
+        while block := os.read(fd, min(1024 * 1024, limit + 1 - size)):
+            size += len(block)
+            if size > limit:
+                raise ValueError('source too large')
+            chunks.append(block)
+        after = os.fstat(fd)
+        signature = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        if signature(before) != signature(after):
+            raise ValueError('source changed')
+        return b''.join(chunks)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent)
+
+
+def _office_create_schema(m):
+    import re
+    if type(m) is not dict or set(m) != {'schema_version', 'operation', 'account', 'target', 'brain_proof'} or m['operation'] != 'create':
+        raise ValueError('closed create schema')
+    f = m['target']
+    if type(f) is not dict or set(f) != {'name', 'mime_type', 'parent_id', 'file_path', 'sha256'}:
+        raise ValueError('closed target')
+    _office_schema({'schema_version': 1, 'account': m['account'],
+                    'files': {'schema-validation': dict(f, write=True)}})
+    if not f['name'] or any(ord(c) < 32 for c in f['name']) or f['parent_id'] == 'root':
+        raise ValueError('literal target')
+    proof = m['brain_proof']
+    if not isinstance(proof, dict) or set(proof) != {'notes'} or type(proof['notes']) is not list or len(proof['notes']) != 8:
+        raise ValueError('operator proof required')
+    for path, note in zip(_OFFICE_BRAIN_PATHS, proof['notes']):
+        if type(note) is not dict or set(note) != {'path', 'source_path', 'sha256', 'size', 'reads'} or note['path'] != '/ruth-brain-ro/' + path:
+            raise ValueError('ordered Brain sources required')
+        source = ('/home/rodrigue/.hermes/shared-email/email/mail-draft-lifecycle/references/ruth-mail-autonomy.md'
+                  if path.startswith('contract/') else '/mnt/nvme/obsidian-vault/' + path)
+        if note['source_path'] != source or not re.fullmatch('[0-9a-f]{64}', note['sha256']):
+            raise ValueError('Brain source')
+        if type(note['size']) is not int or not 0 <= note['size'] <= 4 * 1024 * 1024:
+            raise ValueError('Brain size')
+    return m
+
+
+def _office_create_context():
+    raw = os.environ.get('IRONROD_RUTH_GMAIL_OFFICE_MANDATE_JSON', '')
+    if not raw:
+        return None
+    m = json.loads(raw)
+    if type(m) is not dict:
+        raise ValueError('mandate object required')
+    if m.get('schema_version') != 2:
+        return None
+    _office_create_schema(m)
+    import hashlib
+    key = hashlib.sha256(raw.encode()).hexdigest()
+    state = _OFFICE_CREATE_STATE.setdefault(key, {'reads': [], 'ids': set()})
+    return m, state
+
+
+def _office_brain_plan(m):
+    import hashlib
+    plan = []
+    for note in m['brain_proof']['notes']:
+        data = _office_bytes(note['source_path'], 4 * 1024 * 1024)
+        if len(data) != note['size'] or hashlib.sha256(data).hexdigest() != note['sha256']:
+            raise ValueError('Brain source changed')
+        text = data.decode('utf-8')
+        lines = text.split('\n')
+        reads = note['reads']
+        if reads == [{'path': note['path']}]:
+            texts = [text]
+        elif (isinstance(reads, list) and len(reads) == 2
+              and set(reads[0]) == {'path', 'head'} and set(reads[1]) == {'path', 'tail'}
+              and all(r['path'] == note['path'] for r in reads)
+              and type(reads[0]['head']) is int and type(reads[1]['tail']) is int
+              and reads[0]['head'] > 0 and reads[1]['tail'] > 0
+              and reads[0]['head'] + reads[1]['tail'] == len(lines)):
+            texts = ['\n'.join(lines[:reads[0]['head']]), '\n'.join(lines[-reads[1]['tail']:])]
+        else:
+            raise ValueError('incomplete or overlapping Brain plan')
+        for args, text in zip(reads, texts):
+            output = json.dumps({'result': text}, ensure_ascii=False)
+            if len(output) > 100000:
+                raise ValueError('Brain renderer budget exceeded')
+            plan.append((args, output))
+    return plan
+
+
+def _office_observe_brain(server_name, tool_name, args, rendered):
+    if server_name != 'ruth-brain-ro' or not _ruth_office_identity('gmail-pilot'):
+        return
+    try:
+        context = _office_create_context()
+        if context is None:
+            return
+        m, state = context
+        plan = _office_brain_plan(m)
+        if tool_name == 'read_text_file' and args == plan[0][0]:
+            state['reads'] = []
+        index = len(state['reads'])
+        if tool_name != 'read_text_file' or index >= len(plan) or (args, rendered) != plan[index]:
+            state['reads'] = []
+            return
+        state['reads'].append((dict(args), rendered))
+    except (ValueError, TypeError, KeyError, OSError, UnicodeError):
+        _OFFICE_CREATE_STATE.clear()
+
+
+def _office_query(m):
+    f = m['target']
+    literal = f['name'].replace('\\', '\\\\').replace("'", "\\'")
+    return "name = '" + literal + "' and '" + f['parent_id'] + "' in parents and trashed=false"
+
+
+def _office_evidence(rendered):
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('duplicate evidence key')
+            value[key] = item
+        return value
+    outer = json.loads(rendered, object_pairs_hook=unique_object)
+    if type(outer) is not dict or type(outer.get('result')) is not str:
+        raise ValueError('ambiguous renderer')
+    if set(outer) == {'result', 'structuredContent', '_meta'}:
+        # Installed FastMCP wraps a -> str result, preserving the identical text.
+        if (outer['structuredContent'] != {'result': outer['result']}
+                or type(outer['_meta']) is not dict or set(outer['_meta']) != {'fastmcp'}
+                or type(outer['_meta']['fastmcp']) is not dict
+                or set(outer['_meta']['fastmcp']) != {'wrap_result'}
+                or outer['_meta']['fastmcp']['wrap_result'] is not True):
+            raise ValueError('incoherent FastMCP envelope')
+    elif set(outer) != {'result'}:
+        raise ValueError('ambiguous renderer')
+    value = json.loads(outer['result'], object_pairs_hook=unique_object)
+    if type(value) is not dict:
+        raise ValueError('native evidence required')
+    return value
+
+
+def _office_validate_file(m, f):
+    import re
+    target = m['target']
+    if (not isinstance(f, dict) or not isinstance(f.get('id'), str)
+            or not re.fullmatch('[A-Za-z0-9_-]{5,200}', f['id'])
+            or f.get('name') != target['name'] or f.get('mimeType') != target['mime_type']
+            or f.get('parents') != [target['parent_id']] or f.get('trashed', False) is not False):
+        raise ValueError('unverified returned identity')
+    return f['id']
+
+
+def _office_search_page(m, rendered, token):
+    value = _office_evidence(rendered)
+    if (set(value) != {'office_evidence', 'account', 'query', 'page_token', 'files', 'nextPageToken', 'incompleteSearch'}
+            or value['office_evidence'] != 1 or value['account'] != m['account']
+            or value['query'] != _office_query(m) or value['page_token'] != token
+            or value['incompleteSearch'] is not False or type(value['files']) is not list
+            or len(value['files']) > 100):
+        raise ValueError('incomplete native search evidence')
+    next_token = value['nextPageToken']
+    if next_token is not None and (not isinstance(next_token, str) or not 1 <= len(next_token) <= 4096):
+        raise ValueError('invalid pagination')
+    return value['files'], next_token
+
+
+def _office_claim(m):
+    import hashlib
+    import stat
+    target = m['target']
+    key = hashlib.sha256(json.dumps([m['account'], target['parent_id'], target['name']],
+                                   ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+    # Open every directory without following links; claim namespace survives sessions.
+    parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in _OFFICE_ATTACHMENTS.strip('/').split('/'):
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        st = os.fstat(parent)
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise ValueError('unsafe receipt directory')
+        fd = os.open('.office-create-' + key + '.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=parent)
+        with os.fdopen(fd, 'wb') as out:
+            out.write(json.dumps({'state': 'reserved-effect-unknown', 'account': m['account'], 'target': target},
+                                 ensure_ascii=False).encode())
+            out.flush()
+            os.fsync(out.fileno())
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def _office_prepare_create(m, state, args):
+    import base64
+    import hashlib
+    f = m['target']
+    expected = {'user_google_email': m['account'], 'file_name': f['name'], 'folder_id': f['parent_id'],
+                'mime_type': f['mime_type'], 'content_mime_type': f['mime_type'],
+                'base64_sha256': f['sha256'], 'office_single_attempt': True}
+    if not isinstance(args, dict) or set(args) - (set(expected) | {'base64_content'}):
+        raise ValueError('unexpected create arguments')
+    if any(args.get(k) != v for k, v in expected.items()):
+        raise ValueError('create outside mandate')
+    if state['reads'] != _office_brain_plan(m):
+        raise ValueError('complete observed Brain reads required')
+    data = _office_bytes(f['file_path'])
+    if hashlib.sha256(data).hexdigest() != f['sha256']:
+        raise ValueError('source SHA mismatch')
+    encoded = base64.b64encode(data).decode('ascii')
+    if 'base64_content' in args and args['base64_content'] != encoded:
+        raise ValueError('payload mismatch')
+    return dict(expected, base64_content=encoded)
+
+
+def _office_create_read_guard(m, state, tool_name, args):
+    if state['reads'] != _office_brain_plan(m):
+        raise ValueError('complete observed Brain reads required')
+    if args.get('user_google_email') != m['account']:
+        raise ValueError('account')
+    if tool_name == 'search_drive_files':
+        allowed = {'user_google_email', 'query', 'page_token', 'page_size', 'office_evidence'}
+        token = args.get('page_token')
+        if token is not None and (not isinstance(token, str) or not 1 <= len(token) <= 4096):
+            raise ValueError('invalid pagination token')
+        if (set(args) - allowed or args.get('query') != _office_query(m)
+                or args.get('office_evidence') is not True
+                or type(args.get('page_size', 100)) is not int or not 1 <= args.get('page_size', 100) <= 100):
+            raise ValueError('exact evidence search required')
+    elif tool_name in ('get_drive_file_download_url', 'get_drive_file_content', 'get_drive_file_permissions'):
+        if set(args) != {'user_google_email', 'file_id'} or args['file_id'] not in state['ids']:
+            raise ValueError('unverified read ID')
+    else:
+        raise ValueError('only distinct create and verified reads allowed')
+
+
+def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *, native_images: bool = False):
     """Sync registry handler (``handler(args_dict, **kwargs) -> str``) calling an MCP tool via the background loop."""
     op = f"tools/call {tool_name}"
 
     def _handler(args: dict, **kwargs) -> str:
+        scope_error = _ruth_office_guard(server_name, tool_name, args)
+        if scope_error is not None:
+            return scope_error
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
             return error
+        create_context = None
+        if _ruth_office_identity(server_name):
+            try:
+                create_context = _office_create_context()
+                if create_context and tool_name == 'create_drive_file':
+                    args = _office_prepare_create(*create_context, args)
+                    _office_claim(create_context[0])  # durable BEFORE any acquisition/RPC
+            except (ValueError, TypeError, KeyError, OSError, UnicodeError):
+                return tool_error('RUTH_OFFICE_SCOPE_BLOCKED: receipt exists or invalid proof/source; reconcile without re-emission')
         server, error = _acquire_call_server(server_name, tool_timeout)
         if server is None:
             return error
         # Only a tool annotated readOnlyHint=True is replayed after session expiry; a 401 is always
         # pre-dispatch so the auth recoverer keeps its retry for every tool.
-        read_only = _tool_is_read_only(server_name, tool_name)
+        read_only = False if create_context and tool_name == 'create_drive_file' else _tool_is_read_only(server_name, tool_name)
+
+        image_paths: List[str] = []
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
+                    if create_context and tool_name == 'create_drive_file':
+                        mandate, state = create_context
+                        token, seen = None, set()
+                        for page in range(100):
+                            search_args = {'user_google_email': mandate['account'], 'query': _office_query(mandate),
+                                           'page_size': 100, 'page_token': token, 'office_evidence': True}
+                            search = await _call_tool_racing_stdio_death(server, server_name, 'search_drive_files', search_args)
+                            files, next_token = _office_search_page(mandate, _render_call_tool_result(search, server_name), token)
+                            if files:
+                                raise ValueError('collision: creation refused')
+                            if next_token is None:
+                                break
+                            if next_token in seen:
+                                raise ValueError('pagination loop')
+                            seen.add(next_token)
+                            token = next_token
+                        else:
+                            raise ValueError('pagination bound exceeded')
+                        if state['reads'] != _office_brain_plan(mandate):
+                            raise ValueError('Brain changed during preflight')
                     result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
                 server._mark_session_proven()
-            return _render_call_tool_result(result, server_name)
+            image_paths.clear()
+            rendered = _render_call_tool_result(result, server_name, image_paths)
+            _office_observe_brain(server_name, tool_name, args, rendered)
+            if create_context:
+                mandate, state = create_context
+                if tool_name == 'create_drive_file':
+                    evidence = _office_evidence(rendered)
+                    if set(evidence) != {'office_create', 'account', 'file'} or evidence['office_create'] != 1 or evidence['account'] != mandate['account']:
+                        raise ValueError('uncertain creation response; reconcile')
+                    state['ids'].add(_office_validate_file(mandate, evidence['file']))
+                elif tool_name == 'search_drive_files':
+                    files, _ = _office_search_page(mandate, rendered, args.get('page_token'))
+                    for f in files:
+                        state['ids'].add(_office_validate_file(mandate, f))
+            return rendered
 
         def _on_failure(exc):
             _core._bump_server_error(server_name)
             logger.error("MCP tool %s/%s call failed: %s", server_name, tool_name, exc)
         session_expired = partial(_handle_session_expired_and_retry, call_may_have_side_effects=not read_only)
-        return _dispatch(
+        text = _dispatch(
             server_name, server, op, _call, tool_timeout,
+            () if create_context and tool_name == 'create_drive_file' else
             (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, session_expired),
             _on_failure, record_outcome=True)
+        return _mcp_result_with_native_images(text, image_paths) if native_images and not _result_is_error(text) else text
     return _handler
 
 

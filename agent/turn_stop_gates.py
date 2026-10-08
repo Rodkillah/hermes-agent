@@ -43,6 +43,7 @@ def _verify_on_stop_nudge(agent) -> Optional[str]:
                 session_id=getattr(agent, "session_id", None),
                 changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                 attempts=getattr(agent, "_verification_stop_nudges", 0),
+                platform=getattr(agent, "platform", None),
             )
     except Exception:
         logger.debug("verification stop-loop check failed", exc_info=True)
@@ -122,6 +123,8 @@ def apply_stop_gates(
         return StopGateVerdict(
             continue_turn=True, final_response=None,
             pending_verification_response=final_response,
+            # Prefix semantics on purpose: the streamed prefix IS on screen here. The gateway
+            # interim verdict uses _interim_content_fully_streamed instead (#88954).
             pending_verification_response_previewed=agent._interim_content_was_streamed(
                 final_response or ""
             ),
