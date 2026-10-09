@@ -486,7 +486,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     # The human decision that closed a block loop: say which way it went.
     "block_loop_resolved": lambda ev, n: (
         f"✅ {n.head} block loop resolved — {_payload(ev, 'decision') or 'resolved'}"
-        f"{_clip(ev, 'reason', ': {}', 160)}",
+        f"{_clip(ev, 'reason', ': {value}', 160)}",
         None, None,
     ),
     # Production promotion is distinct from work completion. Keep this
@@ -494,8 +494,8 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     # receipt, backup, rollback and probe evidence stay in the database.
     "production_promoted": lambda ev, n: (
         f"🚀 {n.head} production verified"
-        f"{_clip(ev, 'target', ' — {}', 80)}{_clip(ev, 'deployed_at_utc', ' @ {}', 40)}"
-        f"{_clip(ev, 'deployed_identity_value', ' [{}]', 40)}",
+        f"{_clip(ev, 'target', ' — {value}', 80)}{_clip(ev, 'deployed_at_utc', ' @ {value}', 40)}"
+        f"{_clip(ev, 'deployed_identity_value', ' [{value}]', 40)}",
         None, None,
     ),
 }

@@ -10,7 +10,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.delegation_context import delegated_child_context, is_delegated_child_context
+from agent.delegation_context import (
+    KANBAN_ENV_KEYS, delegated_child_context, is_delegated_child_context,
+)
+from hermes_cli.kanban_db import kanban_home
 from tools.environments.local import LocalEnvironment
 
 
@@ -32,6 +35,8 @@ def test_shell_never_carries_worker_identity(monkeypatch, tmp_path, child_first)
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture_parent")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    expected_fence = str(kanban_home())
     env = LocalEnvironment(cwd=str(tmp_path), timeout=5)
     try:
         if not child_first:
@@ -41,7 +46,10 @@ def test_shell_never_carries_worker_identity(monkeypatch, tmp_path, child_first)
                 env.init_session()
             child = env.execute("export FIXTURE_SHARED=kept; " + _IDENTITE, timeout=5)
             assert "TASK=absent" in child["output"], child["output"]
-            assert "CHILD=1" in child["output"], child["output"]
+            assert child["returncode"] == 0, child
+            assert child["output"].strip() == (
+                f"TASK=absent CHILD={expected_fence} SHARED=kept"
+            ), child["output"]
 
         # Le contexte enfant ne fuit pas dans le processus agent.
         assert not is_delegated_child_context()
@@ -51,26 +59,45 @@ def test_shell_never_carries_worker_identity(monkeypatch, tmp_path, child_first)
         assert os.environ["HERMES_KANBAN_TASK"] == "t_fixture_parent"
 
         parent = env.execute(_IDENTITE, timeout=5)
+        assert parent["returncode"] == 0, parent
+        assert parent["output"].strip() == (
+            f"TASK=absent CHILD={expected_fence} SHARED=kept"
+        ), parent["output"]
         assert "TASK=absent" in parent["output"], parent["output"]
         assert "SHARED=kept" in parent["output"], parent["output"]
     finally:
         env.cleanup()
 
 
-@pytest.mark.parametrize("inherited_child", [False, True])
+@pytest.mark.parametrize("inherited_child", [None, "1", "ancestor"])
 def test_stale_snapshot_cannot_override_spawn_identity(monkeypatch, tmp_path, inherited_child):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture_parent")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    expected_fence = str(kanban_home())
     env = LocalEnvironment(cwd=str(tmp_path), timeout=5)
     try:
         env.init_session()
         # Old snapshots exist across code updates. Their identity is not authority.
         with Path(env._snapshot_path).open("a") as snapshot:
             snapshot.write('declare -x HERMES_DELEGATED_CHILD_CONTEXT="stale"\n')
-            snapshot.write('declare -x HERMES_KANBAN_TASK="t_stale"\n')
+            for key in KANBAN_ENV_KEYS:
+                snapshot.write(f'declare -x {key}="t_stale"\n')
         if inherited_child:
-            monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
-        result = env.execute('printf "IDENTITY=%s TASK=%s\\n" "${HERMES_DELEGATED_CHILD_CONTEXT:-absent}" "${HERMES_KANBAN_TASK:-absent}"', timeout=5)
+            marker = "1" if inherited_child == "1" else str(tmp_path / "ancestor")
+            monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", marker)
+            if inherited_child == "ancestor":
+                expected_fence = marker
+        code = (
+            "import json, os; print(json.dumps({k: os.environ.get(k) "
+            "for k in " + repr(KANBAN_ENV_KEYS) + "}))"
+        )
+        result = env.execute(
+            'printf "IDENTITY=%s TASK=%s\\n" "${HERMES_DELEGATED_CHILD_CONTEXT:-absent}" '
+            '"${HERMES_KANBAN_TASK:-absent}"; '
+            f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}", timeout=5,
+        )
+        assert result["returncode"] == 0, result
         # Invariant Iron Rod, toujours valable : le snapshot n'est pas une autorite.
         # Il ne peut reinjecter ni l'identite de tache ni le marqueur, quelles que
         # soient les valeurs qu'il porte (ici t_stale et "stale").
@@ -78,7 +105,42 @@ def test_stale_snapshot_cannot_override_spawn_identity(monkeypatch, tmp_path, in
         assert 'IDENTITY=stale' not in result["output"], result["output"]
         # Contrat amont : le shell est scrute, donc la tache est absente des deux cotes.
         assert "TASK=absent" in result["output"], result["output"]
-        assert "IDENTITY=1" in result["output"], result["output"]
+        lines = result["output"].splitlines()
+        assert len(lines) == 2, result["output"]
+        assert lines[0] == (
+            f"IDENTITY={expected_fence} TASK=absent"
+        ), result["output"]
+        # Probe before this shell re-dumps the snapshot: a stale run/claim
+        # must not disappear only during export and evade the assertion.
+        assert json.loads(lines[1]) == dict.fromkeys(KANBAN_ENV_KEYS)
+    finally:
+        env.cleanup()
+
+
+def test_snapshot_exporter_drops_worker_and_rpc_authority(monkeypatch, tmp_path):
+    """Observe the next real shell, rather than inspect the exporter's source."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture_parent")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    keys = (*KANBAN_ENV_KEYS, "HERMES_RPC_TOKEN", "HERMES_KERNEL_DIR")
+    for key in keys[1:]:
+        monkeypatch.delenv(key, raising=False)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=5)
+    try:
+        exported = env.execute(
+            "export " + " ".join(f"{key}=synthetic_snapshot_value" for key in keys),
+            timeout=5,
+        )
+        assert exported["returncode"] == 0, exported
+        code = (
+            "import json, os; print(json.dumps({k: os.environ.get(k) "
+            "for k in " + repr(keys) + "}))"
+        )
+        observed = env.execute(
+            f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}", timeout=5,
+        )
+        assert observed["returncode"] == 0, observed
+        assert json.loads(observed["output"]) == dict.fromkeys(keys)
     finally:
         env.cleanup()
 

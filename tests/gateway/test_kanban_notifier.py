@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 
 from gateway.config import Platform
 from gateway.kanban_watchers_common import (
@@ -67,7 +69,8 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
-def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reason", ["superseded", "R" * 160 + "CLIPPED-TAIL"])
+def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch, reason):
     db_path = tmp_path / "block-loop-resolution.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -89,7 +92,7 @@ def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
         # resolution notification rather than replaying both events.
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         assert kb.resolve_block_loop_task(
-            conn, tid, decision="archive", actor="amber", reason="superseded",
+            conn, tid, decision="archive", actor="amber", reason=reason,
             expected_event_id=expected_event_id,
         )
     finally:
@@ -102,6 +105,12 @@ def test_kanban_notifier_delivers_block_loop_resolution(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     assert tid in adapter.sent[0]["text"]
     assert "block loop resolved" in adapter.sent[0]["text"]
+    assert f": {reason[:160]}" in adapter.sent[0]["text"]
+    assert "{}" not in adapter.sent[0]["text"]
+    assert "CLIPPED-TAIL" not in adapter.sent[0]["text"]
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
 
 
 def _unseen_terminal_events(tid):
@@ -886,7 +895,10 @@ def test_notifier_delivers_production_promoted_post_commit_without_replay(
     message = adapter.sent[0]["text"]
     assert "production verified" in message
     assert "ironrod" in message
+    assert "2026-08-30T10:00:00Z" in message
     assert "a" * 40 in message
+    assert "{}" not in message
+    assert "{value}" not in message
     assert "receipt-1" not in message
     assert "backup" not in message
 
