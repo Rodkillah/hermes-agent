@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
+# Keep the native SQLite wait bound; boot time has already consumed handoff grace.
+ADOPTION_BUSY_BUDGET_SECONDS = 5.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
@@ -41,7 +43,7 @@ _PROCESS_ID = uuid.uuid4().hex
 
 # --- executions ledger --------------------------------------------------------------------------
 
-def _connect() -> sqlite3.Connection:
+def _connect(*, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
     # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
     # not at import time (the guarantee cron/ledger.py used to carry, see e24c8499).
@@ -50,11 +52,23 @@ def _connect() -> sqlite3.Connection:
 
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    return open_db(path, db_label="cron/executions.db", busy_timeout_ms=busy_timeout_ms,
+                   synchronous_full=True, initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_cli.sqlite_util import add_column_if_missing
+
+    # Inspect this connection's schema, rather than attempting DDL on every waiter read.
+    # No process-global cache: another profile, restored DB or concurrent migration is visible.
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(executions)")}
+    indexes = {row["name"] for row in conn.execute("PRAGMA index_list(executions)")}
+    required_columns = {"handoff_pending", "handoff_started_at", "delivery_outcome",
+                        "scheduled_instant", "progress_at"}
+    required_indexes = {"idx_executions_job_claimed", "idx_executions_status_claimed",
+                        "idx_executions_occurrence"}
+    if required_columns <= columns and required_indexes <= indexes:
+        return
 
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (
@@ -99,10 +113,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(*, busy_timeout_ms: int = 5000) -> Iterator[sqlite3.Connection]:
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
+    with _lock, transaction(_connect(busy_timeout_ms=busy_timeout_ms)) as conn:
         yield conn
 
 
@@ -198,16 +212,22 @@ def touch_execution_progress(execution_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """DELETE FROM executions WHERE id IN (
-             SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
-             ORDER BY julianday(finished_at) DESC, finished_at DESC,
-                      julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
-           )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
-    )
+def _prune_terminal_executions() -> None:
+    # Sorting history is read work. Only the selected immutable terminal IDs need a writer lock.
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT id FROM executions
+               WHERE status IN ('completed','failed','unknown')
+               ORDER BY julianday(finished_at) DESC, finished_at DESC,
+                        julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?""",
+            (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
+        ).fetchall()
+    if rows:
+        with _transaction() as conn:
+            conn.executemany(
+                "DELETE FROM executions WHERE id=? AND status IN ('completed','failed','unknown')",
+                [(row["id"],) for row in rows],
+            )
 
 
 def create_execution(
@@ -271,10 +291,32 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
     worker.  Adoption is the single ``claimed`` → ``running`` gate: only the
     winner may acknowledge ownership or run side effects.
     """
+    deadline = time.monotonic() + ADOPTION_BUSY_BUDGET_SECONDS
+    delay = 0.01
+    while True:
+        try:
+            return _adopt_claimed_execution_once(execution_id)
+        except sqlite3.OperationalError as exc:
+            # Extended BUSY codes include BUSY_SNAPSHOT: retry on a fresh connection,
+            # never on the stale transaction. No side effects or ACK preceded commit.
+            if getattr(exc, "sqlite_errorcode", None) is None or (
+                exc.sqlite_errorcode & 0xff
+            ) != sqlite3.SQLITE_BUSY:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.1)
+
+
+def _adopt_claimed_execution_once(execution_id: str) -> Optional[Dict[str, Any]]:
     pid = os.getpid()
     process_started_at = _process_start_time(pid)
     now = _hermes_now().isoformat()
-    with _transaction() as conn:
+    # Do not let each schema statement consume a new busy timeout. Retrying the
+    # whole open/transaction also covers concurrent initialization without a snapshot.
+    with _transaction(busy_timeout_ms=0) as conn:
         cur = conn.execute(
             """UPDATE executions
                SET process_id=?, pid=?, process_started_at=?,
@@ -328,8 +370,8 @@ def finish_execution(
         )
         if cur.rowcount != 1:
             return None
-        _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
+    _prune_terminal_executions()
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record
@@ -374,55 +416,58 @@ def recover_interrupted_executions() -> int:
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
-        for row in rows:
-            if row["process_id"] == _PROCESS_ID:
-                continue
-            reason = _OWNER_GONE_REASON
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-                # A live owner is normally a legitimately running job. A worker permanently
-                # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
-                # this check, so a claim SILENT for longer than the derived bound is treated
-                # as wedged and released — the external-worker wait loop polls this ledger
-                # for a terminal status, so the job can fire again. Silence is measured from
-                # the owner's last ``progress_at`` stamp (the run monitor refreshes it while
-                # the agent is active), so a healthy multi-hour run is never reclaimed while
-                # it is still working. The wedged worker PROCESS is NOT terminated here
-                # (leaked until host restart); rows owned by this process (process_id ==
-                # _PROCESS_ID, in-process runs) are skipped above and remain out of scope.
-                if not stale_after_resolved:
-                    stale_after = _live_owner_stale_after_seconds()
-                    stale_after_resolved = True
-                if (
-                    stale_after is None
-                    or _stale_age_seconds(row["claimed_at"], row["progress_at"]) <= stale_after
-                ):
-                    continue
-                reason = _OWNER_WEDGED_REASON
-            handoff_started_at = row["handoff_started_at"]
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        reason = _OWNER_GONE_REASON
+        if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            # A live owner is normally a legitimately running job. A worker permanently
+            # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
+            # this check, so a claim SILENT for longer than the derived bound is treated
+            # as wedged and released — the external-worker wait loop polls this ledger
+            # for a terminal status, so the job can fire again. Silence is measured from
+            # the owner's last ``progress_at`` stamp (the run monitor refreshes it while
+            # the agent is active), so a healthy multi-hour run is never reclaimed while
+            # it is still working. The wedged worker PROCESS is NOT terminated here
+            # (leaked until host restart); rows owned by this process (process_id ==
+            # _PROCESS_ID, in-process runs) are skipped above and remain out of scope.
+            if not stale_after_resolved:
+                stale_after = _live_owner_stale_after_seconds()
+                stale_after_resolved = True
             if (
-                row["handoff_pending"]
-                and handoff_started_at is not None
-                and time.time() - float(handoff_started_at)
-                < HANDOFF_ADOPTION_GRACE_SECONDS
+                stale_after is None
+                or _stale_age_seconds(row["claimed_at"], row["progress_at"]) <= stale_after
             ):
                 continue
+            reason = _OWNER_WEDGED_REASON
+        handoff_started_at = row["handoff_started_at"]
+        if (
+            row["handoff_pending"]
+            and handoff_started_at is not None
+            and time.time() - float(handoff_started_at)
+            < HANDOFF_ADOPTION_GRACE_SECONDS
+        ):
+            continue
+        with _transaction() as conn:
             cur = conn.execute(
                 """UPDATE executions
                    SET status='unknown', finished_at=?, error=?,
                        handoff_pending=0, handoff_started_at=NULL
                    WHERE id=? AND status=? AND process_id=? AND pid=?
                      AND handoff_pending=?
-                     AND handoff_started_at IS ?""",
+                     AND handoff_started_at IS ?
+                     AND process_started_at IS ? AND claimed_at=? AND progress_at IS ?""",
                 (now, reason, row["id"], row["status"], row["process_id"], row["pid"],
-                 row["handoff_pending"], row["handoff_started_at"]),
+                 row["handoff_pending"], row["handoff_started_at"], row["process_started_at"],
+                 row["claimed_at"], row["progress_at"]),
             )
             changed += cur.rowcount
             if cur.rowcount:
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
-        if changed:
-            _prune_unlocked(conn)
+    if changed:
+        _prune_terminal_executions()
     for record in recovered:
         _emit_execution_state(record)
     return changed
@@ -478,7 +523,7 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
         if cur.rowcount != 1:
             return False
         record = _fetch(conn, execution_id)
-        _prune_unlocked(conn)
+    _prune_terminal_executions()
     _emit_execution_state(record)
     return True
 

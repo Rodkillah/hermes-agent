@@ -3556,9 +3556,9 @@ def _wait_for_external_cron_worker_body(
         return bool(current and current.get("status") in _TERMINAL_STATES)
 
     # The worker commits its terminal row before its process exits, so exit is
-    # the correct wakeup.  Each ledger read opens a connection and re-runs
-    # schema init; polling it at 50ms for an hours-long agent run is ~72k
-    # opens/hour of pure contention with the worker's own writes.
+    # the correct wakeup. Poll the ledger once per one-second process wait
+    # to notice recovery while a wedged worker remains alive. Each read opens
+    # a connection; an existing ledger schema needs no DDL.
     while True:
         try:
             returncode = process.wait(timeout=1.0)
