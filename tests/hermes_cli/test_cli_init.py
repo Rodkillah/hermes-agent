@@ -18,7 +18,13 @@ def test_plugin_toolset_is_not_reported_unknown(monkeypatch):
     monkeypatch.setattr(cli_mod, "validate_toolset", lambda _name: False)
     monkeypatch.setattr(plugins_mod, "get_plugin_toolset_keys_nowait", lambda: {"a2a"})
 
-    assert cli_mod._unknown_toolsets(["a2a"], set()) == []
+    from hermes_cli.cli_init_mixin import CLIInitMixin
+    messages = []
+    cli = SimpleNamespace(_console_print=messages.append)
+    monkeypatch.setattr(cli_mod, "CLI_CONFIG", {"agent": {}, "mcp_servers": {}})
+    CLIInitMixin._init_toolsets(cli, ["a2a"])
+    assert cli.enabled_toolsets == ["a2a"]
+    assert messages == []
 
 
 def test_unknown_toolset_is_still_reported(monkeypatch):
@@ -28,7 +34,13 @@ def test_unknown_toolset_is_still_reported(monkeypatch):
     monkeypatch.setattr(cli_mod, "validate_toolset", lambda _name: False)
     monkeypatch.setattr(plugins_mod, "get_plugin_toolset_keys_nowait", lambda: {"a2a"})
 
-    assert cli_mod._unknown_toolsets(["bogus"], set()) == ["bogus"]
+    from hermes_cli.cli_init_mixin import CLIInitMixin
+    messages = []
+    cli = SimpleNamespace(_console_print=messages.append)
+    monkeypatch.setattr(cli_mod, "CLI_CONFIG", {"agent": {}, "mcp_servers": {}})
+    CLIInitMixin._init_toolsets(cli, ["bogus"])
+    assert len(messages) == 1
+    assert "bogus" in messages[0]
 
 
 def _make_cli(env_overrides=None, config_overrides=None, **kwargs):

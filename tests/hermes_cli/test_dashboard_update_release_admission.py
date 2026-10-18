@@ -80,13 +80,13 @@ def test_commit_build_still_refuses_dashboard_apply_before_managed_probe(
     admission.assert_called_once_with(root)
 
 
-def test_managed_dashboard_still_refuses_apply_after_shared_admission(
+def test_managed_dashboard_refuses_apply_without_heuristic_probe(
     apply_boundary, monkeypatch,
 ):
     from hermes_cli import config, image_provenance, steward
     import hermes_constants
 
-    root, completed, receipt, spawn, admission = apply_boundary
+    _root, completed, receipt, spawn, admission = apply_boundary
     monkeypatch.setattr(image_provenance, "read_image_provenance", lambda: None)
     monkeypatch.setattr(steward, "sealed_steward", lambda root: None)
     monkeypatch.setattr(hermes_constants, "is_termux", lambda: False)
@@ -102,4 +102,5 @@ def test_managed_dashboard_still_refuses_apply_after_shared_admission(
     managed_probe.assert_called_once_with()
     receipt.assert_not_called()
     spawn.assert_not_called()
-    admission.assert_called_once_with(root)
+    admission.assert_not_called()
+    assert result["update_command"] == ""

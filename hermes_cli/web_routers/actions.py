@@ -244,17 +244,23 @@ async def update_hermes():
     # one decision with the CLI paths.
     from hermes_cli.update_contract import evaluate_update_admission, record_refusal_receipt
 
-    refusal = evaluate_update_admission(_server_path("PROJECT_ROOT"))
+    from hermes_cli.update_release_policy import release_policy_active
+
+    root = _server_path("PROJECT_ROOT")
+    # Keep explicit release/commit-build refusals authoritative. An externally
+    # managed dashboard otherwise needs no install-method probes or fake command.
+    if (not release_policy_active(root) and not is_commit_build(root)
+            and _dashboard_local_update_managed_externally()):
+        message = _MANAGED_EXTERNALLY_MESSAGE + " The built-in local updater is disabled here."
+        return _update_refused("dashboard_update_managed_externally", message, "")
+
+    refusal = evaluate_update_admission(root)
     if refusal is not None:
         response = _update_refused(
             _UPDATE_REFUSAL_ERROR_CODES.get(refusal.code, "update_not_in_place"), refusal.message, refusal.update_command,
         )
         record_refusal_receipt(refusal)
         return response
-    if _dashboard_local_update_managed_externally():
-        message = _MANAGED_EXTERNALLY_MESSAGE + " The built-in local updater is disabled here."
-        return _update_refused("dashboard_update_managed_externally", message, "managed outside dashboard")
-
     existing = _ACTION_PROCS.get("hermes-update")
     if existing is not None and existing.poll() is None:
         response = {"ok": True, "pid": existing.pid, "name": "hermes-update", "already_running": True}
