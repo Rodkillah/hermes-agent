@@ -33,7 +33,7 @@ class OnePasswordLoginBackend(LoginBackend):
     prefix = "op:"
     needs_unlock = True
 
-    def __init__(self, cfg: Optional[Dict] = None):
+    def __init__(self, cfg: Optional[dict] = None):
         self.cfg = cfg or {}
         from agent.secret_scope import get_secret
         env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
@@ -54,7 +54,7 @@ class OnePasswordLoginBackend(LoginBackend):
             raise RuntimeError("1Password CLI (op) not found — install it or set vault.onepassword.binary_path")
         return op
 
-    def _env(self, session_token: Optional[str]) -> Dict[str, str]:
+    def _env(self, session_token: Optional[str]) -> dict[str, str]:
         from agent.secret_scope import get_secret
         env = {k: os.environ[k] for k in _OP_ENV_ALLOWLIST if k in os.environ and not k.startswith("OP_CONNECT_")}
         # Connect credentials outrank OP_SERVICE_ACCOUNT_TOKEN inside op, so they must come from the
@@ -105,7 +105,7 @@ class OnePasswordLoginBackend(LoginBackend):
         return proc.stdout or ""
 
     # ── backend contract ───────────────────────────────────────────────────
-    def list_items(self) -> List[VaultItemMeta]:
+    def list_items(self) -> list[VaultItemMeta]:
         if not self.is_unlocked():
             return []
         raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
@@ -209,7 +209,7 @@ class OnePasswordLoginBackend(LoginBackend):
         return code if code.isdigit() else None
 
 
-def _web_origins(origins: List[str]) -> tuple:
+def _web_origins(origins: list[str]) -> tuple:
     """Fill targets are browser pages, so app URIs (``androidapp://`` etc.) never
     widen the fill set; an item whose only URI is an app URI keeps its single
     (unfillable-from-a-page) origin exactly as before."""
@@ -217,13 +217,13 @@ def _web_origins(origins: List[str]) -> tuple:
     return web or (origins[0],)
 
 
-def _all_origins(urls: List[str]) -> List[str]:
+def _all_origins(urls: list[str]) -> list[str]:
     """Every normalized origin saved on the item, deduped, order preserved.
 
     A 1Password Login item can carry several websites; each of them is a place the
     user told 1Password the credential belongs, so all of them are valid fill targets.
     """
-    out: List[str] = []
+    out: list[str] = []
     for u in urls:
         try:
             origin = normalize_origin(u)

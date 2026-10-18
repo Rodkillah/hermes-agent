@@ -440,16 +440,16 @@ def _error_result_text(result) -> str:
     return "".join(str(t) for t in texts if t)
 
 
-def _render_content_blocks(result, server_name: str) -> Tuple[str, int, List[str]]:
+def _render_content_blocks(result, server_name: str) -> tuple[str, int, list[str]]:
     """Text passes through; image/audio blocks are cached (MEDIA: tags); resource blocks are
     materialized rather than silently dropped; unsupported blocks become an inline drop notice
     (kimi-code#3227). Returns ``(text, usable_parts, image_paths)``: ``usable_parts`` counts REAL
     rendered blocks (whitespace-only text and drop notices excluded) for the structuredContent
     arbitration; ``image_paths`` are the files THIS call's image blocks were cached to — never
     parsed back out of the text, where a server-written ``MEDIA:`` line could name any local file."""
-    parts: List[str] = []
+    parts: list[str] = []
     usable_parts = 0
-    image_paths: List[str] = []
+    image_paths: list[str] = []
     # MCP tool results can also include ImageContent blocks (screenshot / Blockbench / Playwright etc.);
     # cache those via the gateway's image-cache helper so they flow through Hermes' MEDIA: tag convention
     # and out to messaging adapters that render images natively. Without this, image blocks were silently
@@ -550,7 +550,7 @@ def _ruth_gmail_exact_text_copy(result, server_name, structured, text_result) ->
             and raw == text_result == structured["content"])
 
 
-def _render_call_tool_result(result, server_name: str, image_paths: Optional[List[str]] = None) -> str:
+def _render_call_tool_result(result, server_name: str, image_paths: Optional[list[str]] = None) -> str:
     """Pure: ``CallToolResult`` -> handler JSON (``image_paths``, when given, receives the files this
     call's image blocks were cached to). ``content`` and ``structuredContent`` are both
     forwarded, except that a ``structuredContent`` whose JSON also sits verbatim in a text block
@@ -578,7 +578,7 @@ def _render_call_tool_result(result, server_name: str, image_paths: Optional[Lis
     if structured is None and meta is None:
         return json.dumps({"result": text_result}, ensure_ascii=False)
     # Key order is part of the output: "result" leads when there is text, otherwise "_meta" precedes it.
-    payload: Dict[str, Any] = {"result": text_result} if text_result else {}
+    payload: dict[str, Any] = {"result": text_result} if text_result else {}
     # Cap structuredContent too — a malicious server could flood context via a multi-MB JSON payload
     # (#56059). When the serialized form exceeds the hard cap, replace it with the truncated string (head +
     # tail preserved) so it degrades gracefully instead of flooding downstream.
@@ -1037,7 +1037,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
         # pre-dispatch so the auth recoverer keeps its retry for every tool.
         read_only = False if create_context and tool_name == 'create_drive_file' else _tool_is_read_only(server_name, tool_name)
 
-        image_paths: List[str] = []
+        image_paths: list[str] = []
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
@@ -1147,7 +1147,7 @@ def _render_resource_list(all_resources, server_name: str) -> dict:
 
 
 def _render_read_resource(result, server_name: str) -> dict:
-    parts: List[str] = []
+    parts: list[str] = []
     for block in getattr(result, "contents", []):
         if getattr(block, "text", None) is not None:
             parts.append(strip_unicode_tags(block.text))
