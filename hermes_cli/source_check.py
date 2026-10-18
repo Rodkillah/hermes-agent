@@ -398,22 +398,6 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     from hermes_cli.update_channel import channel_record, install_id, resolve_update_channel, rides_default_channel
     from hermes_cli.release_channels import validate_name
 
-    from hermes_cli.update_release_policy import release_policy_active, release_status
-    policy_root = Path(install_root if install_root is not None else get_project_root()).resolve()
-    if release_policy_active(policy_root):
-        if passive:
-            config = require_readable_config_before_write(Path(home or get_hermes_home()) / "config.yaml")
-            if (config.get("updates") or {}).get("check") is False:
-                return {"supported": False, "hermesRoot": str(policy_root), "behind": None,
-                        "commits": [], "reason": "disabled"}
-        if install_root is not None:
-            from hermes_cli.version_info import _git_version_info
-            status = release_status(force=force, current_version=_git_version_info(policy_root).base_version)
-        else:
-            status = release_status(force=force)
-        return {**status, "supported": True, "hermesRoot": str(policy_root), "commits": [],
-                "updateAvailable": status["update_available"], "canApply": False}
-
     embedded = (os.environ.get("HERMES_REVISION") or None) if install_root is None else None
     root = Path(install_root if install_root is not None else get_project_root()).resolve()
     home = Path(home if home is not None else get_hermes_home()).resolve()
@@ -493,8 +477,6 @@ def main() -> None:
         # Older runtimes reject --set-channel; Desktop offers its selector only on this flag.
         result["channelSelectable"] = True
     print(json.dumps(result))
-    if result.get("error") == "release-check-failed":
-        raise SystemExit(1)
 
 
 if __name__ == "__main__":

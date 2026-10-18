@@ -292,11 +292,6 @@ async def check_hermes_update(force: bool = False, profile: Optional[str] = None
     non-applyable methods) and, for git installs that are behind, commits
     [{sha, summary, author, at}] (additive; existing consumers ignore it).
     """
-    from hermes_cli.update_release_policy import release_policy_active, release_status
-
-    if release_policy_active(_server_path("PROJECT_ROOT")):
-        return await asyncio.to_thread(release_status, force=force)
-
     if is_commit_build(_server_path("PROJECT_ROOT")):
         return {
             "install_method": "desktop-app",
@@ -319,7 +314,7 @@ async def check_hermes_update(force: bool = False, profile: Optional[str] = None
         "install_method": install_method,
         "current_version": get_version_info().derived_version,
         "behind": None,
-        "update_available": False, "can_apply": install_method == "git",
+        "update_available": False, "can_apply": install_method == "git" and not _dashboard_local_update_managed_externally(),
         "update_command": recommended_update_command_for_method(install_method), "message": None,
     }
     non_applyable = _NON_APPLYABLE_MESSAGES.get(install_method)

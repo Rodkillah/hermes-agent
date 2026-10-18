@@ -2365,12 +2365,15 @@ def _update_preflight_handled(args) -> bool:
         record_refusal_receipt,
     )
 
-    from hermes_cli.update_release_policy import release_policy_active, release_status
+    from hermes_cli.update_release_policy import release_policy_active
 
     if getattr(args, "check", False) and release_policy_active(PROJECT_ROOT):
-        status = release_status(force=True)
-        print(status["message"])
-        if status.get("error"):
+        import json
+        from hermes_cli.source_check import check_for_updates
+
+        status = check_for_updates(force=True)
+        print(json.dumps(status))
+        if status.get("error") or not status.get("supported"):
             sys.exit(1)
         return True
 
