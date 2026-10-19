@@ -113,6 +113,10 @@ def _redact_enabled() -> bool:
     cached = _REDACT_ENABLED_BY_HOME.get(home_key)
     if cached is not None:
         return cached
+    # Resolving config can itself log (e.g. an unset ${env:NAME}); nested
+    # formatters must redact securely instead of resolving this policy again.
+    with _REDACT_ENABLED_LOCK:
+        _REDACT_ENABLED_BY_HOME.setdefault(home_key, True)
     enabled = True
     try:
         from agent.secret_scope import current_secret_scope
