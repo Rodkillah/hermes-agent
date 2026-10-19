@@ -4513,9 +4513,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         "firewalling this port to trusted networks only.",
                         self.name, self._host)
 
-            # Plugin-registered native handlers, wired before AppRunner.setup() freezes the router.
             self._wire_plugin_handlers(self._app)
-            self._runner = web.AppRunner(self._app)
+            # Shared callbacks carry query credentials; request-line access logs would disclose them.
+            self._runner = web.AppRunner(self._app, access_log=None)
             await self._runner.setup()
 # Bind directly instead of probing 127.0.0.1 first — the old single-family pre-probe raced the
             # real bind and reported a TIME_WAIT socket as "in use" (#10297), failing gateway restarts for
@@ -4532,7 +4532,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         if exc.errno != errno.EADDRINUSE or attempt == _BIND_ATTEMPTS - 1:
                             raise
                         await self._runner.cleanup()
-                        self._runner = web.AppRunner(self._app)
+                        self._runner = web.AppRunner(self._app, access_log=None)
                         await self._runner.setup()
                         await asyncio.sleep(0.2 * (attempt + 1))
             except OSError as exc:
